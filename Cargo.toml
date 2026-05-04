@@ -3,7 +3,7 @@ name = "disk-advisor"
 version = "0.1.0"
 edition = "2021"
 description = "A personalized, reversible disk-cleanup CLI"
-license = "Apache-2.0"
+license = "LicenseRef-PolyForm-Noncommercial-1.0.0"
 
 [[bin]]
 name = "disk-advisor"
