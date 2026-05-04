@@ -1,6 +1,6 @@
 # disk-advisor
 
-A personalized, reversible disk-cleanup CLI that finds *your* low-hanging fruit, pressure-tests each candidate, and reclaims space safely.
+A personalized disk-cleanup CLI that finds *your* low-hanging fruit, pressure-tests each candidate, and reclaims space safely — with a reversible quarantine so nothing is permanently deleted until you say so.
 
 ```
   ·▄▄▄▄  ▪  .▄▄ · ▄ •▄      ▄▄▄· ·▄▄▄▄  ▌ ▐·▪  .▄▄ · ▄▄▄
@@ -12,7 +12,7 @@ A personalized, reversible disk-cleanup CLI that finds *your* low-hanging fruit,
 
 Spiritual peers: `ripgrep`, `fd`, `dust`, `bat` — tools that do one thing with care.
 
-One binary. No GUI. No cloud. No telemetry. Apache 2.0.
+One binary. No GUI. No cloud. No telemetry. PolyForm Noncommercial 1.0.0.
 
 ---
 
@@ -24,12 +24,6 @@ Every dev Mac accumulates hundreds of GB in DerivedData, node_modules, Docker vo
 
 ```bash
 cargo install disk-advisor
-```
-
-Or via Homebrew (coming in M4):
-
-```bash
-brew install disk-advisor
 ```
 
 ## Quick start
@@ -64,7 +58,7 @@ Categories: `dev-artifact`, `app-cache`, `download-entropy`, `vm-disk`.
 
 Each candidate shows its confidence score and the path. Run `--verbose` for the full reasoning trace.
 
-### 3. Check
+### 3. Check *(coming in M2)*
 
 `disk-advisor check <id>` pressure-tests a candidate through a chain of validators before you act on it:
 
@@ -75,7 +69,7 @@ Each candidate shows its confidence score and the path. Run `--verbose` for the 
 
 Outputs a human-readable reasoning trace. Fails loudly if any validator rejects.
 
-### 4. Quarantine
+### 4. Quarantine *(coming in M2)*
 
 `disk-advisor quarantine <id>` moves the candidate to `~/.disk-advisor/quarantine/` with a manifest. Space is freed immediately. Nothing is permanently deleted — restore is always available for 30 days (configurable).
 
