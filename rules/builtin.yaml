@@ -25,7 +25,22 @@
   path_pattern: "~/Library/Developer/Xcode/iOS DeviceSupport"
   domain: ios_development
   base_confidence: 0.75
-  reason: "Device support files for old iOS versions — safe to remove for versions you no longer test"
+  reason: "Device support files for old iOS versions"
+
+- id: xcode-simulator-devices
+  category: dev-artifact
+  path_pattern: "~/Library/Developer/CoreSimulator/Devices"
+  domain: ios_development
+  base_confidence: 0.68
+  reason: "Simulator device images — recreatable in Xcode"
+  exclude_if_recent_access_days: 14
+
+- id: xcode-simulator-runtimes
+  category: app-cache
+  path_pattern: "~/Library/Developer/CoreSimulator/Cryptex/Images"
+  domain: ios_development
+  base_confidence: 0.72
+  reason: "Downloaded simulator runtime images — keep only versions you actively test on"
 
 - id: npm-node-modules
   category: dev-artifact
@@ -35,12 +50,43 @@
   reason: "Reinstall with `npm install` or `pnpm install`"
   exclude_if_recent_access_days: 7
 
+- id: pnpm-store
+  category: dev-artifact
+  path_pattern: "~/.pnpm-store"
+  domain: web_development
+  base_confidence: 0.78
+  reason: "pnpm content-addressable store — repopulated on next install"
+  exclude_if_recent_modified_days: 30
+
+- id: yarn-cache
+  category: dev-artifact
+  path_pattern: "~/.yarn/cache"
+  domain: web_development
+  base_confidence: 0.85
+  reason: "Yarn package cache — repopulated on next install"
+  exclude_if_recent_modified_days: 30
+
+- id: npm-cache
+  category: dev-artifact
+  path_pattern: "~/.npm/_cacache"
+  domain: web_development
+  base_confidence: 0.88
+  reason: "npm download cache — repopulated on demand"
+
 - id: python-venv
   category: dev-artifact
   path_pattern: "**/.venv"
   domain: python_development
   base_confidence: 0.80
   reason: "Recreate with `python -m venv .venv`"
+  exclude_if_recent_access_days: 7
+
+- id: python-venv-alt
+  category: dev-artifact
+  path_pattern: "**/venv"
+  domain: python_development
+  base_confidence: 0.78
+  reason: "Python virtualenv — recreate with `python -m venv venv`"
   exclude_if_recent_access_days: 7
 
 - id: python-pycache
@@ -50,6 +96,13 @@
   base_confidence: 0.90
   reason: "Python bytecode cache — regenerated automatically"
 
+- id: python-pip-cache
+  category: dev-artifact
+  path_pattern: "~/Library/Caches/pip"
+  domain: python_development
+  base_confidence: 0.88
+  reason: "pip download cache — repopulated on demand"
+
 - id: rust-target-dir
   category: dev-artifact
   path_pattern: "**/target"
@@ -57,6 +110,22 @@
   base_confidence: 0.78
   reason: "Rust build artifacts — rebuild with `cargo build`"
   exclude_if_recent_modified_days: 7
+
+- id: cargo-registry
+  category: dev-artifact
+  path_pattern: "~/.cargo/registry"
+  domain: rust_development
+  base_confidence: 0.75
+  reason: "Cargo package registry cache — repopulated on next build"
+  exclude_if_recent_modified_days: 30
+
+- id: cargo-git
+  category: dev-artifact
+  path_pattern: "~/.cargo/git"
+  domain: rust_development
+  base_confidence: 0.75
+  reason: "Cargo git dependency cache — repopulated on next build"
+  exclude_if_recent_modified_days: 30
 
 - id: next-build
   category: dev-artifact
@@ -66,6 +135,14 @@
   reason: "Next.js build cache — rebuilt automatically"
   exclude_if_recent_access_days: 5
 
+- id: nuxt-build
+  category: dev-artifact
+  path_pattern: "**/.nuxt"
+  domain: web_development
+  base_confidence: 0.85
+  reason: "Nuxt.js build cache — rebuilt automatically"
+  exclude_if_recent_access_days: 5
+
 - id: dist-build
   category: dev-artifact
   path_pattern: "**/dist"
@@ -73,6 +150,52 @@
   base_confidence: 0.72
   reason: "Build output directory — regenerate with your build command"
   exclude_if_recent_access_days: 7
+
+- id: turbo-cache
+  category: dev-artifact
+  path_pattern: "**/.turbo"
+  domain: web_development
+  base_confidence: 0.82
+  reason: "Turborepo build cache — regenerated automatically"
+
+- id: vite-cache
+  category: dev-artifact
+  path_pattern: "**/node_modules/.vite"
+  domain: web_development
+  base_confidence: 0.88
+  reason: "Vite dependency pre-bundle cache — regenerated automatically"
+
+- id: gradle-cache
+  category: dev-artifact
+  path_pattern: "~/.gradle/caches"
+  domain: android_development
+  base_confidence: 0.78
+  reason: "Gradle build cache — repopulated on next build"
+  exclude_if_recent_modified_days: 14
+
+- id: gradle-wrapper
+  category: dev-artifact
+  path_pattern: "~/.gradle/wrapper/dists"
+  domain: android_development
+  base_confidence: 0.72
+  reason: "Gradle wrapper distributions — re-downloaded on demand"
+  exclude_if_recent_access_days: 30
+
+- id: maven-repository
+  category: dev-artifact
+  path_pattern: "~/.m2/repository"
+  domain: java_development
+  base_confidence: 0.70
+  reason: "Maven local repository — repopulated on next build"
+  exclude_if_recent_modified_days: 30
+
+- id: go-pkg-cache
+  category: dev-artifact
+  path_pattern: "~/go/pkg"
+  domain: go_development
+  base_confidence: 0.80
+  reason: "Go compiled package cache — rebuilt with `go build`"
+  exclude_if_recent_modified_days: 14
 
 - id: homebrew-cache
   category: dev-artifact
@@ -85,7 +208,67 @@
   path_pattern: "~/Library/Containers/com.docker.docker/Data/vms"
   domain: docker
   base_confidence: 0.65
-  reason: "Docker VM disk images — safe only if you're done with Docker or can rebuild images"
+  reason: "Docker VM disk images — safe only if you can rebuild all images"
+
+- id: docker-orbstack
+  category: dev-artifact
+  path_pattern: "~/.orbstack/data"
+  domain: docker
+  base_confidence: 0.60
+  reason: "OrbStack VM data — safe only if you can rebuild all containers"
+  exclude_if_recent_access_days: 14
+
+- id: ruby-gems
+  category: dev-artifact
+  path_pattern: "~/.gem"
+  domain: ruby_development
+  base_confidence: 0.75
+  reason: "Ruby gems — reinstall with `bundle install`"
+  exclude_if_recent_modified_days: 30
+
+- id: cocoapods-cache
+  category: dev-artifact
+  path_pattern: "~/Library/Caches/CocoaPods"
+  domain: ios_development
+  base_confidence: 0.85
+  reason: "CocoaPods download cache — repopulated on `pod install`"
+
+- id: swift-pm-cache
+  category: dev-artifact
+  path_pattern: "~/Library/Caches/org.swift.swiftpm"
+  domain: ios_development
+  base_confidence: 0.82
+  reason: "Swift Package Manager cache — repopulated on next resolve"
+
+- id: jetbrains-caches
+  category: app-cache
+  path_pattern: "~/Library/Caches/JetBrains"
+  base_confidence: 0.82
+  reason: "JetBrains IDE caches — rebuilt on next IDE launch"
+
+- id: unity-library
+  category: dev-artifact
+  path_pattern: "**/Library"
+  domain: unity_development
+  base_confidence: 0.72
+  reason: "Unity project Library folder — rebuilt by Unity on next open"
+  exclude_if_recent_access_days: 14
+
+- id: unreal-intermediate
+  category: dev-artifact
+  path_pattern: "**/Intermediate"
+  domain: unreal_development
+  base_confidence: 0.75
+  reason: "Unreal Engine intermediate build files — rebuilt automatically"
+  exclude_if_recent_modified_days: 7
+
+- id: unreal-saved
+  category: dev-artifact
+  path_pattern: "**/Saved/Cooked"
+  domain: unreal_development
+  base_confidence: 0.80
+  reason: "Unreal cooked content — rebuilt on next cook"
+  exclude_if_recent_modified_days: 7
 
 # ── App Caches ─────────────────────────────────────────────────────────────────
 
@@ -101,18 +284,80 @@
   base_confidence: 0.88
   reason: "Chrome browser cache — rebuilt on demand"
 
+- id: arc-cache
+  category: app-cache
+  path_pattern: "~/Library/Caches/company.thebrowser.Browser"
+  base_confidence: 0.85
+  reason: "Arc browser cache — rebuilt on demand"
+
+- id: firefox-cache
+  category: app-cache
+  path_pattern: "~/Library/Caches/Firefox"
+  base_confidence: 0.88
+  reason: "Firefox browser cache — rebuilt on demand"
+
+- id: safari-cache
+  category: app-cache
+  path_pattern: "~/Library/Caches/com.apple.Safari"
+  base_confidence: 0.82
+  reason: "Safari browser cache — rebuilt on demand"
+
 - id: spotify-cache
   category: app-cache
   path_pattern: "~/Library/Caches/com.spotify.client"
   base_confidence: 0.85
   reason: "Spotify audio cache — rebuilt as you listen"
 
-- id: xcode-simulator-runtimes
+- id: discord-cache
   category: app-cache
-  path_pattern: "~/Library/Developer/CoreSimulator/Cryptex/Images"
+  path_pattern: "~/Library/Application Support/discord/Cache"
+  base_confidence: 0.88
+  reason: "Discord media cache — rebuilt on demand"
+
+- id: figma-cache
+  category: app-cache
+  path_pattern: "~/Library/Application Support/Figma/DesktopProfile/Cache"
+  base_confidence: 0.85
+  reason: "Figma desktop cache — rebuilt on demand"
+
+- id: notion-cache
+  category: app-cache
+  path_pattern: "~/Library/Application Support/Notion/Cache"
+  base_confidence: 0.85
+  reason: "Notion desktop cache — rebuilt on demand"
+
+- id: zoom-cache
+  category: app-cache
+  path_pattern: "~/Library/Application Support/zoom.us/Cache"
+  base_confidence: 0.88
+  reason: "Zoom media cache — rebuilt on demand"
+
+- id: teams-cache
+  category: app-cache
+  path_pattern: "~/Library/Application Support/Microsoft/Teams/Cache"
+  base_confidence: 0.88
+  reason: "Microsoft Teams cache — rebuilt on demand"
+
+- id: linear-cache
+  category: app-cache
+  path_pattern: "~/Library/Application Support/Linear/Cache"
+  base_confidence: 0.85
+  reason: "Linear desktop cache — rebuilt on demand"
+
+- id: apple-mail-cache
+  category: app-cache
+  path_pattern: "~/Library/Mail/V*/MailData/Envelope Index-wal"
+  base_confidence: 0.70
+  reason: "Mail write-ahead log — safe to remove when Mail is closed"
+  exclude_if_recent_access_days: 1
+
+- id: ios-device-backups
+  category: app-cache
+  path_pattern: "~/Library/Application Support/MobileSync/Backup"
   domain: ios_development
-  base_confidence: 0.72
-  reason: "Downloaded simulator runtime images — keep only versions you actively test on"
+  base_confidence: 0.55
+  reason: "iOS device backups — keep at least the most recent one"
+  exclude_if_recent_modified_days: 90
 
 # ── Download Entropy ───────────────────────────────────────────────────────────
 
@@ -130,6 +375,27 @@
   reason: "Downloaded archive — likely already extracted or abandoned"
   exclude_if_recent_modified_days: 60
 
+- id: old-pkg-installers
+  category: download-entropy
+  path_pattern: "~/Downloads/*.pkg"
+  base_confidence: 0.82
+  reason: "macOS package installer — already installed or abandoned"
+  exclude_if_recent_modified_days: 30
+
+- id: desktop-screenshots
+  category: download-entropy
+  path_pattern: "~/Desktop/Screenshot*.png"
+  base_confidence: 0.72
+  reason: "Screenshots accumulate on Desktop — move or delete once reviewed"
+  exclude_if_recent_modified_days: 7
+
+- id: downloads-screenshots
+  category: download-entropy
+  path_pattern: "~/Downloads/Screenshot*.png"
+  base_confidence: 0.75
+  reason: "Screenshots in Downloads — likely already reviewed"
+  exclude_if_recent_modified_days: 14
+
 # ── VM Disks ───────────────────────────────────────────────────────────────────
 
 - id: parallels-vm
@@ -140,6 +406,14 @@
   reason: "Parallels VM disk — keep only VMs you actively use"
   exclude_if_recent_access_days: 30
 
+- id: vmware-vm
+  category: vm-disk
+  path_pattern: "~/Virtual Machines/*.vmwarevm"
+  domain: virtualization
+  base_confidence: 0.60
+  reason: "VMware Fusion VM — keep only VMs you actively use"
+  exclude_if_recent_access_days: 30
+
 - id: android-avd
   category: vm-disk
   path_pattern: "~/.android/avd"
@@ -147,3 +421,10 @@
   base_confidence: 0.75
   reason: "Android emulator virtual devices — recreate in Android Studio"
   exclude_if_recent_access_days: 14
+
+- id: ios-simulator-logs
+  category: vm-disk
+  path_pattern: "~/Library/Logs/CoreSimulator"
+  domain: ios_development
+  base_confidence: 0.88
+  reason: "iOS simulator logs — not needed after debugging sessions"
