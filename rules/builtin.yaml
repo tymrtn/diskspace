@@ -143,13 +143,6 @@
   reason: "Nuxt.js build cache — rebuilt automatically"
   exclude_if_recent_access_days: 5
 
-- id: dist-build
-  category: dev-artifact
-  path_pattern: "**/dist"
-  domain: web_development
-  base_confidence: 0.72
-  reason: "Build output directory — regenerate with your build command"
-  exclude_if_recent_access_days: 7
 
 - id: turbo-cache
   category: dev-artifact
@@ -246,29 +239,10 @@
   base_confidence: 0.82
   reason: "JetBrains IDE caches — rebuilt on next IDE launch"
 
-- id: unity-library
-  category: dev-artifact
-  path_pattern: "**/Library"
-  domain: unity_development
-  base_confidence: 0.72
-  reason: "Unity project Library folder — rebuilt by Unity on next open"
-  exclude_if_recent_access_days: 14
-
-- id: unreal-intermediate
-  category: dev-artifact
-  path_pattern: "**/Intermediate"
-  domain: unreal_development
-  base_confidence: 0.75
-  reason: "Unreal Engine intermediate build files — rebuilt automatically"
-  exclude_if_recent_modified_days: 7
-
-- id: unreal-saved
-  category: dev-artifact
-  path_pattern: "**/Saved/Cooked"
-  domain: unreal_development
-  base_confidence: 0.80
-  reason: "Unreal cooked content — rebuilt on next cook"
-  exclude_if_recent_modified_days: 7
+# Unity/Unreal rules intentionally omitted: `**/Library` and `**/Intermediate`
+# are too broad for safe glob detection. These engines require sibling-directory
+# context checks (e.g., adjacent Assets/ or .uproject file) that the current
+# rule engine cannot express. PRs welcome with a safer detection approach.
 
 # ── App Caches ─────────────────────────────────────────────────────────────────
 
