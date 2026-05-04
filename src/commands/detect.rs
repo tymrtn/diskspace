@@ -84,10 +84,7 @@ pub fn run(show_all: bool, top: usize, ctx: &Context) -> Result<()> {
         );
 
         // Path
-        println!(
-            "       {}",
-            ctx.style(&c.path.display().to_string(), &bold)
-        );
+        println!("       {}", ctx.style(&c.path.display().to_string(), &bold));
 
         // Confidence bar + id
         if !ctx.quiet {
@@ -101,10 +98,7 @@ pub fn run(show_all: bool, top: usize, ctx: &Context) -> Result<()> {
 
         // Reason (verbose only)
         if ctx.verbose {
-            println!(
-                "       {}",
-                ctx.style(&format!("↳  {}", c.reason), &dim)
-            );
+            println!("       {}", ctx.style(&format!("↳  {}", c.reason), &dim));
         }
 
         if i < shown.len() - 1 {

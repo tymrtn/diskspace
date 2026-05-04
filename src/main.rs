@@ -11,7 +11,9 @@ use std::path::PathBuf;
 #[command(name = "disk-advisor")]
 #[command(about = "Find and safely reclaim your disk's lowest-hanging fruit")]
 #[command(version)]
-#[command(after_help = "Run without arguments to get started, or try `disk-advisor scan` to begin.")]
+#[command(
+    after_help = "Run without arguments to get started, or try `disk-advisor scan` to begin."
+)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
@@ -119,8 +121,13 @@ fn main() -> Result<()> {
         Some(Commands::Detect { all, top }) => commands::detect::run(all, top, &ctx),
         Some(Commands::Check { candidate_id }) => commands::check::run(&candidate_id, &ctx),
         Some(Commands::Quarantine { target }) => commands::quarantine::run(&target, &ctx),
-        Some(Commands::Restore { target, all }) => commands::restore::run(target.as_deref(), all, &ctx),
-        Some(Commands::Purge { older_than, dry_run }) => commands::purge::run(older_than, dry_run, &ctx),
+        Some(Commands::Restore { target, all }) => {
+            commands::restore::run(target.as_deref(), all, &ctx)
+        }
+        Some(Commands::Purge {
+            older_than,
+            dry_run,
+        }) => commands::purge::run(older_than, dry_run, &ctx),
         Some(Commands::Status) => commands::status::run(&ctx),
         Some(Commands::Profile { action }) => match action {
             ProfileAction::Get => commands::profile_cmd::get(&ctx),

@@ -17,6 +17,11 @@ pub fn run(ctx: &Context) -> Result<()> {
         return Ok(());
     }
 
+    // First-run wizard: no profile + interactive TTY
+    if crate::commands::wizard::should_run(ctx) {
+        crate::commands::wizard::run(ctx)?;
+    }
+
     let cyan = Style::new().cyan();
     let dim = Style::new().dim();
     let bold = Style::new().bold();
@@ -32,7 +37,10 @@ pub fn run(ctx: &Context) -> Result<()> {
     println!();
     println!(
         "  {}",
-        ctx.style("find and safely reclaim your disk's lowest-hanging fruit", &dim)
+        ctx.style(
+            "find and safely reclaim your disk's lowest-hanging fruit",
+            &dim
+        )
     );
     println!();
 
@@ -91,10 +99,7 @@ pub fn run(ctx: &Context) -> Result<()> {
     }
 
     println!();
-    println!(
-        "  {}",
-        ctx.style(&output::rule("", 54), &dim)
-    );
+    println!("  {}", ctx.style(&output::rule("", 54), &dim));
     println!();
 
     Ok(())

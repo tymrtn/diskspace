@@ -64,18 +64,18 @@ pub fn pressure_test(
     path: &Path,
     prof: &profile::Profile,
 ) -> Result<CheckResult> {
-    let mut steps: Vec<CheckStep> = Vec::new();
-
-    steps.push(restat_check(path));
-    steps.push(liveness_check(path));
-    steps.push(policy_check(path, prof));
-    steps.push(recency_check(path));
+    let steps: Vec<CheckStep> = vec![
+        restat_check(path),
+        liveness_check(path),
+        policy_check(path, prof),
+        recency_check(path),
+    ];
 
     let safe = steps.iter().all(|s| s.passed);
     // Confidence decays for each soft failure
-    let confidence = steps.iter().fold(1.0f32, |acc, s| {
-        if s.passed { acc } else { acc * 0.5 }
-    });
+    let confidence = steps
+        .iter()
+        .fold(1.0f32, |acc, s| if s.passed { acc } else { acc * 0.5 });
 
     Ok(CheckResult {
         candidate_id: candidate_id.to_string(),
@@ -136,10 +136,7 @@ fn render_result(result: &CheckResult, ctx: &Context) {
             ctx.style(&result.candidate_id, &dim),
         );
     } else {
-        println!(
-            "  {}  not safe — see failures above",
-            ctx.style("✗", &red),
-        );
+        println!("  {}  not safe — see failures above", ctx.style("✗", &red),);
     }
     println!();
 }
@@ -165,20 +162,17 @@ fn liveness_check(path: &Path) -> CheckStep {
         .arg(path.to_string_lossy().as_ref())
         .output();
 
-    match output {
-        Ok(out) => {
-            let lines = String::from_utf8_lossy(&out.stdout);
-            let open = lines.lines().count().saturating_sub(1); // subtract header
-            if open > 0 {
-                return CheckStep {
-                    name: "liveness".into(),
-                    passed: false,
-                    note: format!("{} open file handle(s)", open),
-                };
-            }
+    if let Ok(out) = output {
+        let lines = String::from_utf8_lossy(&out.stdout);
+        let open = lines.lines().count().saturating_sub(1); // subtract header
+        if open > 0 {
+            return CheckStep {
+                name: "liveness".into(),
+                passed: false,
+                note: format!("{} open file handle(s)", open),
+            };
         }
-        Err(_) => {} // lsof unavailable — fall through to mtime check
-    }
+    } // lsof unavailable or no handles — fall through to mtime check
 
     // Check for writes in last 24h
     if walk_recent_mtime(path, chrono::Duration::hours(24)) {
@@ -270,7 +264,10 @@ fn recency_check(path: &Path) -> CheckStep {
                         note: if passed {
                             format!("last git activity {} days ago", age_days)
                         } else {
-                            format!("git activity {} day(s) ago — project may be active", age_days)
+                            format!(
+                                "git activity {} day(s) ago — project may be active",
+                                age_days
+                            )
                         },
                     };
                 }

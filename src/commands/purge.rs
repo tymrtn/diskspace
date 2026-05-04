@@ -10,7 +10,7 @@ pub fn run(older_than: Option<u32>, dry_run: bool, ctx: &Context) -> Result<()> 
 
     if manifest.entries.is_empty() {
         if ctx.json {
-            println!("{}", r#"{"purged":[],"message":"quarantine is empty"}"#);
+            println!(r#"{{"purged":[],"message":"quarantine is empty"}}"#);
         } else {
             println!("\n  Quarantine is empty — nothing to purge.\n");
         }
@@ -36,7 +36,7 @@ pub fn run(older_than: Option<u32>, dry_run: bool, ctx: &Context) -> Result<()> 
 
     if to_purge.is_empty() {
         if ctx.json {
-            println!("{}", r#"{"purged":[],"message":"no entries eligible for purge"}"#);
+            println!(r#"{{"purged":[],"message":"no entries eligible for purge"}}"#);
         } else {
             println!("\n  No entries eligible for purge yet.\n");
         }
@@ -46,7 +46,10 @@ pub fn run(older_than: Option<u32>, dry_run: bool, ctx: &Context) -> Result<()> 
     let red = Style::new().red().bold();
     let bold = Style::new().bold();
     let dim = Style::new().dim();
-    let total_bytes: u64 = to_purge.iter().map(|&i| manifest.entries[i].size_bytes).sum();
+    let total_bytes: u64 = to_purge
+        .iter()
+        .map(|&i| manifest.entries[i].size_bytes)
+        .sum();
 
     if dry_run {
         if ctx.json {
@@ -57,7 +60,10 @@ pub fn run(older_than: Option<u32>, dry_run: bool, ctx: &Context) -> Result<()> 
             println!("{}", serde_json::to_string_pretty(&preview)?);
         } else {
             println!();
-            println!("  {} (dry run — nothing deleted)", ctx.style("Eligible for purge:", &bold));
+            println!(
+                "  {} (dry run — nothing deleted)",
+                ctx.style("Eligible for purge:", &bold)
+            );
             println!();
             for &i in &to_purge {
                 let e = &manifest.entries[i];

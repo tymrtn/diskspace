@@ -33,7 +33,10 @@ pub fn run(target: &str, ctx: &Context) -> Result<()> {
             if ctx.json {
                 eprintln!(r#"{{"error":"candidate not found","hint":"run disk-advisor detect"}}"#);
             } else {
-                eprintln!("\n  Candidate '{}' not found. Run `disk-advisor detect` first.\n", target);
+                eprintln!(
+                    "\n  Candidate '{}' not found. Run `disk-advisor detect` first.\n",
+                    target
+                );
             }
             std::process::exit(1);
         }

@@ -35,7 +35,7 @@ pub fn load_manifest() -> Result<QuarantineManifest> {
         return Ok(QuarantineManifest::default());
     }
     let content = std::fs::read_to_string(&path).context("reading quarantine manifest")?;
-    Ok(serde_json::from_str(&content).context("parsing quarantine manifest")?)
+    serde_json::from_str(&content).context("parsing quarantine manifest")
 }
 
 pub fn save_manifest(manifest: &QuarantineManifest) -> Result<()> {

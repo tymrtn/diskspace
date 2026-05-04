@@ -7,3 +7,4 @@ pub mod restore;
 pub mod scan;
 pub mod status;
 pub mod welcome;
+pub mod wizard;

@@ -21,6 +21,11 @@ pub fn run(path: Option<PathBuf>, ctx: &Context) -> Result<()> {
         anyhow::bail!("Path does not exist: {}", root.display());
     }
 
+    // Offer wizard on first scan if no profile exists yet
+    if crate::commands::wizard::should_run(ctx) {
+        crate::commands::wizard::run(ctx)?;
+    }
+
     let rule_list = rules::load_builtin()?;
 
     let spinner = if !ctx.json && !ctx.quiet {
@@ -63,10 +68,7 @@ pub fn run(path: Option<PathBuf>, ctx: &Context) -> Result<()> {
     let scanned_at = result.scanned_at.format("%H:%M:%S").to_string();
 
     println!();
-    let (top, bot) = output::box_line(
-        &format!("scan  ·  {}  ·  {}", total, root.display()),
-        60,
-    );
+    let (top, bot) = output::box_line(&format!("scan  ·  {}  ·  {}", total, root.display()), 60);
     println!("  {}", ctx.style(&top, &dim));
     println!();
 
@@ -100,6 +102,22 @@ pub fn run(path: Option<PathBuf>, ctx: &Context) -> Result<()> {
 
     println!();
     println!("  {}", ctx.style(&bot, &dim));
+    // Show cloud placeholder notice if any files were skipped
+    if result.cloud_placeholder_bytes > 0 {
+        let cloud_str = output::format_bytes(result.cloud_placeholder_bytes);
+        println!(
+            "  {} {}",
+            ctx.style("☁", &dim),
+            ctx.style(
+                &format!(
+                    "{} in cloud-only files skipped (iCloud / Dropbox — not local)",
+                    cloud_str
+                ),
+                &dim
+            ),
+        );
+    }
+
     println!();
     println!(
         "  {} {}    {}",

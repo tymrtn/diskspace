@@ -1,6 +1,6 @@
 [package]
 name = "disk-advisor"
-version = "0.1.0"
+version = "0.5.0"
 edition = "2021"
 description = "A personalized, reversible disk-cleanup CLI"
 license = "LicenseRef-PolyForm-Noncommercial-1.0.0"

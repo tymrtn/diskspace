@@ -59,12 +59,7 @@ pub fn set(assignment: &str, ctx: &Context) -> Result<()> {
         println!(r#"{{"set":"{}","value":"{}"}}"#, key, value);
     } else {
         let bold = Style::new().bold();
-        println!(
-            "\n  {} {} = {}\n",
-            ctx.style("set", &bold),
-            key,
-            value
-        );
+        println!("\n  {} {} = {}\n", ctx.style("set", &bold), key, value);
     }
 
     Ok(())

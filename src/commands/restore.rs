@@ -9,7 +9,7 @@ pub fn run(target: Option<&str>, all: bool, ctx: &Context) -> Result<()> {
 
     if manifest.entries.is_empty() {
         if ctx.json {
-            println!("{}", r#"{"restored":[],"message":"quarantine is empty"}"#);
+            println!(r#"{{"restored":[],"message":"quarantine is empty"}}"#);
         } else {
             println!("\n  Quarantine is empty — nothing to restore.\n");
         }
@@ -19,9 +19,11 @@ pub fn run(target: Option<&str>, all: bool, ctx: &Context) -> Result<()> {
     let to_restore: Vec<usize> = if all {
         (0..manifest.entries.len()).collect()
     } else if let Some(t) = target {
-        match manifest.entries.iter().position(|e| {
-            e.id == t || e.original_path.to_string_lossy() == t
-        }) {
+        match manifest
+            .entries
+            .iter()
+            .position(|e| e.id == t || e.original_path.to_string_lossy() == t)
+        {
             Some(i) => vec![i],
             None => {
                 if ctx.json {
@@ -39,7 +41,9 @@ pub fn run(target: Option<&str>, all: bool, ctx: &Context) -> Result<()> {
         if ctx.json {
             eprintln!(r#"{{"error":"specify a target id or use --all"}}"#);
         } else {
-            eprintln!("  Specify an entry ID or use --all. Run `disk-advisor status` to list entries.");
+            eprintln!(
+                "  Specify an entry ID or use --all. Run `disk-advisor status` to list entries."
+            );
         }
         std::process::exit(1);
     };

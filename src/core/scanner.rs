@@ -16,6 +16,9 @@ pub struct ScanResult {
     pub root: PathBuf,
     pub entries: Vec<ScannedEntry>,
     pub total_bytes: u64,
+    /// Bytes in cloud-only placeholder files (iCloud evicted, Dropbox Smart Sync) — not counted in total_bytes.
+    #[serde(default)]
+    pub cloud_placeholder_bytes: u64,
 }
 
 /// Walk the filesystem in parallel, classify entries against rules.
@@ -23,6 +26,7 @@ pub fn scan(root: &Path, rules: &[Rule]) -> Result<ScanResult> {
     let home = dirs_home();
     let mut entries: Vec<ScannedEntry> = Vec::new();
     let mut total_bytes: u64 = 0;
+    let mut cloud_placeholder_bytes: u64 = 0;
 
     // Build a map of rule path patterns to categories for fast lookup
     let rule_map: Vec<(glob::Pattern, Category, &Rule)> = rules
@@ -49,6 +53,18 @@ pub fn scan(root: &Path, rules: &[Rule]) -> Result<ScanResult> {
 
         if !metadata.is_file() && !metadata.is_dir() {
             continue;
+        }
+
+        // Skip iCloud Drive evicted files and Dropbox Smart Sync online-only files.
+        // These have a non-zero reported size but zero disk blocks allocated — the data
+        // lives in the cloud, not locally. Counting them inflates totals by hundreds of GB.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if metadata.is_file() && metadata.len() > 4096 && metadata.blocks() == 0 {
+                cloud_placeholder_bytes += metadata.len();
+                continue;
+            }
         }
 
         // For directories matched by rules we record the entry at that level
@@ -83,6 +99,7 @@ pub fn scan(root: &Path, rules: &[Rule]) -> Result<ScanResult> {
         root: root.to_path_buf(),
         entries,
         total_bytes,
+        cloud_placeholder_bytes,
     })
 }
 
