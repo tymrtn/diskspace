@@ -1,0 +1,133 @@
+use console::{Style, Term};
+
+pub struct Context {
+    pub json: bool,
+    #[allow(dead_code)]
+    pub yes: bool,
+    pub no_color: bool,
+    pub verbose: bool,
+    pub quiet: bool,
+}
+
+impl Context {
+    pub fn style(&self, s: &str, style: &Style) -> String {
+        if self.no_color {
+            s.to_string()
+        } else {
+            style.apply_to(s).to_string()
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn confirm(&self, prompt: &str) -> bool {
+        if self.yes || self.json {
+            return true;
+        }
+        let term = Term::stderr();
+        eprint!("{} [y/N] ", prompt);
+        if let Ok(line) = term.read_line() {
+            matches!(line.trim().to_lowercase().as_str(), "y" | "yes")
+        } else {
+            false
+        }
+    }
+}
+
+/// Render a confidence bar like [████████░░] 80%
+pub fn confidence_bar(score: f32, width: usize) -> String {
+    let filled = (score * width as f32).round() as usize;
+    let empty = width.saturating_sub(filled);
+    format!(
+        "[{}{}] {:.0}%",
+        "█".repeat(filled),
+        "░".repeat(empty),
+        score * 100.0
+    )
+}
+
+/// Format bytes as human-readable string
+pub fn format_bytes(bytes: u64) -> String {
+    const GB: u64 = 1_073_741_824;
+    const MB: u64 = 1_048_576;
+    const KB: u64 = 1_024;
+    if bytes >= GB {
+        format!("{:.1} GB", bytes as f64 / GB as f64)
+    } else if bytes >= MB {
+        format!("{:.0} MB", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{:.0} KB", bytes as f64 / KB as f64)
+    } else {
+        format!("{} B", bytes)
+    }
+}
+
+/// Inline horizontal bar using block gradient chars for visual weight
+pub fn size_bar(bytes: u64, max_bytes: u64, width: usize) -> String {
+    if max_bytes == 0 {
+        return "░".repeat(width);
+    }
+    let ratio = bytes as f64 / max_bytes as f64;
+    let filled = (ratio * width as f64).round() as usize;
+    let filled = filled.min(width);
+    let empty = width.saturating_sub(filled);
+    // Use gradient blocks for the filled portion: taper off at the end
+    let bar: String = (0..filled)
+        .map(|i| {
+            if filled < 3 || i < filled.saturating_sub(2) {
+                '█'
+            } else if i == filled.saturating_sub(2) {
+                '▓'
+            } else {
+                '▒'
+            }
+        })
+        .collect();
+    format!("{}{}", bar, "░".repeat(empty))
+}
+
+/// Icon for a category (plain ASCII-art style, no emoji)
+pub fn category_icon(category: &str) -> &'static str {
+    match category {
+        "dev-artifact" => "◈",
+        "app-cache" => "◉",
+        "download-entropy" => "◎",
+        "vm-disk" => "▣",
+        _ => "·",
+    }
+}
+
+/// Style for a category
+pub fn category_style(category: &str) -> Style {
+    match category {
+        "dev-artifact" => Style::new().yellow(),
+        "app-cache" => Style::new().cyan(),
+        "download-entropy" => Style::new().magenta(),
+        "vm-disk" => Style::new().red(),
+        _ => Style::new().dim(),
+    }
+}
+
+/// Draw a horizontal rule with an optional centered label
+///   ── label ────────────────────
+pub fn rule(label: &str, width: usize) -> String {
+    if label.is_empty() {
+        "─".repeat(width)
+    } else {
+        let inner = format!(" {} ", label);
+        let dashes = width.saturating_sub(inner.len() + 2);
+        let left = dashes / 2;
+        let right = dashes - left;
+        format!("{}{}{}", "─".repeat(left), inner, "─".repeat(right))
+    }
+}
+
+/// Draw a padded box header
+///   ╭─ title ──────────────────╮
+///   ╰──────────────────────────╯
+pub fn box_line(label: &str, width: usize) -> (String, String) {
+    let inner = format!("─ {} ", label);
+    let dashes = width.saturating_sub(inner.len() + 2);
+    let top = format!("╭{}{}╮", inner, "─".repeat(dashes));
+    let bottom = format!("╰{}╯", "─".repeat(width.saturating_sub(2)));
+    (top, bottom)
+}

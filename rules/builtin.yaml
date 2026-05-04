@@ -1,0 +1,149 @@
+# disk-advisor built-in rule library
+# Confidence: 0.0–1.0 (modified at runtime by profile domain, recency, liveness)
+# Contributing: add a rule here with a PR — no Rust required.
+
+# ── Dev Artifacts ──────────────────────────────────────────────────────────────
+
+- id: xcode-derived-data
+  category: dev-artifact
+  path_pattern: "~/Library/Developer/Xcode/DerivedData"
+  domain: ios_development
+  base_confidence: 0.85
+  reason: "Xcode rebuilds this automatically on next build"
+  exclude_if_recent_modified_days: 3
+
+- id: xcode-archives
+  category: dev-artifact
+  path_pattern: "~/Library/Developer/Xcode/Archives"
+  domain: ios_development
+  base_confidence: 0.70
+  reason: "Old Xcode build archives — keep only if you distribute those builds"
+  exclude_if_recent_modified_days: 7
+
+- id: xcode-device-support
+  category: dev-artifact
+  path_pattern: "~/Library/Developer/Xcode/iOS DeviceSupport"
+  domain: ios_development
+  base_confidence: 0.75
+  reason: "Device support files for old iOS versions — safe to remove for versions you no longer test"
+
+- id: npm-node-modules
+  category: dev-artifact
+  path_pattern: "**/node_modules"
+  domain: web_development
+  base_confidence: 0.82
+  reason: "Reinstall with `npm install` or `pnpm install`"
+  exclude_if_recent_access_days: 7
+
+- id: python-venv
+  category: dev-artifact
+  path_pattern: "**/.venv"
+  domain: python_development
+  base_confidence: 0.80
+  reason: "Recreate with `python -m venv .venv`"
+  exclude_if_recent_access_days: 7
+
+- id: python-pycache
+  category: dev-artifact
+  path_pattern: "**/__pycache__"
+  domain: python_development
+  base_confidence: 0.90
+  reason: "Python bytecode cache — regenerated automatically"
+
+- id: rust-target-dir
+  category: dev-artifact
+  path_pattern: "**/target"
+  domain: rust_development
+  base_confidence: 0.78
+  reason: "Rust build artifacts — rebuild with `cargo build`"
+  exclude_if_recent_modified_days: 7
+
+- id: next-build
+  category: dev-artifact
+  path_pattern: "**/.next"
+  domain: web_development
+  base_confidence: 0.85
+  reason: "Next.js build cache — rebuilt automatically"
+  exclude_if_recent_access_days: 5
+
+- id: dist-build
+  category: dev-artifact
+  path_pattern: "**/dist"
+  domain: web_development
+  base_confidence: 0.72
+  reason: "Build output directory — regenerate with your build command"
+  exclude_if_recent_access_days: 7
+
+- id: homebrew-cache
+  category: dev-artifact
+  path_pattern: "~/Library/Caches/Homebrew"
+  base_confidence: 0.92
+  reason: "Homebrew download cache — safe to clear, re-downloaded on demand"
+
+- id: docker-data
+  category: dev-artifact
+  path_pattern: "~/Library/Containers/com.docker.docker/Data/vms"
+  domain: docker
+  base_confidence: 0.65
+  reason: "Docker VM disk images — safe only if you're done with Docker or can rebuild images"
+
+# ── App Caches ─────────────────────────────────────────────────────────────────
+
+- id: slack-cache
+  category: app-cache
+  path_pattern: "~/Library/Application Support/Slack/Cache"
+  base_confidence: 0.88
+  reason: "Slack media cache — rebuilt on demand"
+
+- id: chrome-cache
+  category: app-cache
+  path_pattern: "~/Library/Caches/Google/Chrome"
+  base_confidence: 0.88
+  reason: "Chrome browser cache — rebuilt on demand"
+
+- id: spotify-cache
+  category: app-cache
+  path_pattern: "~/Library/Caches/com.spotify.client"
+  base_confidence: 0.85
+  reason: "Spotify audio cache — rebuilt as you listen"
+
+- id: xcode-simulator-runtimes
+  category: app-cache
+  path_pattern: "~/Library/Developer/CoreSimulator/Cryptex/Images"
+  domain: ios_development
+  base_confidence: 0.72
+  reason: "Downloaded simulator runtime images — keep only versions you actively test on"
+
+# ── Download Entropy ───────────────────────────────────────────────────────────
+
+- id: old-dmg-files
+  category: download-entropy
+  path_pattern: "~/Downloads/*.dmg"
+  base_confidence: 0.80
+  reason: "Disk image installer — app is already installed or abandoned"
+  exclude_if_recent_modified_days: 30
+
+- id: old-zip-installers
+  category: download-entropy
+  path_pattern: "~/Downloads/*.zip"
+  base_confidence: 0.70
+  reason: "Downloaded archive — likely already extracted or abandoned"
+  exclude_if_recent_modified_days: 60
+
+# ── VM Disks ───────────────────────────────────────────────────────────────────
+
+- id: parallels-vm
+  category: vm-disk
+  path_pattern: "~/Parallels/*.pvm"
+  domain: virtualization
+  base_confidence: 0.60
+  reason: "Parallels VM disk — keep only VMs you actively use"
+  exclude_if_recent_access_days: 30
+
+- id: android-avd
+  category: vm-disk
+  path_pattern: "~/.android/avd"
+  domain: android_development
+  base_confidence: 0.75
+  reason: "Android emulator virtual devices — recreate in Android Studio"
+  exclude_if_recent_access_days: 14

@@ -1,0 +1,31 @@
+[package]
+name = "disk-advisor"
+version = "0.1.0"
+edition = "2021"
+description = "A personalized, reversible disk-cleanup CLI"
+license = "Apache-2.0"
+
+[[bin]]
+name = "disk-advisor"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+jwalk = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+toml = "0.8"
+toml_edit = "0.22"
+console = "0.15"
+indicatif = "0.17"
+chrono = { version = "0.4", features = ["serde"] }
+anyhow = "1"
+thiserror = "1"
+glob = "0.3"
+include_dir = "0.7"
+
+[profile.release]
+opt-level = 3
+strip = true
+lto = true
