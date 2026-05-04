@@ -123,6 +123,15 @@ pub fn run(show_all: bool, top: usize, ctx: &Context) -> Result<()> {
     Ok(())
 }
 
+pub fn build_candidates_pub(
+    scan: &ScanResult,
+    rules: &[Rule],
+    prof: &Profile,
+    home: &str,
+) -> Vec<Candidate> {
+    build_candidates(scan, rules, prof, home)
+}
+
 fn build_candidates(
     scan: &ScanResult,
     rules: &[Rule],
