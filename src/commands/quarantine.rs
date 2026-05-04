@@ -9,7 +9,9 @@ use crate::core::scanner::ScanResult;
 use crate::output::{self, Context};
 use crate::profile;
 
-pub fn run(target: &str, ctx: &Context) -> Result<()> {
+const IMMEDIATE_MIN_CONFIDENCE: f32 = 0.85;
+
+pub fn run(target: &str, immediate: bool, ctx: &Context) -> Result<()> {
     let cache = scan_cache_path();
     if !cache.exists() {
         if ctx.json {
@@ -42,7 +44,25 @@ pub fn run(target: &str, ctx: &Context) -> Result<()> {
         }
     };
 
-    // Always pressure-test before quarantine
+    // --immediate requires high confidence
+    if immediate && candidate.confidence < IMMEDIATE_MIN_CONFIDENCE {
+        if ctx.json {
+            eprintln!(
+                r#"{{"error":"confidence_too_low","confidence":{:.2},"required":{:.2},"hint":"use quarantine without --immediate or raise confidence threshold"}}"#,
+                candidate.confidence, IMMEDIATE_MIN_CONFIDENCE
+            );
+        } else {
+            eprintln!(
+                "\n  --immediate requires confidence ≥ {:.0}%  (this candidate is {:.0}%)\n  Use `disk-advisor quarantine {}` to quarantine with restore option.\n",
+                IMMEDIATE_MIN_CONFIDENCE * 100.0,
+                candidate.confidence * 100.0,
+                target,
+            );
+        }
+        std::process::exit(3);
+    }
+
+    // Always pressure-test before acting
     let check_result = check::pressure_test(&candidate.id, &candidate.path, &prof)?;
     if !check_result.safe {
         if ctx.json {
@@ -59,8 +79,55 @@ pub fn run(target: &str, ctx: &Context) -> Result<()> {
         std::process::exit(2);
     }
 
-    // Confirmation prompt
     let size_str = output::format_bytes(candidate.size_bytes);
+
+    if immediate {
+        // Permanent delete — no quarantine, no restore
+        let prompt = format!(
+            "  Permanently delete {} ({})? This cannot be undone.",
+            candidate.path.display(),
+            size_str
+        );
+        if !ctx.json && !ctx.yes && !ctx.confirm(&prompt) {
+            println!("  Aborted.");
+            return Ok(());
+        }
+
+        if candidate.path.is_dir() {
+            std::fs::remove_dir_all(&candidate.path)?;
+        } else {
+            std::fs::remove_file(&candidate.path)?;
+        }
+
+        if ctx.json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "deleted": candidate.path,
+                    "size_bytes": candidate.size_bytes,
+                    "candidate_id": candidate.id,
+                }))?
+            );
+        } else {
+            let red = Style::new().red().bold();
+            let bold = Style::new().bold();
+            let dim = Style::new().dim();
+            println!();
+            println!(
+                "  {}  {} deleted permanently",
+                ctx.style("✓", &red),
+                ctx.style(&size_str, &bold),
+            );
+            println!(
+                "     {}",
+                ctx.style(&candidate.path.display().to_string(), &dim)
+            );
+            println!();
+        }
+        return Ok(());
+    }
+
+    // Standard quarantine path
     if !ctx.json && !ctx.yes && prof.preferences.confirm_before_quarantine {
         let prompt = format!(
             "  Quarantine {} ({}) and free {}?",

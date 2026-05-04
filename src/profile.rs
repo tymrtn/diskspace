@@ -49,7 +49,7 @@ pub struct Preferences {
 impl Default for Preferences {
     fn default() -> Self {
         Self {
-            quarantine_retention_days: 30,
+            quarantine_retention_days: 7,
             min_candidate_size_gb: 0.1,
             confirm_before_quarantine: true,
         }

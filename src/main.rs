@@ -64,6 +64,9 @@ enum Commands {
     Quarantine {
         /// Candidate ID or file path
         target: String,
+        /// Delete immediately without quarantine — only allowed for high-confidence candidates (≥0.85)
+        #[arg(long)]
+        immediate: bool,
     },
     /// Restore a quarantined item to its original location
     Restore {
@@ -120,7 +123,9 @@ fn main() -> Result<()> {
         Some(Commands::Scan { path }) => commands::scan::run(path, &ctx),
         Some(Commands::Detect { all, top }) => commands::detect::run(all, top, &ctx),
         Some(Commands::Check { candidate_id }) => commands::check::run(&candidate_id, &ctx),
-        Some(Commands::Quarantine { target }) => commands::quarantine::run(&target, &ctx),
+        Some(Commands::Quarantine { target, immediate }) => {
+            commands::quarantine::run(&target, immediate, &ctx)
+        }
         Some(Commands::Restore { target, all }) => {
             commands::restore::run(target.as_deref(), all, &ctx)
         }
