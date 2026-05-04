@@ -137,10 +137,11 @@ Rules live in [`rules/builtin.yaml`](rules/builtin.yaml). Open a PR.
 ## Roadmap
 
 - **M1** — scan, detect, rule library (20 rules), profile, styled CLI ✓
-- **M2** — check (pressure-test pipeline), quarantine, restore, purge
-- **M3** — profile domain scoring, agent polish
-- **M4** — 50+ rules, Homebrew cask, CI
-- **M5** — real-machine hardening, open source launch
+- **M2** — check (pressure-test pipeline), quarantine, restore, purge ✓
+- **M3** — profile domain scoring, agent polish ✓
+- **M4** — 58-rule library, GitHub Actions CI, CONTRIBUTING.md ✓
+- **M5** — first-run guided wizard, iCloud/Dropbox placeholder handling, Homebrew cask, public launch
+- **M6** — consequence explanations per candidate: recreation effort, rebuild time, performance impact while gone
 
 ## License
 
