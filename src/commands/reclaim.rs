@@ -16,9 +16,9 @@ pub fn run(top: usize, ctx: &Context) -> Result<()> {
     let cache = scan_cache_path();
     if !cache.exists() {
         if ctx.json {
-            eprintln!(r#"{{"error":"no scan found","hint":"run disk-space scan first"}}"#);
+            eprintln!(r#"{{"error":"no scan found","hint":"run diskspace scan first"}}"#);
         } else {
-            eprintln!("\n  No scan found. Run `disk-space scan` first.\n");
+            eprintln!("\n  No scan found. Run `diskspace scan` first.\n");
         }
         std::process::exit(1);
     }
@@ -42,7 +42,7 @@ pub fn run(top: usize, ctx: &Context) -> Result<()> {
             println!(r#"{{"reclaimed":[],"message":"no high-confidence candidates"}}"#);
         } else {
             println!(
-                "\n  No candidates at confidence ≥ {:.0}%. Run `disk-space detect` and use `airlock` for lower-confidence items.\n",
+                "\n  No candidates at confidence ≥ {:.0}%. Run `diskspace detect` and use `airlock` for lower-confidence items.\n",
                 MIN_CONFIDENCE * 100.0
             );
         }

@@ -123,7 +123,7 @@ pub fn run(path: Option<PathBuf>, ctx: &Context) -> Result<()> {
         "  {} {}    {}",
         ctx.style("✓", &Style::new().green().bold()),
         ctx.style(&format!("scan complete  ·  {}", scanned_at), &dim),
-        ctx.style("run disk-space detect →", &cyan),
+        ctx.style("run diskspace detect →", &cyan),
     );
     println!();
 

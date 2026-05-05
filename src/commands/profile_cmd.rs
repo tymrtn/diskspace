@@ -10,7 +10,7 @@ pub fn get(ctx: &Context) -> Result<()> {
         if ctx.json {
             println!("{}", serde_json::to_string_pretty(&Profile::default())?);
         } else {
-            println!("\n  No profile yet. Run `disk-space profile edit` to create one.\n");
+            println!("\n  No profile yet. Run `diskspace profile edit` to create one.\n");
         }
         return Ok(());
     }
@@ -134,9 +134,9 @@ fn set_toml_key(doc: &mut toml_edit::DocumentMut, key: &str, value: &str) -> Res
 }
 
 fn default_profile_toml() -> &'static str {
-    r#"# disk-space profile
+    r#"# diskspace profile
 # Edit this file to personalize your cleanup recommendations.
-# Your agent can also write to this with: disk-space profile set key=value
+# Your agent can also write to this with: diskspace profile set key=value
 
 [focus]
 current = ""
@@ -144,7 +144,7 @@ updated = ""
 
 [domains]
 # Set active = false for domains you no longer work in.
-# disk-space will rank those candidates higher.
+# diskspace will rank those candidates higher.
 #
 # ios_development = { active = false, last_active = "2024-11" }
 # web_development = { active = true }

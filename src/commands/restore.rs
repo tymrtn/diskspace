@@ -30,7 +30,7 @@ pub fn run(target: Option<&str>, all: bool, ctx: &Context) -> Result<()> {
                     eprintln!(r#"{{"error":"entry not found","target":"{}"}}"#, t);
                 } else {
                     eprintln!(
-                        "\n  Entry '{}' not found. Run `disk-space status` to list airlocked items.\n",
+                        "\n  Entry '{}' not found. Run `diskspace status` to list airlocked items.\n",
                         t
                     );
                 }
@@ -42,7 +42,7 @@ pub fn run(target: Option<&str>, all: bool, ctx: &Context) -> Result<()> {
             eprintln!(r#"{{"error":"specify a target id or use --all"}}"#);
         } else {
             eprintln!(
-                "  Specify an entry ID or use --all. Run `disk-space status` to list entries."
+                "  Specify an entry ID or use --all. Run `diskspace status` to list entries."
             );
         }
         std::process::exit(1);

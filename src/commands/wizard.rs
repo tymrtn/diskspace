@@ -174,7 +174,7 @@ pub fn run(ctx: &Context) -> Result<()> {
             "  {}  {}",
             ctx.style("○", &dim),
             ctx.style(
-                "Skipped — run `disk-space profile edit` to personalize later",
+                "Skipped — run `diskspace profile edit` to personalize later",
                 &dim
             )
         );

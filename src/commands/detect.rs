@@ -13,9 +13,9 @@ pub fn run(show_all: bool, top: usize, ctx: &Context) -> Result<()> {
     let cache = scan_cache_path();
     if !cache.exists() {
         if ctx.json {
-            eprintln!(r#"{{"error":"no scan found","hint":"run disk-space scan first"}}"#);
+            eprintln!(r#"{{"error":"no scan found","hint":"run diskspace scan first"}}"#);
         } else {
-            eprintln!("  No scan found. Run `disk-space scan` first.");
+            eprintln!("  No scan found. Run `diskspace scan` first.");
         }
         std::process::exit(1);
     }
@@ -109,7 +109,7 @@ pub fn run(show_all: bool, top: usize, ctx: &Context) -> Result<()> {
     println!();
     println!("  {}", ctx.style(&output::rule("", 56), &dim));
     println!(
-        "  {}  disk-space check <id>",
+        "  {}  diskspace check <id>",
         ctx.style("→ next:", &green_bold),
     );
     println!();

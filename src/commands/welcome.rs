@@ -6,15 +6,15 @@ use crate::profile;
 
 const LOGO: &str = r"
    ·      ·    ✦    ·       ·  ✦   ·    ·   ·     ·
-        ___ ___ ___ _  __  ___ ___  _   ___ ___
-       |   \_ _/ __| |/ / / __| _ \/_\ / __| __|
-       | |) | |\__ \ ' <  \__ \  _/ _ \ (__| _|
-       |___/___|___/_|\_\ |___/_|/_/ \_\___|___|
+        ___ ___ ___ _  _____ ___  _   ___ ___
+       |   \_ _/ __| |/ / __| _ \/_\ / __| __|
+       | |) | |\__ \ ' <\__ \  _/ _ \ (__| _|
+       |___/___|___/_|\_\___/_|/_/ \_\___|___|
    ·    ·  ✦   ·   ·       ·  ·   ✦    ·     ·";
 
 pub fn run(ctx: &Context) -> Result<()> {
     if ctx.json {
-        println!(r#"{{"message":"Run disk-space --help for usage"}}"#);
+        println!(r#"{{"message":"Run diskspace --help for usage"}}"#);
         return Ok(());
     }
 
@@ -29,7 +29,7 @@ pub fn run(ctx: &Context) -> Result<()> {
     let green = Style::new().green().bold();
 
     if ctx.quiet {
-        println!("\n  disk-space — find the dead weight in your cargo hold\n");
+        println!("\n  diskspace — find the dead weight in your cargo hold\n");
         return Ok(());
     }
 
@@ -62,7 +62,7 @@ pub fn run(ctx: &Context) -> Result<()> {
         if profile_exists {
             ctx.style("calibrated", &bold)
         } else {
-            ctx.style("not set    →  disk-space profile edit", &dim)
+            ctx.style("not set    →  diskspace profile edit", &dim)
         }
     );
     println!(
@@ -71,7 +71,7 @@ pub fn run(ctx: &Context) -> Result<()> {
         if scan_exists {
             ctx.style("cached", &bold)
         } else {
-            ctx.style("not run    →  disk-space scan", &dim)
+            ctx.style("not run    →  diskspace scan", &dim)
         }
     );
     println!();
@@ -81,11 +81,11 @@ pub fn run(ctx: &Context) -> Result<()> {
     println!();
 
     let steps: &[(&str, &str)] = &[
-        ("disk-space scan", "survey your cargo hold"),
-        ("disk-space detect", "find dead weight, ranked by yield"),
-        ("disk-space check <id>", "pressure-test before venting"),
-        ("disk-space airlock <id>", "stage cargo for safe disposal"),
-        ("disk-space reclaim", "jettison high-confidence weight NOW"),
+        ("diskspace scan", "survey your cargo hold"),
+        ("diskspace detect", "find dead weight, ranked by yield"),
+        ("diskspace check <id>", "pressure-test before venting"),
+        ("diskspace airlock <id>", "stage cargo for safe disposal"),
+        ("diskspace reclaim", "jettison high-confidence weight NOW"),
     ];
 
     for (cmd, desc) in steps {

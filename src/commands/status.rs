@@ -72,8 +72,8 @@ pub fn run(ctx: &Context) -> Result<()> {
     );
     println!(
         "  restore: {}  ·  purge now: {}",
-        ctx.style("disk-space restore <id>", &dim),
-        ctx.style("disk-space purge --dry-run", &red),
+        ctx.style("diskspace restore <id>", &dim),
+        ctx.style("diskspace purge --dry-run", &red),
     );
     println!();
 

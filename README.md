@@ -1,4 +1,4 @@
-# disk-space
+# diskspace
 
 **Find the dead weight in your cargo hold.**
 
@@ -21,39 +21,39 @@ One binary. No GUI. No cloud. No telemetry. PolyForm Noncommercial 1.0.0.
 
 ## The problem
 
-Every dev Mac accumulates hundreds of GB in DerivedData, node_modules, Docker volumes, Homebrew caches, and VM disks. Existing tools are either too blunt (nuke everything), too manual (scroll through a list), or too dumb (no awareness of what you actually use). `disk-space` finds *your* candidates — informed by your profile and usage patterns — and only acts on them reversibly.
+Every dev Mac accumulates hundreds of GB in DerivedData, node_modules, Docker volumes, Homebrew caches, and VM disks. Existing tools are either too blunt (nuke everything), too manual (scroll through a list), or too dumb (no awareness of what you actually use). `diskspace` finds *your* candidates — informed by your profile and usage patterns — and only acts on them reversibly.
 
 ## Install
 
 ```bash
-cargo install disk-space
+cargo install diskspace
 ```
 
-Or download the universal Mac binary from the [latest release](https://github.com/tymrtn/disk-space/releases/latest).
+Or download the universal Mac binary from the [latest release](https://github.com/tymrtn/diskspace/releases/latest).
 
 ## Quick start
 
 ```bash
-disk-space scan              # survey your cargo hold
-disk-space detect            # find dead weight, ranked by yield × confidence
-disk-space check <id>        # pressure-test before venting
-disk-space airlock <id>      # stage cargo for safe disposal (reversible)
-disk-space restore <id>      # bring it back
-disk-space reclaim           # jettison high-confidence weight NOW (skips airlock)
-disk-space status            # show what's in the airlock
+diskspace scan              # survey your cargo hold
+diskspace detect            # find dead weight, ranked by yield × confidence
+diskspace check <id>        # pressure-test before venting
+diskspace airlock <id>      # stage cargo for safe disposal (reversible)
+diskspace restore <id>      # bring it back
+diskspace reclaim           # jettison high-confidence weight NOW (skips airlock)
+diskspace status            # show what's in the airlock
 ```
 
 ## How it works
 
 ### 1. Scan
 
-`disk-space scan` walks your filesystem in parallel, annotates entries by category, and caches the result. iCloud Drive evicted files and Dropbox Smart Sync online-only files are skipped — only locally-stored bytes count.
+`diskspace scan` walks your filesystem in parallel, annotates entries by category, and caches the result. iCloud Drive evicted files and Dropbox Smart Sync online-only files are skipped — only locally-stored bytes count.
 
 Categories: `dev-artifact`, `app-cache`, `download-entropy`, `vm-disk`.
 
 ### 2. Detect
 
-`disk-space detect` applies a declarative rule library to the scan and ranks candidates by `yield × confidence`. Rules cover the highest-value targets out of the box:
+`diskspace detect` applies a declarative rule library to the scan and ranks candidates by `yield × confidence`. Rules cover the highest-value targets out of the box:
 
 | Category | Examples |
 |---|---|
@@ -66,7 +66,7 @@ Each candidate shows its confidence score and the path. Run `--verbose` for the 
 
 ### 3. Check
 
-`disk-space check <id>` pressure-tests a candidate through a chain of validators before you act on it:
+`diskspace check <id>` pressure-tests a candidate through a chain of validators before you act on it:
 
 1. Re-stat: size hasn't changed since detect
 2. Liveness: no open file handles, no writes in last 24h, no owning process running
@@ -77,19 +77,19 @@ Outputs a human-readable reasoning trace. Fails loudly if any validator rejects.
 
 ### 4. Airlock
 
-`disk-space airlock <id>` moves the candidate to `~/.disk-space/airlock/` with a manifest. Restore is always available for 7 days (configurable). Auto-purge runs after the retention window.
+`diskspace airlock <id>` moves the candidate to `~/.diskspace/airlock/` with a manifest. Restore is always available for 7 days (configurable). Auto-purge runs after the retention window.
 
 Pass `--immediate` to skip the airlock and permanently delete — only allowed for candidates with confidence ≥ 0.85.
 
 ### 5. Reclaim
 
-`disk-space reclaim` is the **"I need space NOW"** path. It picks the top high-confidence candidates (confidence ≥ 0.85), runs pressure tests on each, and permanently deletes the survivors with one confirmation. Reports the actual `df` free-space delta before/after — no fictional accounting.
+`diskspace reclaim` is the **"I need space NOW"** path. It picks the top high-confidence candidates (confidence ≥ 0.85), runs pressure tests on each, and permanently deletes the survivors with one confirmation. Reports the actual `df` free-space delta before/after — no fictional accounting.
 
 This is the right call when your disk is critical: airlocking a 5GB folder on the same volume doesn't free space until purge. Reclaim does the real thing for stuff that doesn't need reversibility (npm cache, DerivedData, Homebrew).
 
 ## Personalization
 
-`disk-space` gets smarter when it knows what you do. On first run, the **crew briefing** asks what kind of work you do — pick from a menu. The result lands in `~/.disk-space/profile.toml`:
+`diskspace` gets smarter when it knows what you do. On first run, the **crew briefing** asks what kind of work you do — pick from a menu. The result lands in `~/.diskspace/profile.toml`:
 
 ```toml
 [focus]
@@ -107,9 +107,9 @@ never_touch = ["~/Documents/**", "~/Clients/**"]
 Inactive domains boost candidate confidence. `never_touch` paths are hard-blocked from ever being suggested.
 
 ```bash
-disk-space profile edit   # open in $EDITOR
-disk-space profile get    # print current profile
-disk-space profile set domains.ios_development.active=false
+diskspace profile edit   # open in $EDITOR
+diskspace profile get    # print current profile
+diskspace profile set domains.ios_development.active=false
 ```
 
 ## Agent usage
@@ -118,19 +118,19 @@ Every command supports `--json` output and `--yes` to skip confirmations. The sa
 
 ```bash
 # scan and get top candidates as JSON
-disk-space scan && disk-space detect --json --top 10
+diskspace scan && diskspace detect --json --top 10
 
 # pressure-test the top candidate
-disk-space check xcode-derived-data-001 --json
+diskspace check xcode-derived-data-001 --json
 
 # airlock if safe
-disk-space airlock xcode-derived-data-001 --yes --json
+diskspace airlock xcode-derived-data-001 --yes --json
 
 # or reclaim a batch of high-confidence stuff in one shot
-disk-space reclaim --top 20 --yes --json
+diskspace reclaim --top 20 --yes --json
 
 # update profile with context from your agent
-disk-space profile set domains.ios_development.active=false
+diskspace profile set domains.ios_development.active=false
 ```
 
 Exit codes: `0` success · `1` no candidates · `2` pressure-test failed · `3` profile policy blocked · `127` unknown error.
@@ -155,7 +155,7 @@ Rules live in [`rules/builtin.yaml`](rules/builtin.yaml). Open a PR.
 - **M2** — check (pressure-test pipeline), airlock, restore, purge ✓
 - **M3** — profile domain scoring, agent polish ✓
 - **M4** — 58-rule library, GitHub Actions CI, CONTRIBUTING.md ✓
-- **M5** — first-run wizard, iCloud/Dropbox placeholder handling, reclaim, brand to disk-space ✓
+- **M5** — first-run wizard, iCloud/Dropbox placeholder handling, reclaim, brand to diskspace ✓
 - **M6** — consequence explanations per candidate: recreation effort, rebuild time, performance impact while gone
 
 ## License

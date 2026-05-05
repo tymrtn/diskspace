@@ -1,4 +1,4 @@
-# Contributing to disk-space
+# Contributing to diskspace
 
 ## The easiest contribution: adding a rule
 
