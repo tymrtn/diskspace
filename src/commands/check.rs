@@ -41,7 +41,8 @@ pub fn run(candidate_id: &str, ctx: &Context) -> Result<()> {
         }
     };
 
-    let result = pressure_test(candidate_id, &candidate.path, &prof)?;
+    let mut result = pressure_test(candidate_id, &candidate.path, &prof)?;
+    result.consequences = candidate.consequences.clone();
 
     if ctx.json {
         println!("{}", serde_json::to_string_pretty(&result)?);
@@ -82,6 +83,7 @@ pub fn pressure_test(
         safe,
         confidence,
         steps,
+        consequences: None,
     })
 }
 
@@ -129,16 +131,58 @@ fn render_result(result: &CheckResult, ctx: &Context) {
             ctx.style("→", &green),
             ctx.style(&bar, &yellow),
         );
+    } else {
+        println!("  {}  not safe — see failures above", ctx.style("✗", &red),);
+    }
+    println!();
+
+    // ── if you delete this ───────────────────────────
+    if let Some(cons) = &result.consequences {
+        println!(
+            "  {}",
+            ctx.style(&output::rule("if you delete this", 56), &dim)
+        );
         println!();
+        let recovery_label = format_recovery(&cons.recovery, cons.rebuild_seconds);
+        println!(
+            "  {:<10}  {}",
+            ctx.style("recovery", &bold),
+            ctx.style(&recovery_label, &yellow),
+        );
+        println!(
+            "  {:<10}  {}",
+            ctx.style("impact", &bold),
+            ctx.style(&cons.impact, &dim),
+        );
+        if let Some(cmd) = &cons.recovery_cmd {
+            println!(
+                "  {:<10}  {}",
+                ctx.style("recover", &bold),
+                ctx.style(cmd, &dim),
+            );
+        }
+        println!();
+    }
+
+    if result.safe {
         println!(
             "  {}  diskspace airlock {}",
             ctx.style("next:", &bold),
             ctx.style(&result.candidate_id, &dim),
         );
-    } else {
-        println!("  {}  not safe — see failures above", ctx.style("✗", &red),);
+        println!();
     }
-    println!();
+}
+
+/// Format a recovery label like "rebuild · ~2 min" or "manual" or "irreversible".
+fn format_recovery(recovery: &str, seconds: Option<u32>) -> String {
+    let dur = match seconds {
+        Some(s) if s < 60 => format!(" · ~{}s", s),
+        Some(s) if s < 3600 => format!(" · ~{} min", s / 60),
+        Some(s) => format!(" · ~{} hr", s / 3600),
+        None => String::new(),
+    };
+    format!("{}{}", recovery, dur)
 }
 
 fn restat_check(path: &Path) -> CheckStep {

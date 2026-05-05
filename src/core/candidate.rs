@@ -47,6 +47,9 @@ pub struct Candidate {
     pub domain: Option<String>,
     pub modified: Option<DateTime<Utc>>,
     pub accessed: Option<DateTime<Utc>>,
+    /// Consequence metadata copied from the matching rule (M6).
+    #[serde(default)]
+    pub consequences: Option<crate::core::rules::Consequences>,
 }
 
 impl Candidate {
@@ -64,6 +67,9 @@ pub struct CheckResult {
     pub safe: bool,
     pub confidence: f32,
     pub steps: Vec<CheckStep>,
+    /// Consequence metadata: what happens if you delete this (M6).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub consequences: Option<crate::core::rules::Consequences>,
 }
 
 #[allow(dead_code)]

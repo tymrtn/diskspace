@@ -1,8 +1,8 @@
+pub mod airlock;
 pub mod check;
 pub mod detect;
 pub mod profile_cmd;
 pub mod purge;
-pub mod airlock;
 pub mod reclaim;
 pub mod restore;
 pub mod scan;

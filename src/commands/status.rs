@@ -27,10 +27,7 @@ pub fn run(ctx: &Context) -> Result<()> {
     let red = Style::new().red();
 
     println!();
-    println!(
-        "  {}",
-        ctx.style(&output::rule("airlock status", 56), &dim)
-    );
+    println!("  {}", ctx.style(&output::rule("airlock status", 56), &dim));
     println!();
 
     if manifest.entries.is_empty() {

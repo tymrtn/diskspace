@@ -58,9 +58,7 @@ impl Default for Preferences {
 
 pub fn profile_path() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/".into());
-    PathBuf::from(home)
-        .join(".diskspace")
-        .join("profile.toml")
+    PathBuf::from(home).join(".diskspace").join("profile.toml")
 }
 
 pub fn load() -> Result<Profile> {

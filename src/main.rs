@@ -11,9 +11,7 @@ use std::path::PathBuf;
 #[command(name = "diskspace")]
 #[command(about = "Find and safely reclaim your disk's lowest-hanging fruit")]
 #[command(version)]
-#[command(
-    after_help = "Run without arguments to get started, or try `diskspace scan` to begin."
-)]
+#[command(after_help = "Run without arguments to get started, or try `diskspace scan` to begin.")]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,

@@ -89,10 +89,7 @@ pub fn run(ctx: &Context) -> Result<()> {
     println!();
     println!(
         "  {}",
-        ctx.style(
-            "Welcome aboard. Let's calibrate the cargo manifest.",
-            &bold
-        )
+        ctx.style("Welcome aboard. Let's calibrate the cargo manifest.", &bold)
     );
     println!(
         "  {}",

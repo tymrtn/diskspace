@@ -13,7 +13,25 @@ The rule library is the main contribution surface. Adding a rule requires no Rus
   reason: "One sentence — why is this safe to delete?"
   exclude_if_recent_access_days: 7   # optional: skip if accessed within N days
   exclude_if_recent_modified_days: 7 # optional: skip if modified within N days
+  consequences:                      # optional but recommended (M6)
+    recovery: rebuild                # auto | redownload | rebuild | recreate | manual | irreversible
+    rebuild_seconds: 120             # rough cost-to-recover (omit for manual/irreversible)
+    impact: "What the user will notice if they delete this"
+    recovery_cmd: "command to recover, if any"
 ```
+
+### Consequences guidelines
+
+The `consequences` block is what `diskspace check` and agents use to explain what happens if a candidate is deleted. Be honest and specific.
+
+| `recovery` value | Meaning |
+|---|---|
+| `auto` | Regenerated transparently with no user action |
+| `rebuild` | Tool rebuilds on next use (cargo, xcode, npm) — slower next build |
+| `redownload` | Requires internet to fetch packages (npm install, brew install) |
+| `recreate` | User must run a command (`python -m venv`, etc.) |
+| `manual` | User has to remember/recreate state themselves |
+| `irreversible` | Data is gone — only use for genuine cleanup of user-deletable cruft |
 
 ### Confidence guidelines
 

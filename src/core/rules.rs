@@ -17,6 +17,24 @@ pub struct Rule {
     /// Skip candidate if modified within this many days
     #[serde(default)]
     pub exclude_if_recent_modified_days: Option<u32>,
+    /// What happens if you delete this — recovery cost, performance impact, etc.
+    #[serde(default)]
+    pub consequences: Option<Consequences>,
+}
+
+/// Consequence metadata: what happens if a user deletes a candidate matching this rule.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Consequences {
+    /// How the data comes back. One of: "auto", "redownload", "rebuild", "recreate", "manual", "irreversible"
+    pub recovery: String,
+    /// Rough time cost to recover, in seconds. None if "manual" or "irreversible".
+    #[serde(default)]
+    pub rebuild_seconds: Option<u32>,
+    /// One-line description of what the user will notice
+    pub impact: String,
+    /// Optional: command to recover, if any
+    #[serde(default)]
+    pub recovery_cmd: Option<String>,
 }
 
 static BUILTIN_RULES_YAML: &str = include_str!("../../rules/builtin.yaml");

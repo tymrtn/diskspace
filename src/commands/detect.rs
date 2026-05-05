@@ -225,6 +225,7 @@ fn build_candidates(
                 domain: rule.domain.clone(),
                 modified: entry.modified,
                 accessed: entry.accessed,
+                consequences: rule.consequences.clone(),
             });
 
             // Only match first entry per rule to avoid duplicates from glob walking

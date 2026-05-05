@@ -11,6 +11,11 @@
   base_confidence: 0.85
   reason: "Xcode rebuilds this automatically on next build"
   exclude_if_recent_modified_days: 3
+  consequences:
+    recovery: rebuild
+    rebuild_seconds: 300
+    impact: "Next Xcode build of any existing project will recompile from scratch (~2-10 min)"
+    recovery_cmd: "(automatic on next Xcode build)"
 
 - id: xcode-archives
   category: dev-artifact
@@ -49,6 +54,11 @@
   base_confidence: 0.82
   reason: "Reinstall with `npm install` or `pnpm install`"
   exclude_if_recent_access_days: 7
+  consequences:
+    recovery: redownload
+    rebuild_seconds: 90
+    impact: "Project won't run until reinstalled. Downloads from npm (needs internet)"
+    recovery_cmd: "npm install  (or pnpm install / yarn)"
 
 - id: pnpm-store
   category: dev-artifact
@@ -80,6 +90,11 @@
   base_confidence: 0.80
   reason: "Recreate with `python -m venv .venv`"
   exclude_if_recent_access_days: 7
+  consequences:
+    recovery: recreate
+    rebuild_seconds: 60
+    impact: "Project won't run until you recreate the venv and pip-install requirements"
+    recovery_cmd: "python -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt"
 
 - id: python-venv-alt
   category: dev-artifact
@@ -110,6 +125,11 @@
   base_confidence: 0.78
   reason: "Rust build artifacts — rebuild with `cargo build`"
   exclude_if_recent_modified_days: 7
+  consequences:
+    recovery: rebuild
+    rebuild_seconds: 180
+    impact: "Next cargo build recompiles all dependencies + your crate from scratch (~1-5 min)"
+    recovery_cmd: "cargo build  (automatic)"
 
 - id: cargo-registry
   category: dev-artifact
