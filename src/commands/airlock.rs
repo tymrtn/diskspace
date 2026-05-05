@@ -15,9 +15,9 @@ pub fn run(target: &str, immediate: bool, ctx: &Context) -> Result<()> {
     let cache = scan_cache_path();
     if !cache.exists() {
         if ctx.json {
-            eprintln!(r#"{{"error":"no scan found","hint":"run disk-advisor scan first"}}"#);
+            eprintln!(r#"{{"error":"no scan found","hint":"run disk-space scan first"}}"#);
         } else {
-            eprintln!("  No scan found. Run `disk-advisor scan` first.");
+            eprintln!("  No scan found. Run `disk-space scan` first.");
         }
         std::process::exit(1);
     }
@@ -33,10 +33,10 @@ pub fn run(target: &str, immediate: bool, ctx: &Context) -> Result<()> {
         Some(c) => c.clone(),
         None => {
             if ctx.json {
-                eprintln!(r#"{{"error":"candidate not found","hint":"run disk-advisor detect"}}"#);
+                eprintln!(r#"{{"error":"candidate not found","hint":"run disk-space detect"}}"#);
             } else {
                 eprintln!(
-                    "\n  Candidate '{}' not found. Run `disk-advisor detect` first.\n",
+                    "\n  Candidate '{}' not found. Run `disk-space detect` first.\n",
                     target
                 );
             }
@@ -53,7 +53,7 @@ pub fn run(target: &str, immediate: bool, ctx: &Context) -> Result<()> {
             );
         } else {
             eprintln!(
-                "\n  --immediate requires confidence ≥ {:.0}%  (this candidate is {:.0}%)\n  Use `disk-advisor airlock {}` to airlock with restore option.\n",
+                "\n  --immediate requires confidence ≥ {:.0}%  (this candidate is {:.0}%)\n  Use `disk-space airlock {}` to airlock with restore option.\n",
                 IMMEDIATE_MIN_CONFIDENCE * 100.0,
                 candidate.confidence * 100.0,
                 target,
@@ -171,7 +171,7 @@ pub fn run(target: &str, immediate: bool, ctx: &Context) -> Result<()> {
         ctx.style(&candidate.path.display().to_string(), &dim)
     );
     println!(
-        "     auto-purge in {} days  ·  restore with: disk-advisor restore {}",
+        "     auto-purge in {} days  ·  restore with: disk-space restore {}",
         prof.preferences.airlock_retention_days,
         ctx.style(&entry.id, &dim),
     );

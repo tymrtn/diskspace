@@ -5,15 +5,16 @@ use crate::output::{self, Context};
 use crate::profile;
 
 const LOGO: &str = r"
-  ·▄▄▄▄  ▪  .▄▄ · ▄ •▄      ▄▄▄· ·▄▄▄▄  ▌ ▐·▪  .▄▄ · ▄▄▄
-  ██▪ ██ ██ ▐█ ▀. █▌▄▌▪    ▐█ ▀█ ██▪ ██ ▪█·█▌██ ▐█ ▀. ▀▄ █·
-  ▐█· ▐█▌▐█·▄▀▀▀█▄▐▀▀▄·    ▄█▀▀█ ▐█· ▐█▌▐█▐█•▐█·▄▀▀▀█▄▐▀▀▄
-  ██. ██ ▐█▌▐█▄▪▐█▐█.█▌    ▐█ ▪▐▌██. ██  ███ ▐█▌▐█▄▪▐█▐█•█▌
-  ▀▀▀▀▀• ▀▀▀ ▀▀▀▀ ·▀  ▀     ▀  ▀ ▀▀▀▀▀• . ▀  ▀▀▀ ▀▀▀▀ .▀  ▀";
+   ·      ·    ✦    ·       ·  ✦   ·    ·   ·     ·
+        ___ ___ ___ _  __  ___ ___  _   ___ ___
+       |   \_ _/ __| |/ / / __| _ \/_\ / __| __|
+       | |) | |\__ \ ' <  \__ \  _/ _ \ (__| _|
+       |___/___|___/_|\_\ |___/_|/_/ \_\___|___|
+   ·    ·  ✦   ·   ·       ·  ·   ✦    ·     ·";
 
 pub fn run(ctx: &Context) -> Result<()> {
     if ctx.json {
-        println!(r#"{{"message":"Run disk-advisor --help for usage"}}"#);
+        println!(r#"{{"message":"Run disk-space --help for usage"}}"#);
         return Ok(());
     }
 
@@ -27,9 +28,8 @@ pub fn run(ctx: &Context) -> Result<()> {
     let bold = Style::new().bold();
     let green = Style::new().green().bold();
 
-    // Small tasteful header instead of full logo in quiet mode
     if ctx.quiet {
-        println!("\n  disk-advisor — find and reclaim disk space safely\n");
+        println!("\n  disk-space — find the dead weight in your cargo hold\n");
         return Ok(());
     }
 
@@ -37,18 +37,15 @@ pub fn run(ctx: &Context) -> Result<()> {
     println!();
     println!(
         "  {}",
-        ctx.style(
-            "find and safely reclaim your disk's lowest-hanging fruit",
-            &dim
-        )
+        ctx.style("find the dead weight in your cargo hold", &dim)
     );
     println!();
 
-    // ── state indicator ──────────────────────────────
+    // ── ship status ──────────────────────────────────
     let profile_exists = profile::profile_path().exists();
     let scan_exists = crate::commands::scan::scan_cache_path().exists();
 
-    println!("  {}", ctx.style(&output::rule("status", 54), &dim));
+    println!("  {}", ctx.style(&output::rule("ship status", 54), &dim));
     println!();
 
     let check = |ok: bool| -> String {
@@ -60,34 +57,35 @@ pub fn run(ctx: &Context) -> Result<()> {
     };
 
     println!(
-        "  {}  profile    {}",
+        "  {}  crew profile  {}",
         check(profile_exists),
         if profile_exists {
-            ctx.style("configured", &bold)
+            ctx.style("calibrated", &bold)
         } else {
-            ctx.style("not found  →  disk-advisor profile edit", &dim)
+            ctx.style("not set    →  disk-space profile edit", &dim)
         }
     );
     println!(
-        "  {}  scan       {}",
+        "  {}  hold survey   {}",
         check(scan_exists),
         if scan_exists {
             ctx.style("cached", &bold)
         } else {
-            ctx.style("not run    →  disk-advisor scan", &dim)
+            ctx.style("not run    →  disk-space scan", &dim)
         }
     );
     println!();
 
-    // ── quick start ───────────────────────────────────
-    println!("  {}", ctx.style(&output::rule("quick start", 54), &dim));
+    // ── flight plan ───────────────────────────────────
+    println!("  {}", ctx.style(&output::rule("flight plan", 54), &dim));
     println!();
 
     let steps: &[(&str, &str)] = &[
-        ("disk-advisor scan", "scan your home directory"),
-        ("disk-advisor detect", "find cleanup candidates"),
-        ("disk-advisor check <id>", "pressure-test a candidate"),
-        ("disk-advisor airlock <id>", "safely reclaim space"),
+        ("disk-space scan", "survey your cargo hold"),
+        ("disk-space detect", "find dead weight, ranked by yield"),
+        ("disk-space check <id>", "pressure-test before venting"),
+        ("disk-space airlock <id>", "stage cargo for safe disposal"),
+        ("disk-space reclaim", "jettison high-confidence weight NOW"),
     ];
 
     for (cmd, desc) in steps {

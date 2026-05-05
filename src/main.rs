@@ -8,11 +8,11 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 #[derive(Parser)]
-#[command(name = "disk-advisor")]
+#[command(name = "disk-space")]
 #[command(about = "Find and safely reclaim your disk's lowest-hanging fruit")]
 #[command(version)]
 #[command(
-    after_help = "Run without arguments to get started, or try `disk-advisor scan` to begin."
+    after_help = "Run without arguments to get started, or try `disk-space scan` to begin."
 )]
 struct Cli {
     #[command(subcommand)]

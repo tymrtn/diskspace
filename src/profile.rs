@@ -59,7 +59,7 @@ impl Default for Preferences {
 pub fn profile_path() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/".into());
     PathBuf::from(home)
-        .join(".disk-advisor")
+        .join(".disk-space")
         .join("profile.toml")
 }
 
@@ -71,7 +71,7 @@ pub fn load() -> Result<Profile> {
     let content = std::fs::read_to_string(&path)
         .with_context(|| format!("reading profile at {}", path.display()))?;
     let profile: Profile = toml::from_str(&content)
-        .with_context(|| "parsing profile.toml — run `disk-advisor profile edit` to fix it")?;
+        .with_context(|| "parsing profile.toml — run `disk-space profile edit` to fix it")?;
     Ok(profile)
 }
 
@@ -88,5 +88,13 @@ pub fn save(profile: &Profile) -> Result<()> {
 
 pub fn data_dir() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/".into());
-    PathBuf::from(home).join(".disk-advisor")
+    let new_dir = PathBuf::from(&home).join(".disk-space");
+    let old_dir = PathBuf::from(&home).join(".disk-advisor");
+
+    // One-time migration from the old name. Idempotent; runs once.
+    if old_dir.exists() && !new_dir.exists() {
+        let _ = std::fs::rename(&old_dir, &new_dir);
+    }
+
+    new_dir
 }

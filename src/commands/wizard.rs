@@ -84,27 +84,27 @@ pub fn run(ctx: &Context) -> Result<()> {
     println!();
     println!(
         "  {}",
-        ctx.style(&crate::output::rule("first run", 54), &dim)
+        ctx.style(&crate::output::rule("crew briefing", 54), &dim)
     );
     println!();
     println!(
         "  {}",
         ctx.style(
-            "Welcome! Let's personalize disk-advisor for your machine.",
+            "Welcome aboard. Let's calibrate the cargo manifest.",
             &bold
         )
     );
     println!(
         "  {}",
         ctx.style(
-            "This takes 30 seconds and makes candidates far more accurate.",
+            "30 seconds — knowing your work makes detection far more accurate.",
             &dim
         )
     );
     println!();
     println!(
         "  {}",
-        ctx.style("What kind of work do you do on this machine?", &bold)
+        ctx.style("What kind of work do you do on this ship?", &bold)
     );
     println!();
 
@@ -174,7 +174,7 @@ pub fn run(ctx: &Context) -> Result<()> {
             "  {}  {}",
             ctx.style("○", &dim),
             ctx.style(
-                "Skipped — run `disk-advisor profile edit` to personalize later",
+                "Skipped — run `disk-space profile edit` to personalize later",
                 &dim
             )
         );

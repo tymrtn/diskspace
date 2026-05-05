@@ -1,4 +1,4 @@
-# Contributing to disk-advisor
+# Contributing to disk-space
 
 ## The easiest contribution: adding a rule
 

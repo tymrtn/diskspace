@@ -1,4 +1,4 @@
-# disk-advisor
+# disk-space
 
 A personalized disk-cleanup CLI that finds *your* low-hanging fruit, pressure-tests each candidate, and reclaims space safely — with a reversible airlock so nothing is permanently deleted until you say so.
 
@@ -18,36 +18,36 @@ One binary. No GUI. No cloud. No telemetry. PolyForm Noncommercial 1.0.0.
 
 ## The problem
 
-Every dev Mac accumulates hundreds of GB in DerivedData, node_modules, Docker volumes, Homebrew caches, and VM disks. Existing tools are either too blunt (nuke everything), too manual (scroll through a list), or too dumb (no awareness of what you actually use). `disk-advisor` finds *your* candidates — informed by your profile and usage patterns — and only acts on them reversibly.
+Every dev Mac accumulates hundreds of GB in DerivedData, node_modules, Docker volumes, Homebrew caches, and VM disks. Existing tools are either too blunt (nuke everything), too manual (scroll through a list), or too dumb (no awareness of what you actually use). `disk-space` finds *your* candidates — informed by your profile and usage patterns — and only acts on them reversibly.
 
 ## Install
 
 ```bash
-cargo install disk-advisor
+cargo install disk-space
 ```
 
 ## Quick start
 
 ```bash
-disk-advisor scan          # scan your home directory
-disk-advisor detect        # find cleanup candidates ranked by yield × confidence
-disk-advisor check <id>    # pressure-test a candidate before acting  (M2)
-disk-advisor airlock <id>  # reversibly reclaim space              (M2)
-disk-advisor restore <id>  # undo an airlock                        (M2)
-disk-advisor status        # show what's held in airlock
+disk-space scan          # scan your home directory
+disk-space detect        # find cleanup candidates ranked by yield × confidence
+disk-space check <id>    # pressure-test a candidate before acting  (M2)
+disk-space airlock <id>  # reversibly reclaim space              (M2)
+disk-space restore <id>  # undo an airlock                        (M2)
+disk-space status        # show what's held in airlock
 ```
 
 ## How it works
 
 ### 1. Scan
 
-`disk-advisor scan` walks your filesystem in parallel, annotates entries by category, and caches the result. Subsequent scans are incremental.
+`disk-space scan` walks your filesystem in parallel, annotates entries by category, and caches the result. Subsequent scans are incremental.
 
 Categories: `dev-artifact`, `app-cache`, `download-entropy`, `vm-disk`.
 
 ### 2. Detect
 
-`disk-advisor detect` applies a declarative rule library to the scan and ranks candidates by `yield × confidence`. Rules cover the highest-value targets out of the box:
+`disk-space detect` applies a declarative rule library to the scan and ranks candidates by `yield × confidence`. Rules cover the highest-value targets out of the box:
 
 | Category | Examples |
 |---|---|
@@ -60,7 +60,7 @@ Each candidate shows its confidence score and the path. Run `--verbose` for the 
 
 ### 3. Check *(coming in M2)*
 
-`disk-advisor check <id>` pressure-tests a candidate through a chain of validators before you act on it:
+`disk-space check <id>` pressure-tests a candidate through a chain of validators before you act on it:
 
 1. Re-stat: size hasn't changed since detect
 2. Liveness: no open file handles, no writes in last 24h, no owning process running
@@ -71,13 +71,13 @@ Outputs a human-readable reasoning trace. Fails loudly if any validator rejects.
 
 ### 4. Airlock *(coming in M2)*
 
-`disk-advisor airlock <id>` moves the candidate to `~/.disk-advisor/airlock/` with a manifest. Space is freed immediately. Nothing is permanently deleted — restore is always available for 30 days (configurable).
+`disk-space airlock <id>` moves the candidate to `~/.disk-space/airlock/` with a manifest. Space is freed immediately. Nothing is permanently deleted — restore is always available for 30 days (configurable).
 
-`disk-advisor purge` is the only irreversible operation, and it's always explicit.
+`disk-space purge` is the only irreversible operation, and it's always explicit.
 
 ## Personalization
 
-`disk-advisor` gets smarter when it knows what you do. Edit `~/.disk-advisor/profile.toml`:
+`disk-space` gets smarter when it knows what you do. Edit `~/.disk-space/profile.toml`:
 
 ```toml
 [focus]
@@ -95,9 +95,9 @@ never_touch = ["~/Documents/**", "~/Clients/**"]
 Inactive domains boost candidate confidence. `never_touch` paths are hard-blocked from ever being suggested.
 
 ```bash
-disk-advisor profile edit   # open in $EDITOR
-disk-advisor profile get    # print current profile
-disk-advisor profile set domains.ios_development.active=false
+disk-space profile edit   # open in $EDITOR
+disk-space profile get    # print current profile
+disk-space profile set domains.ios_development.active=false
 ```
 
 ## Agent usage
@@ -106,16 +106,16 @@ Every command supports `--json` output and `--yes` to skip confirmations. The sa
 
 ```bash
 # scan and get top candidates as JSON
-disk-advisor scan && disk-advisor detect --json --top 10
+disk-space scan && disk-space detect --json --top 10
 
 # pressure-test the top candidate
-disk-advisor check xcode-derived-data-001 --json
+disk-space check xcode-derived-data-001 --json
 
 # airlock if safe
-disk-advisor airlock xcode-derived-data-001 --yes --json
+disk-space airlock xcode-derived-data-001 --yes --json
 
 # update profile with context from your agent
-disk-advisor profile set domains.ios_development.active=false
+disk-space profile set domains.ios_development.active=false
 ```
 
 Exit codes: `0` success · `1` no candidates · `2` pressure-test failed · `3` profile policy blocked · `127` unknown error.

@@ -9,7 +9,7 @@ use std::time::SystemTime;
 use super::candidate::{Category, ScannedEntry};
 use super::rules::Rule;
 
-/// Cached scan result written to ~/.disk-advisor/scan.json
+/// Cached scan result written to ~/.disk-space/scan.json
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ScanResult {
     pub scanned_at: DateTime<Utc>,

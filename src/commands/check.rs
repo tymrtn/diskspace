@@ -28,12 +28,12 @@ pub fn run(candidate_id: &str, ctx: &Context) -> Result<()> {
         None => {
             if ctx.json {
                 eprintln!(
-                    r#"{{"error":"candidate not found","id":"{}","hint":"run disk-advisor detect"}}"#,
+                    r#"{{"error":"candidate not found","id":"{}","hint":"run disk-space detect"}}"#,
                     candidate_id
                 );
             } else {
                 eprintln!(
-                    "\n  Candidate '{}' not found. Run `disk-advisor detect` first.\n",
+                    "\n  Candidate '{}' not found. Run `disk-space detect` first.\n",
                     candidate_id
                 );
             }
@@ -131,7 +131,7 @@ fn render_result(result: &CheckResult, ctx: &Context) {
         );
         println!();
         println!(
-            "  {}  disk-advisor airlock {}",
+            "  {}  disk-space airlock {}",
             ctx.style("next:", &bold),
             ctx.style(&result.candidate_id, &dim),
         );
@@ -288,8 +288,8 @@ fn recency_check(path: &Path) -> CheckStep {
 
 fn bail_no_scan(ctx: &Context) {
     if ctx.json {
-        eprintln!(r#"{{"error":"no scan found","hint":"run disk-advisor scan first"}}"#);
+        eprintln!(r#"{{"error":"no scan found","hint":"run disk-space scan first"}}"#);
     } else {
-        eprintln!("  No scan found. Run `disk-advisor scan` first.");
+        eprintln!("  No scan found. Run `disk-space scan` first.");
     }
 }
