@@ -1,13 +1,16 @@
 # disk-space
 
+**Find the dead weight in your cargo hold.**
+
 A personalized disk-cleanup CLI that finds *your* low-hanging fruit, pressure-tests each candidate, and reclaims space safely — with a reversible airlock so nothing is permanently deleted until you say so.
 
 ```
-  ·▄▄▄▄  ▪  .▄▄ · ▄ •▄      ▄▄▄· ·▄▄▄▄  ▌ ▐·▪  .▄▄ · ▄▄▄
-  ██▪ ██ ██ ▐█ ▀. █▌▄▌▪    ▐█ ▀█ ██▪ ██ ▪█·█▌██ ▐█ ▀. ▀▄ █·
-  ▐█· ▐█▌▐█·▄▀▀▀█▄▐▀▀▄·    ▄█▀▀█ ▐█· ▐█▌▐█▐█•▐█·▄▀▀▀█▄▐▀▀▄
-  ██. ██ ▐█▌▐█▄▪▐█▐█.█▌    ▐█ ▪▐▌██. ██  ███ ▐█▌▐█▄▪▐█▐█•█▌
-  ▀▀▀▀▀• ▀▀▀ ▀▀▀▀ ·▀  ▀     ▀  ▀ ▀▀▀▀▀• . ▀  ▀▀▀ ▀▀▀▀ .▀  ▀
+   ·      ·    ✦    ·       ·  ✦   ·    ·   ·     ·
+        ___ ___ ___ _  __  ___ ___  _   ___ ___
+       |   \_ _/ __| |/ / / __| _ \/_\ / __| __|
+       | |) | |\__ \ ' <  \__ \  _/ _ \ (__| _|
+       |___/___|___/_|\_\ |___/_|/_/ \_\___|___|
+   ·    ·  ✦   ·   ·       ·  ·   ✦    ·     ·
 ```
 
 Spiritual peers: `ripgrep`, `fd`, `dust`, `bat` — tools that do one thing with care.
@@ -26,22 +29,25 @@ Every dev Mac accumulates hundreds of GB in DerivedData, node_modules, Docker vo
 cargo install disk-space
 ```
 
+Or download the universal Mac binary from the [latest release](https://github.com/tymrtn/disk-space/releases/latest).
+
 ## Quick start
 
 ```bash
-disk-space scan          # scan your home directory
-disk-space detect        # find cleanup candidates ranked by yield × confidence
-disk-space check <id>    # pressure-test a candidate before acting  (M2)
-disk-space airlock <id>  # reversibly reclaim space              (M2)
-disk-space restore <id>  # undo an airlock                        (M2)
-disk-space status        # show what's held in airlock
+disk-space scan              # survey your cargo hold
+disk-space detect            # find dead weight, ranked by yield × confidence
+disk-space check <id>        # pressure-test before venting
+disk-space airlock <id>      # stage cargo for safe disposal (reversible)
+disk-space restore <id>      # bring it back
+disk-space reclaim           # jettison high-confidence weight NOW (skips airlock)
+disk-space status            # show what's in the airlock
 ```
 
 ## How it works
 
 ### 1. Scan
 
-`disk-space scan` walks your filesystem in parallel, annotates entries by category, and caches the result. Subsequent scans are incremental.
+`disk-space scan` walks your filesystem in parallel, annotates entries by category, and caches the result. iCloud Drive evicted files and Dropbox Smart Sync online-only files are skipped — only locally-stored bytes count.
 
 Categories: `dev-artifact`, `app-cache`, `download-entropy`, `vm-disk`.
 
@@ -58,7 +64,7 @@ Categories: `dev-artifact`, `app-cache`, `download-entropy`, `vm-disk`.
 
 Each candidate shows its confidence score and the path. Run `--verbose` for the full reasoning trace.
 
-### 3. Check *(coming in M2)*
+### 3. Check
 
 `disk-space check <id>` pressure-tests a candidate through a chain of validators before you act on it:
 
@@ -69,15 +75,21 @@ Each candidate shows its confidence score and the path. Run `--verbose` for the 
 
 Outputs a human-readable reasoning trace. Fails loudly if any validator rejects.
 
-### 4. Airlock *(coming in M2)*
+### 4. Airlock
 
-`disk-space airlock <id>` moves the candidate to `~/.disk-space/airlock/` with a manifest. Space is freed immediately. Nothing is permanently deleted — restore is always available for 30 days (configurable).
+`disk-space airlock <id>` moves the candidate to `~/.disk-space/airlock/` with a manifest. Restore is always available for 7 days (configurable). Auto-purge runs after the retention window.
 
-`disk-space purge` is the only irreversible operation, and it's always explicit.
+Pass `--immediate` to skip the airlock and permanently delete — only allowed for candidates with confidence ≥ 0.85.
+
+### 5. Reclaim
+
+`disk-space reclaim` is the **"I need space NOW"** path. It picks the top high-confidence candidates (confidence ≥ 0.85), runs pressure tests on each, and permanently deletes the survivors with one confirmation. Reports the actual `df` free-space delta before/after — no fictional accounting.
+
+This is the right call when your disk is critical: airlocking a 5GB folder on the same volume doesn't free space until purge. Reclaim does the real thing for stuff that doesn't need reversibility (npm cache, DerivedData, Homebrew).
 
 ## Personalization
 
-`disk-space` gets smarter when it knows what you do. Edit `~/.disk-space/profile.toml`:
+`disk-space` gets smarter when it knows what you do. On first run, the **crew briefing** asks what kind of work you do — pick from a menu. The result lands in `~/.disk-space/profile.toml`:
 
 ```toml
 [focus]
@@ -102,7 +114,7 @@ disk-space profile set domains.ios_development.active=false
 
 ## Agent usage
 
-Every command supports `--json` output and `--yes` to skip confirmations. The same binary humans use is what agents use — no special mode.
+Every command supports `--json` output and `--yes` to skip confirmations. The same binary humans use is what agents use — no special mode. The first-run wizard is auto-skipped in non-TTY contexts.
 
 ```bash
 # scan and get top candidates as JSON
@@ -113,6 +125,9 @@ disk-space check xcode-derived-data-001 --json
 
 # airlock if safe
 disk-space airlock xcode-derived-data-001 --yes --json
+
+# or reclaim a batch of high-confidence stuff in one shot
+disk-space reclaim --top 20 --yes --json
 
 # update profile with context from your agent
 disk-space profile set domains.ios_development.active=false
@@ -136,11 +151,11 @@ Rules live in [`rules/builtin.yaml`](rules/builtin.yaml). Open a PR.
 
 ## Roadmap
 
-- **M1** — scan, detect, rule library (20 rules), profile, styled CLI ✓
+- **M1** — scan, detect, rule library, profile, styled CLI ✓
 - **M2** — check (pressure-test pipeline), airlock, restore, purge ✓
 - **M3** — profile domain scoring, agent polish ✓
 - **M4** — 58-rule library, GitHub Actions CI, CONTRIBUTING.md ✓
-- **M5** — first-run guided wizard, iCloud/Dropbox placeholder handling, Homebrew cask, public launch
+- **M5** — first-run wizard, iCloud/Dropbox placeholder handling, reclaim, brand to disk-space ✓
 - **M6** — consequence explanations per candidate: recreation effort, rebuild time, performance impact while gone
 
 ## License
