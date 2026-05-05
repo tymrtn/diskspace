@@ -6,10 +6,10 @@ A personalized disk-cleanup CLI that finds *your* low-hanging fruit, pressure-te
 
 ```
    ·      ·    ✦    ·       ·  ✦   ·    ·   ·     ·
-        ___ ___ ___ _  __  ___ ___  _   ___ ___
-       |   \_ _/ __| |/ / / __| _ \/_\ / __| __|
-       | |) | |\__ \ ' <  \__ \  _/ _ \ (__| _|
-       |___/___|___/_|\_\ |___/_|/_/ \_\___|___|
+        ___ ___ ___ _  _____ ___  _   ___ ___
+       |   \_ _/ __| |/ / __| _ \/_\ / __| __|
+       | |) | |\__ \ ' <\__ \  _/ _ \ (__| _|
+       |___/___|___/_|\_\___/_|/_/ \_\___|___|
    ·    ·  ✦   ·   ·       ·  ·   ✦    ·     ·
 ```
 
@@ -24,6 +24,12 @@ One binary. No GUI. No cloud. No telemetry. PolyForm Noncommercial 1.0.0.
 Every dev Mac accumulates hundreds of GB in DerivedData, node_modules, Docker volumes, Homebrew caches, and VM disks. Existing tools are either too blunt (nuke everything), too manual (scroll through a list), or too dumb (no awareness of what you actually use). `diskspace` finds *your* candidates — informed by your profile and usage patterns — and only acts on them reversibly.
 
 ## Install
+
+```bash
+brew install tymrtn/diskspace/diskspace
+```
+
+Or with cargo:
 
 ```bash
 cargo install diskspace
