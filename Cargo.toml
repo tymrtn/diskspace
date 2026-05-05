@@ -1,9 +1,16 @@
 [package]
 name = "diskspace"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2021"
 description = "Find the dead weight in your cargo hold — a personalized, reversible disk-cleanup CLI"
-license = "LicenseRef-PolyForm-Noncommercial-1.0.0"
+license-file = "LICENSE"
+repository = "https://github.com/tymrtn/diskspace"
+homepage = "https://github.com/tymrtn/diskspace"
+readme = "README.md"
+keywords = ["disk", "cleanup", "cli", "macos", "cache"]
+categories = ["command-line-utilities", "filesystem"]
+authors = ["Tyler Martin <ty@tmrtn.com>"]
+exclude = ["target/*", ".github/*"]
 
 [[bin]]
 name = "diskspace"

@@ -67,6 +67,11 @@
   base_confidence: 0.78
   reason: "pnpm content-addressable store — repopulated on next install"
   exclude_if_recent_modified_days: 30
+  consequences:
+    recovery: redownload
+    rebuild_seconds: 90
+    impact: "Next pnpm install redownloads packages from the registry"
+    recovery_cmd: "pnpm install"
 
 - id: yarn-cache
   category: dev-artifact
@@ -75,6 +80,11 @@
   base_confidence: 0.85
   reason: "Yarn package cache — repopulated on next install"
   exclude_if_recent_modified_days: 30
+  consequences:
+    recovery: redownload
+    rebuild_seconds: 60
+    impact: "Next yarn install redownloads packages"
+    recovery_cmd: "yarn install"
 
 - id: npm-cache
   category: dev-artifact
@@ -82,6 +92,11 @@
   domain: web_development
   base_confidence: 0.88
   reason: "npm download cache — repopulated on demand"
+  consequences:
+    recovery: redownload
+    rebuild_seconds: 60
+    impact: "First install in any project after this redownloads packages from npm"
+    recovery_cmd: "(automatic on next npm install)"
 
 - id: python-venv
   category: dev-artifact
@@ -117,6 +132,11 @@
   domain: python_development
   base_confidence: 0.88
   reason: "pip download cache — repopulated on demand"
+  consequences:
+    recovery: redownload
+    rebuild_seconds: 30
+    impact: "Next pip install redownloads wheels instead of using cache"
+    recovery_cmd: "(automatic on next pip install)"
 
 - id: rust-target-dir
   category: dev-artifact
@@ -138,6 +158,11 @@
   base_confidence: 0.75
   reason: "Cargo package registry cache — repopulated on next build"
   exclude_if_recent_modified_days: 30
+  consequences:
+    recovery: redownload
+    rebuild_seconds: 90
+    impact: "Next cargo build redownloads crate index and dependencies"
+    recovery_cmd: "(automatic on next cargo build)"
 
 - id: cargo-git
   category: dev-artifact
@@ -154,6 +179,11 @@
   base_confidence: 0.85
   reason: "Next.js build cache — rebuilt automatically"
   exclude_if_recent_access_days: 5
+  consequences:
+    recovery: rebuild
+    rebuild_seconds: 60
+    impact: "First `next dev` or `next build` after deletion takes longer (cold start)"
+    recovery_cmd: "(automatic on next next.js run)"
 
 - id: nuxt-build
   category: dev-artifact
@@ -177,6 +207,11 @@
   domain: web_development
   base_confidence: 0.88
   reason: "Vite dependency pre-bundle cache — regenerated automatically"
+  consequences:
+    recovery: rebuild
+    rebuild_seconds: 30
+    impact: "First `vite` run after deletion re-bundles deps (slower cold start)"
+    recovery_cmd: "(automatic on next vite run)"
 
 - id: gradle-cache
   category: dev-artifact
@@ -185,6 +220,11 @@
   base_confidence: 0.78
   reason: "Gradle build cache — repopulated on next build"
   exclude_if_recent_modified_days: 14
+  consequences:
+    recovery: redownload
+    rebuild_seconds: 300
+    impact: "Next Gradle build redownloads dependencies and rebuilds (~5 min for big projects)"
+    recovery_cmd: "(automatic on next gradle/Android build)"
 
 - id: gradle-wrapper
   category: dev-artifact
@@ -209,12 +249,22 @@
   base_confidence: 0.80
   reason: "Go compiled package cache — rebuilt with `go build`"
   exclude_if_recent_modified_days: 14
+  consequences:
+    recovery: redownload
+    rebuild_seconds: 60
+    impact: "Next `go build` redownloads modules and recompiles dependencies"
+    recovery_cmd: "(automatic on next go build)"
 
 - id: homebrew-cache
   category: dev-artifact
   path_pattern: "~/Library/Caches/Homebrew"
   base_confidence: 0.92
   reason: "Homebrew download cache — safe to clear, re-downloaded on demand"
+  consequences:
+    recovery: redownload
+    rebuild_seconds: 60
+    impact: "Next `brew install` or `brew upgrade` re-downloads bottles instead of using cache"
+    recovery_cmd: "(automatic on next brew install)"
 
 - id: docker-data
   category: dev-artifact
@@ -422,3 +472,126 @@
   domain: ios_development
   base_confidence: 0.88
   reason: "iOS simulator logs — not needed after debugging sessions"
+
+# ── Browser-automation caches (added M8 from real-world hits) ─────────────────
+
+- id: ms-playwright-cache
+  category: app-cache
+  path_pattern: "~/Library/Caches/ms-playwright"
+  domain: web_development
+  base_confidence: 0.88
+  reason: "Playwright browser binaries — re-downloaded on next `npx playwright install`"
+  consequences:
+    recovery: redownload
+    rebuild_seconds: 120
+    impact: "Next Playwright run downloads browsers again (Chromium, Firefox, WebKit)"
+    recovery_cmd: "npx playwright install"
+
+- id: camoufox-cache
+  category: app-cache
+  path_pattern: "~/Library/Caches/camoufox"
+  domain: web_development
+  base_confidence: 0.85
+  reason: "Camoufox stealth Firefox cache — re-downloaded on next launch"
+  consequences:
+    recovery: redownload
+    rebuild_seconds: 60
+    impact: "First camoufox launch redownloads its bundled binary"
+    recovery_cmd: "(automatic on next camoufox run)"
+
+# ── Updater / installer leftovers ─────────────────────────────────────────────
+
+- id: shipit-update-cache
+  category: app-cache
+  path_pattern: "~/Library/Caches/*ShipIt*"
+  base_confidence: 0.92
+  reason: "Sparkle ShipIt updater leftovers — pure waste, app already updated"
+  consequences:
+    recovery: auto
+    impact: "Nothing — these are stale installer payloads from completed app updates"
+
+# ── Package-manager content stores ────────────────────────────────────────────
+
+- id: pnpm-store
+  category: dev-artifact
+  path_pattern: "~/Library/pnpm/store"
+  domain: web_development
+  base_confidence: 0.85
+  reason: "pnpm content-addressable store — repopulated on next install"
+  exclude_if_recent_modified_days: 14
+  consequences:
+    recovery: redownload
+    rebuild_seconds: 90
+    impact: "Next `pnpm install` redownloads dependencies from the registry"
+    recovery_cmd: "pnpm install"
+
+# ── Browser app caches ────────────────────────────────────────────────────────
+
+- id: brave-cache
+  category: app-cache
+  path_pattern: "~/Library/Caches/BraveSoftware"
+  base_confidence: 0.90
+  reason: "Brave browser cache — rebuilt as you browse"
+  consequences:
+    recovery: auto
+    impact: "First page load per domain may be slightly slower until cache rebuilds"
+
+- id: dia-browser-cache
+  category: app-cache
+  path_pattern: "~/Library/Caches/Dia"
+  base_confidence: 0.90
+  reason: "Dia browser cache — rebuilt as you browse"
+  consequences:
+    recovery: auto
+    impact: "First page load per domain may be slightly slower until cache rebuilds"
+
+- id: comet-browser-cache
+  category: app-cache
+  path_pattern: "~/Library/Caches/Comet"
+  base_confidence: 0.90
+  reason: "Comet browser cache — rebuilt as you browse"
+  consequences:
+    recovery: auto
+    impact: "First page load per domain may be slightly slower until cache rebuilds"
+
+- id: openai-atlas-cache
+  category: app-cache
+  path_pattern: "~/Library/Caches/com.openai.atlas"
+  base_confidence: 0.88
+  reason: "OpenAI Atlas browser cache — rebuilt as you use it"
+  consequences:
+    recovery: auto
+    impact: "First page load per domain may be slightly slower until cache rebuilds"
+
+- id: canva-cache
+  category: app-cache
+  path_pattern: "~/Library/Caches/com.canva.affinity"
+  base_confidence: 0.85
+  reason: "Canva offline asset cache — re-downloaded on demand"
+  consequences:
+    recovery: redownload
+    rebuild_seconds: 60
+    impact: "First Canva launch may redownload offline templates and assets"
+
+# ── Stale archive folders by convention ───────────────────────────────────────
+
+- id: stale-folder-marker
+  category: download-entropy
+  path_pattern: "**/stale/*"
+  base_confidence: 0.75
+  reason: "Anything under a folder named 'stale/' is, by author convention, abandoned"
+  consequences:
+    recovery: manual
+    impact: "Folder author already marked this as abandoned by putting it in /stale"
+
+- id: archive-folder-node-modules
+  category: dev-artifact
+  path_pattern: "**/_archive/**/node_modules"
+  domain: web_development
+  base_confidence: 0.92
+  reason: "node_modules inside an _archive/ folder — inactive by author convention"
+  consequences:
+    recovery: redownload
+    rebuild_seconds: 90
+    impact: "If you ever revive the archived project: npm install"
+    recovery_cmd: "npm install"

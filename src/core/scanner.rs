@@ -14,28 +14,38 @@ use super::rules::Rule;
 pub struct ScanResult {
     pub scanned_at: DateTime<Utc>,
     pub root: PathBuf,
+    /// Only rule-matched entries — keeps the cache small.
     pub entries: Vec<ScannedEntry>,
     pub total_bytes: u64,
     /// Bytes in cloud-only placeholder files (iCloud evicted, Dropbox Smart Sync) — not counted in total_bytes.
     #[serde(default)]
     pub cloud_placeholder_bytes: u64,
+    /// Per-category byte totals — populated during walk so we don't need to keep all entries.
+    #[serde(default)]
+    pub category_totals: HashMap<String, u64>,
 }
 
 /// Walk the filesystem in parallel, classify entries against rules.
+///
+/// Only rule-matched entries are kept in `entries`. Per-category totals are computed
+/// during the walk so we can render the scan summary without holding every file path
+/// in memory or persisting them to disk.
 pub fn scan(root: &Path, rules: &[Rule]) -> Result<ScanResult> {
     let home = dirs_home();
     let mut entries: Vec<ScannedEntry> = Vec::new();
     let mut total_bytes: u64 = 0;
     let mut cloud_placeholder_bytes: u64 = 0;
+    let mut category_totals: HashMap<String, u64> = HashMap::new();
+    let mut dir_sizes: HashMap<PathBuf, u64> = HashMap::new();
 
     // Build a map of rule path patterns to categories for fast lookup
-    let rule_map: Vec<(glob::Pattern, Category, &Rule)> = rules
+    let rule_map: Vec<(glob::Pattern, Category)> = rules
         .iter()
         .filter_map(|r| {
             let pattern_str = expand_home(&r.path_pattern, &home);
             glob::Pattern::new(&pattern_str)
                 .ok()
-                .map(|p| (p, category_from_str(&r.category), r))
+                .map(|p| (p, category_from_str(&r.category)))
         })
         .collect();
 
@@ -55,9 +65,8 @@ pub fn scan(root: &Path, rules: &[Rule]) -> Result<ScanResult> {
             continue;
         }
 
-        // Skip iCloud Drive evicted files and Dropbox Smart Sync online-only files.
-        // These have a non-zero reported size but zero disk blocks allocated — the data
-        // lives in the cloud, not locally. Counting them inflates totals by hundreds of GB.
+        // Skip iCloud Drive evicted and Dropbox Smart Sync online-only files —
+        // they have reported size but zero disk blocks allocated.
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;
@@ -67,31 +76,65 @@ pub fn scan(root: &Path, rules: &[Rule]) -> Result<ScanResult> {
             }
         }
 
-        // For directories matched by rules we record the entry at that level
-        // and skip descending (we use DirEntry depth to manage this via post-processing)
         let size = if metadata.is_file() {
             metadata.len()
         } else {
-            0 // directories get aggregated below
+            0
         };
 
         total_bytes += size;
 
-        let (cat, _rule) = rule_map
-            .iter()
-            .find(|(pat, _, _)| pat.matches_path(&path))
-            .map(|(_, cat, rule)| (cat.clone(), Some(rule)))
-            .unwrap_or((Category::Unknown, None));
+        let matched = rule_map.iter().find(|(pat, _)| pat.matches_path(&path));
 
-        if cat != Category::Unknown || metadata.is_file() {
+        // Accumulate file sizes into ancestor directories so a rule-matched
+        // directory entry knows its total size.
+        if size > 0 {
+            let mut p = path.parent();
+            while let Some(parent) = p {
+                *dir_sizes.entry(parent.to_path_buf()).or_insert(0) += size;
+                p = parent.parent();
+            }
+        }
+
+        // Only persist rule-matched entries — this is the cache-size fix.
+        if let Some((_, cat)) = matched {
             entries.push(ScannedEntry {
                 path: path.to_path_buf(),
                 size_bytes: size,
-                category: cat,
+                category: cat.clone(),
                 modified: system_time_to_dt(metadata.modified().ok()),
                 accessed: system_time_to_dt(metadata.accessed().ok()),
             });
         }
+    }
+
+    // Patch directory entries (size 0 from walk) with their aggregated descendant size.
+    for entry in &mut entries {
+        if entry.size_bytes == 0 {
+            if let Some(&s) = dir_sizes.get(&entry.path) {
+                entry.size_bytes = s;
+            }
+        }
+    }
+
+    // Compute category totals from top-level matched entries only.
+    // (Nested matches would double-count since their bytes are already included
+    // in an ancestor's aggregated size.)
+    let mut top_level_total: u64 = 0;
+    for entry in &entries {
+        let is_nested = entries
+            .iter()
+            .any(|other| other.path != entry.path && entry.path.starts_with(&other.path));
+        if !is_nested && entry.size_bytes > 0 {
+            *category_totals
+                .entry(entry.category.to_string())
+                .or_insert(0) += entry.size_bytes;
+            top_level_total += entry.size_bytes;
+        }
+    }
+    // Whatever isn't covered by a rule lands in "unknown".
+    if total_bytes > top_level_total {
+        *category_totals.entry("unknown".to_string()).or_insert(0) += total_bytes - top_level_total;
     }
 
     Ok(ScanResult {
@@ -100,34 +143,8 @@ pub fn scan(root: &Path, rules: &[Rule]) -> Result<ScanResult> {
         entries,
         total_bytes,
         cloud_placeholder_bytes,
+        category_totals,
     })
-}
-
-/// Aggregate directory sizes: for each rule-matched directory path,
-/// sum all descendant file sizes.
-pub fn aggregate_dir_sizes(result: &mut ScanResult) {
-    let mut dir_sizes: HashMap<PathBuf, u64> = HashMap::new();
-
-    for entry in &result.entries {
-        if entry.size_bytes == 0 {
-            continue;
-        }
-        // Walk up the path tree and accumulate into parent directories
-        let mut p = entry.path.parent();
-        while let Some(parent) = p {
-            *dir_sizes.entry(parent.to_path_buf()).or_insert(0) += entry.size_bytes;
-            p = parent.parent();
-        }
-    }
-
-    // Patch directory entries with their aggregated sizes
-    for entry in &mut result.entries {
-        if entry.size_bytes == 0 {
-            if let Some(&size) = dir_sizes.get(&entry.path) {
-                entry.size_bytes = size;
-            }
-        }
-    }
 }
 
 fn category_from_str(s: &str) -> Category {

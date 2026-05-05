@@ -42,8 +42,7 @@ pub fn run(path: Option<PathBuf>, ctx: &Context) -> Result<()> {
         None
     };
 
-    let mut result = scanner::scan(&root, &rule_list)?;
-    scanner::aggregate_dir_sizes(&mut result);
+    let result = scanner::scan(&root, &rule_list)?;
 
     if let Some(pb) = &spinner {
         pb.finish_and_clear();
@@ -72,29 +71,23 @@ pub fn run(path: Option<PathBuf>, ctx: &Context) -> Result<()> {
     println!("  {}", ctx.style(&top, &dim));
     println!();
 
-    // Group entries by category and show bar chart
-    use std::collections::HashMap;
-    let mut by_cat: HashMap<String, u64> = HashMap::new();
-    for e in &result.entries {
-        *by_cat.entry(e.category.to_string()).or_insert(0) += e.size_bytes;
-    }
-
-    let max = by_cat.values().copied().max().unwrap_or(1);
-    let mut cats: Vec<_> = by_cat.into_iter().collect();
-    cats.sort_by(|a, b| b.1.cmp(&a.1));
+    // Category bar chart from precomputed totals (avoids holding every file in memory).
+    let max = result.category_totals.values().copied().max().unwrap_or(1);
+    let mut cats: Vec<_> = result.category_totals.iter().collect();
+    cats.sort_by(|a, b| b.1.cmp(a.1));
 
     for (cat, size) in &cats {
-        if *size == 0 {
+        if **size == 0 {
             continue;
         }
         let icon = output::category_icon(cat);
         let cat_style = output::category_style(cat);
-        let bar = output::size_bar(*size, max, 22);
-        let size_str = output::format_bytes(*size);
+        let bar = output::size_bar(**size, max, 22);
+        let size_str = output::format_bytes(**size);
         println!(
             "  {} {:<18}  {:<22}  {:>8}",
             ctx.style(icon, &cat_style),
-            ctx.style(cat, &bold),
+            ctx.style(cat.as_str(), &bold),
             ctx.style(&bar, &cat_style),
             ctx.style(&size_str, &dim),
         );
