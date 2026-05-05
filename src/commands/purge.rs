@@ -1,18 +1,18 @@
 use anyhow::Result;
 use console::Style;
 
-use crate::core::quarantine_store;
+use crate::core::airlock_store;
 use crate::output::{self, Context};
 
 pub fn run(older_than: Option<u32>, dry_run: bool, ctx: &Context) -> Result<()> {
-    let mut manifest = quarantine_store::load_manifest()?;
+    let mut manifest = airlock_store::load_manifest()?;
     let now = chrono::Utc::now();
 
     if manifest.entries.is_empty() {
         if ctx.json {
-            println!(r#"{{"purged":[],"message":"quarantine is empty"}}"#);
+            println!(r#"{{"purged":[],"message":"airlock is empty"}}"#);
         } else {
-            println!("\n  Quarantine is empty — nothing to purge.\n");
+            println!("\n  Airlock is empty — nothing to purge.\n");
         }
         return Ok(());
     }
@@ -24,7 +24,7 @@ pub fn run(older_than: Option<u32>, dry_run: bool, ctx: &Context) -> Result<()> 
         .enumerate()
         .filter(|(_, e)| {
             if let Some(days) = older_than {
-                let age = now.signed_duration_since(e.quarantined_at).num_days();
+                let age = now.signed_duration_since(e.airlocked_at).num_days();
                 age >= days as i64
             } else {
                 // Default: purge anything past its auto_purge_at date
@@ -100,15 +100,15 @@ pub fn run(older_than: Option<u32>, dry_run: bool, ctx: &Context) -> Result<()> 
     let mut purged = Vec::new();
     for &i in to_purge.iter().rev() {
         let entry = &manifest.entries[i];
-        // Remove from quarantine store
-        if entry.quarantine_path.exists() {
-            if entry.quarantine_path.is_dir() {
-                std::fs::remove_dir_all(&entry.quarantine_path)?;
+        // Remove from airlock store
+        if entry.airlock_path.exists() {
+            if entry.airlock_path.is_dir() {
+                std::fs::remove_dir_all(&entry.airlock_path)?;
             } else {
-                std::fs::remove_file(&entry.quarantine_path)?;
+                std::fs::remove_file(&entry.airlock_path)?;
             }
             // Clean up slot dir
-            if let Some(slot) = entry.quarantine_path.parent() {
+            if let Some(slot) = entry.airlock_path.parent() {
                 let _ = std::fs::remove_dir(slot);
             }
         }
@@ -128,7 +128,7 @@ pub fn run(older_than: Option<u32>, dry_run: bool, ctx: &Context) -> Result<()> 
         manifest.entries.remove(i);
     }
 
-    quarantine_store::save_manifest(&manifest)?;
+    airlock_store::save_manifest(&manifest)?;
 
     if ctx.json {
         println!("{}", serde_json::to_string_pretty(&purged)?);

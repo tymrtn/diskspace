@@ -6,39 +6,39 @@ use std::path::{Path, PathBuf};
 use crate::profile;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct QuarantineEntry {
+pub struct AirlockEntry {
     pub id: String,
     pub candidate_id: String,
     pub original_path: PathBuf,
-    pub quarantine_path: PathBuf,
+    pub airlock_path: PathBuf,
     pub size_bytes: u64,
-    pub quarantined_at: DateTime<Utc>,
+    pub airlocked_at: DateTime<Utc>,
     pub auto_purge_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
-pub struct QuarantineManifest {
-    pub entries: Vec<QuarantineEntry>,
+pub struct AirlockManifest {
+    pub entries: Vec<AirlockEntry>,
 }
 
 pub fn manifest_path() -> PathBuf {
-    profile::data_dir().join("quarantine").join("manifest.json")
+    profile::data_dir().join("airlock").join("manifest.json")
 }
 
-pub fn quarantine_root() -> PathBuf {
-    profile::data_dir().join("quarantine")
+pub fn airlock_root() -> PathBuf {
+    profile::data_dir().join("airlock")
 }
 
-pub fn load_manifest() -> Result<QuarantineManifest> {
+pub fn load_manifest() -> Result<AirlockManifest> {
     let path = manifest_path();
     if !path.exists() {
-        return Ok(QuarantineManifest::default());
+        return Ok(AirlockManifest::default());
     }
-    let content = std::fs::read_to_string(&path).context("reading quarantine manifest")?;
-    serde_json::from_str(&content).context("parsing quarantine manifest")
+    let content = std::fs::read_to_string(&path).context("reading airlock manifest")?;
+    serde_json::from_str(&content).context("parsing airlock manifest")
 }
 
-pub fn save_manifest(manifest: &QuarantineManifest) -> Result<()> {
+pub fn save_manifest(manifest: &AirlockManifest) -> Result<()> {
     let path = manifest_path();
     std::fs::create_dir_all(path.parent().unwrap())?;
     let content = serde_json::to_string_pretty(manifest)?;
@@ -46,14 +46,14 @@ pub fn save_manifest(manifest: &QuarantineManifest) -> Result<()> {
     Ok(())
 }
 
-/// Move a path into quarantine. Returns the QuarantineEntry.
-pub fn quarantine_path(
+/// Move a path into airlock. Returns the AirlockEntry.
+pub fn airlock_path(
     candidate_id: &str,
     original: &Path,
     retention_days: u32,
-) -> Result<QuarantineEntry> {
+) -> Result<AirlockEntry> {
     let entry_id = format!("{}-{}", candidate_id, Utc::now().timestamp());
-    let dest = quarantine_root()
+    let dest = airlock_root()
         .join(&entry_id)
         .join(original.file_name().unwrap_or_default());
 
@@ -67,28 +67,28 @@ pub fn quarantine_path(
     }
 
     let now = Utc::now();
-    Ok(QuarantineEntry {
+    Ok(AirlockEntry {
         id: entry_id,
         candidate_id: candidate_id.to_string(),
         original_path: original.to_path_buf(),
-        quarantine_path: dest,
+        airlock_path: dest,
         size_bytes: size,
-        quarantined_at: now,
+        airlocked_at: now,
         auto_purge_at: now + chrono::Duration::days(retention_days as i64),
     })
 }
 
-/// Restore a quarantined entry back to its original path.
-pub fn restore_entry(entry: &QuarantineEntry) -> Result<()> {
+/// Restore an airlocked entry back to its original path.
+pub fn restore_entry(entry: &AirlockEntry) -> Result<()> {
     if let Some(parent) = entry.original_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    if std::fs::rename(&entry.quarantine_path, &entry.original_path).is_err() {
-        copy_recursive(&entry.quarantine_path, &entry.original_path)?;
-        remove_recursive(&entry.quarantine_path)?;
+    if std::fs::rename(&entry.airlock_path, &entry.original_path).is_err() {
+        copy_recursive(&entry.airlock_path, &entry.original_path)?;
+        remove_recursive(&entry.airlock_path)?;
     }
-    // Clean up the quarantine slot directory
-    if let Some(slot) = entry.quarantine_path.parent() {
+    // Clean up the airlock slot directory
+    if let Some(slot) = entry.airlock_path.parent() {
         let _ = std::fs::remove_dir(slot);
     }
     Ok(())

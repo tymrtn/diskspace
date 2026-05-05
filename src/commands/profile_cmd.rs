@@ -167,8 +167,8 @@ always_safe = [
 never_suggest = []
 
 [preferences]
-quarantine_retention_days = 30
+airlock_retention_days = 30
 min_candidate_size_gb = 0.1
-confirm_before_quarantine = true
+confirm_before_airlock = true
 "#
 }

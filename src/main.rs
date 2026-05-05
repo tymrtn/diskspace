@@ -60,23 +60,23 @@ enum Commands {
         /// Candidate ID from `detect` output
         candidate_id: String,
     },
-    /// Reversibly move candidates to quarantine
-    Quarantine {
+    /// Reversibly move candidates to airlock
+    Airlock {
         /// Candidate ID or file path
         target: String,
-        /// Delete immediately without quarantine — only allowed for high-confidence candidates (≥0.85)
+        /// Delete immediately without airlock — only allowed for high-confidence candidates (≥0.85)
         #[arg(long)]
         immediate: bool,
     },
-    /// Restore a quarantined item to its original location
+    /// Restore an airlocked item to its original location
     Restore {
         /// Candidate ID or path
         target: Option<String>,
-        /// Restore everything in quarantine
+        /// Restore everything in airlock
         #[arg(long)]
         all: bool,
     },
-    /// Permanently delete quarantined items (irreversible)
+    /// Permanently delete airlocked items (irreversible)
     Purge {
         /// Only purge items older than N days
         #[arg(long, value_name = "DAYS")]
@@ -85,7 +85,13 @@ enum Commands {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Show quarantine state and pending purges
+    /// Reclaim space NOW — permanently delete top high-confidence candidates (skips airlock)
+    Reclaim {
+        /// Max items to delete (default: 10)
+        #[arg(long, default_value = "10")]
+        top: usize,
+    },
+    /// Show airlock state and pending purges
     Status,
     /// Read or write your personalization profile
     Profile {
@@ -123,8 +129,8 @@ fn main() -> Result<()> {
         Some(Commands::Scan { path }) => commands::scan::run(path, &ctx),
         Some(Commands::Detect { all, top }) => commands::detect::run(all, top, &ctx),
         Some(Commands::Check { candidate_id }) => commands::check::run(&candidate_id, &ctx),
-        Some(Commands::Quarantine { target, immediate }) => {
-            commands::quarantine::run(&target, immediate, &ctx)
+        Some(Commands::Airlock { target, immediate }) => {
+            commands::airlock::run(&target, immediate, &ctx)
         }
         Some(Commands::Restore { target, all }) => {
             commands::restore::run(target.as_deref(), all, &ctx)
@@ -133,6 +139,7 @@ fn main() -> Result<()> {
             older_than,
             dry_run,
         }) => commands::purge::run(older_than, dry_run, &ctx),
+        Some(Commands::Reclaim { top }) => commands::reclaim::run(top, &ctx),
         Some(Commands::Status) => commands::status::run(&ctx),
         Some(Commands::Profile { action }) => match action {
             ProfileAction::Get => commands::profile_cmd::get(&ctx),

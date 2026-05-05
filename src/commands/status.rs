@@ -1,11 +1,11 @@
 use anyhow::Result;
 use console::Style;
 
-use crate::core::quarantine_store;
+use crate::core::airlock_store;
 use crate::output::{self, Context};
 
 pub fn run(ctx: &Context) -> Result<()> {
-    let manifest = quarantine_store::load_manifest()?;
+    let manifest = airlock_store::load_manifest()?;
     let now = chrono::Utc::now();
 
     if ctx.json {
@@ -13,7 +13,7 @@ pub fn run(ctx: &Context) -> Result<()> {
         println!(
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
-                "quarantine": manifest.entries,
+                "airlock": manifest.entries,
                 "total_bytes": total,
                 "count": manifest.entries.len(),
             }))?
@@ -29,12 +29,12 @@ pub fn run(ctx: &Context) -> Result<()> {
     println!();
     println!(
         "  {}",
-        ctx.style(&output::rule("quarantine status", 56), &dim)
+        ctx.style(&output::rule("airlock status", 56), &dim)
     );
     println!();
 
     if manifest.entries.is_empty() {
-        println!("  {}", ctx.style("Quarantine is empty.", &dim));
+        println!("  {}", ctx.style("Airlock is empty.", &dim));
         println!();
         return Ok(());
     }

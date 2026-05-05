@@ -125,13 +125,13 @@ fn render_result(result: &CheckResult, ctx: &Context) {
     if result.safe {
         let bar = output::confidence_bar(result.confidence, 10);
         println!(
-            "  {}  {}  safe to quarantine",
+            "  {}  {}  safe to airlock",
             ctx.style("→", &green),
             ctx.style(&bar, &yellow),
         );
         println!();
         println!(
-            "  {}  disk-advisor quarantine {}",
+            "  {}  disk-advisor airlock {}",
             ctx.style("next:", &bold),
             ctx.style(&result.candidate_id, &dim),
         );

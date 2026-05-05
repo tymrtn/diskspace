@@ -87,7 +87,7 @@ pub fn run(ctx: &Context) -> Result<()> {
         ("disk-advisor scan", "scan your home directory"),
         ("disk-advisor detect", "find cleanup candidates"),
         ("disk-advisor check <id>", "pressure-test a candidate"),
-        ("disk-advisor quarantine <id>", "safely reclaim space"),
+        ("disk-advisor airlock <id>", "safely reclaim space"),
     ];
 
     for (cmd, desc) in steps {

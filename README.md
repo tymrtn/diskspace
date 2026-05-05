@@ -1,6 +1,6 @@
 # disk-advisor
 
-A personalized disk-cleanup CLI that finds *your* low-hanging fruit, pressure-tests each candidate, and reclaims space safely — with a reversible quarantine so nothing is permanently deleted until you say so.
+A personalized disk-cleanup CLI that finds *your* low-hanging fruit, pressure-tests each candidate, and reclaims space safely — with a reversible airlock so nothing is permanently deleted until you say so.
 
 ```
   ·▄▄▄▄  ▪  .▄▄ · ▄ •▄      ▄▄▄· ·▄▄▄▄  ▌ ▐·▪  .▄▄ · ▄▄▄
@@ -32,9 +32,9 @@ cargo install disk-advisor
 disk-advisor scan          # scan your home directory
 disk-advisor detect        # find cleanup candidates ranked by yield × confidence
 disk-advisor check <id>    # pressure-test a candidate before acting  (M2)
-disk-advisor quarantine <id>  # reversibly reclaim space              (M2)
-disk-advisor restore <id>  # undo a quarantine                        (M2)
-disk-advisor status        # show what's held in quarantine
+disk-advisor airlock <id>  # reversibly reclaim space              (M2)
+disk-advisor restore <id>  # undo an airlock                        (M2)
+disk-advisor status        # show what's held in airlock
 ```
 
 ## How it works
@@ -69,9 +69,9 @@ Each candidate shows its confidence score and the path. Run `--verbose` for the 
 
 Outputs a human-readable reasoning trace. Fails loudly if any validator rejects.
 
-### 4. Quarantine *(coming in M2)*
+### 4. Airlock *(coming in M2)*
 
-`disk-advisor quarantine <id>` moves the candidate to `~/.disk-advisor/quarantine/` with a manifest. Space is freed immediately. Nothing is permanently deleted — restore is always available for 30 days (configurable).
+`disk-advisor airlock <id>` moves the candidate to `~/.disk-advisor/airlock/` with a manifest. Space is freed immediately. Nothing is permanently deleted — restore is always available for 30 days (configurable).
 
 `disk-advisor purge` is the only irreversible operation, and it's always explicit.
 
@@ -111,8 +111,8 @@ disk-advisor scan && disk-advisor detect --json --top 10
 # pressure-test the top candidate
 disk-advisor check xcode-derived-data-001 --json
 
-# quarantine if safe
-disk-advisor quarantine xcode-derived-data-001 --yes --json
+# airlock if safe
+disk-advisor airlock xcode-derived-data-001 --yes --json
 
 # update profile with context from your agent
 disk-advisor profile set domains.ios_development.active=false
@@ -137,7 +137,7 @@ Rules live in [`rules/builtin.yaml`](rules/builtin.yaml). Open a PR.
 ## Roadmap
 
 - **M1** — scan, detect, rule library (20 rules), profile, styled CLI ✓
-- **M2** — check (pressure-test pipeline), quarantine, restore, purge ✓
+- **M2** — check (pressure-test pipeline), airlock, restore, purge ✓
 - **M3** — profile domain scoring, agent polish ✓
 - **M4** — 58-rule library, GitHub Actions CI, CONTRIBUTING.md ✓
 - **M5** — first-run guided wizard, iCloud/Dropbox placeholder handling, Homebrew cask, public launch

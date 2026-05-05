@@ -4,7 +4,7 @@ use console::Style;
 use crate::commands::check;
 use crate::commands::detect::build_candidates_pub;
 use crate::commands::scan::scan_cache_path;
-use crate::core::quarantine_store;
+use crate::core::airlock_store;
 use crate::core::scanner::ScanResult;
 use crate::output::{self, Context};
 use crate::profile;
@@ -48,12 +48,12 @@ pub fn run(target: &str, immediate: bool, ctx: &Context) -> Result<()> {
     if immediate && candidate.confidence < IMMEDIATE_MIN_CONFIDENCE {
         if ctx.json {
             eprintln!(
-                r#"{{"error":"confidence_too_low","confidence":{:.2},"required":{:.2},"hint":"use quarantine without --immediate or raise confidence threshold"}}"#,
+                r#"{{"error":"confidence_too_low","confidence":{:.2},"required":{:.2},"hint":"use airlock without --immediate or raise confidence threshold"}}"#,
                 candidate.confidence, IMMEDIATE_MIN_CONFIDENCE
             );
         } else {
             eprintln!(
-                "\n  --immediate requires confidence ≥ {:.0}%  (this candidate is {:.0}%)\n  Use `disk-advisor quarantine {}` to quarantine with restore option.\n",
+                "\n  --immediate requires confidence ≥ {:.0}%  (this candidate is {:.0}%)\n  Use `disk-advisor airlock {}` to airlock with restore option.\n",
                 IMMEDIATE_MIN_CONFIDENCE * 100.0,
                 candidate.confidence * 100.0,
                 target,
@@ -74,7 +74,7 @@ pub fn run(target: &str, immediate: bool, ctx: &Context) -> Result<()> {
             eprintln!("{}", serde_json::to_string_pretty(&out)?);
         } else {
             check::render_check_result_pub(&check_result, ctx);
-            eprintln!("  Quarantine aborted — candidate did not pass pressure test.\n");
+            eprintln!("  Airlock aborted — candidate did not pass pressure test.\n");
         }
         std::process::exit(2);
     }
@@ -82,7 +82,7 @@ pub fn run(target: &str, immediate: bool, ctx: &Context) -> Result<()> {
     let size_str = output::format_bytes(candidate.size_bytes);
 
     if immediate {
-        // Permanent delete — no quarantine, no restore
+        // Permanent delete — no airlock, no restore
         let prompt = format!(
             "  Permanently delete {} ({})? This cannot be undone.",
             candidate.path.display(),
@@ -127,10 +127,10 @@ pub fn run(target: &str, immediate: bool, ctx: &Context) -> Result<()> {
         return Ok(());
     }
 
-    // Standard quarantine path
-    if !ctx.json && !ctx.yes && prof.preferences.confirm_before_quarantine {
+    // Standard airlock path
+    if !ctx.json && !ctx.yes && prof.preferences.confirm_before_airlock {
         let prompt = format!(
-            "  Quarantine {} ({}) and free {}?",
+            "  Airlock {} ({}) and free {}?",
             candidate.path.display(),
             candidate.id,
             size_str
@@ -141,15 +141,15 @@ pub fn run(target: &str, immediate: bool, ctx: &Context) -> Result<()> {
         }
     }
 
-    let entry = quarantine_store::quarantine_path(
+    let entry = airlock_store::airlock_path(
         &candidate.id,
         &candidate.path,
-        prof.preferences.quarantine_retention_days,
+        prof.preferences.airlock_retention_days,
     )?;
 
-    let mut manifest = quarantine_store::load_manifest()?;
+    let mut manifest = airlock_store::load_manifest()?;
     manifest.entries.push(entry.clone());
-    quarantine_store::save_manifest(&manifest)?;
+    airlock_store::save_manifest(&manifest)?;
 
     if ctx.json {
         println!("{}", serde_json::to_string_pretty(&entry)?);
@@ -167,12 +167,12 @@ pub fn run(target: &str, immediate: bool, ctx: &Context) -> Result<()> {
         ctx.style(&size_str, &bold),
     );
     println!(
-        "     {} → quarantine",
+        "     {} → airlock",
         ctx.style(&candidate.path.display().to_string(), &dim)
     );
     println!(
         "     auto-purge in {} days  ·  restore with: disk-advisor restore {}",
-        prof.preferences.quarantine_retention_days,
+        prof.preferences.airlock_retention_days,
         ctx.style(&entry.id, &dim),
     );
     println!();

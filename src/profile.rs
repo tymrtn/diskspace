@@ -41,17 +41,17 @@ pub struct PathPolicies {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Preferences {
-    pub quarantine_retention_days: u32,
+    pub airlock_retention_days: u32,
     pub min_candidate_size_gb: f32,
-    pub confirm_before_quarantine: bool,
+    pub confirm_before_airlock: bool,
 }
 
 impl Default for Preferences {
     fn default() -> Self {
         Self {
-            quarantine_retention_days: 7,
+            airlock_retention_days: 7,
             min_candidate_size_gb: 0.1,
-            confirm_before_quarantine: true,
+            confirm_before_airlock: true,
         }
     }
 }

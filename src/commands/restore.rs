@@ -1,17 +1,17 @@
 use anyhow::Result;
 use console::Style;
 
-use crate::core::quarantine_store;
+use crate::core::airlock_store;
 use crate::output::{self, Context};
 
 pub fn run(target: Option<&str>, all: bool, ctx: &Context) -> Result<()> {
-    let mut manifest = quarantine_store::load_manifest()?;
+    let mut manifest = airlock_store::load_manifest()?;
 
     if manifest.entries.is_empty() {
         if ctx.json {
-            println!(r#"{{"restored":[],"message":"quarantine is empty"}}"#);
+            println!(r#"{{"restored":[],"message":"airlock is empty"}}"#);
         } else {
-            println!("\n  Quarantine is empty — nothing to restore.\n");
+            println!("\n  Airlock is empty — nothing to restore.\n");
         }
         return Ok(());
     }
@@ -30,7 +30,7 @@ pub fn run(target: Option<&str>, all: bool, ctx: &Context) -> Result<()> {
                     eprintln!(r#"{{"error":"entry not found","target":"{}"}}"#, t);
                 } else {
                     eprintln!(
-                        "\n  Entry '{}' not found. Run `disk-advisor status` to list quarantined items.\n",
+                        "\n  Entry '{}' not found. Run `disk-advisor status` to list airlocked items.\n",
                         t
                     );
                 }
@@ -56,7 +56,7 @@ pub fn run(target: Option<&str>, all: bool, ctx: &Context) -> Result<()> {
     // Restore in reverse so indices stay valid
     for &i in to_restore.iter().rev() {
         let entry = &manifest.entries[i];
-        quarantine_store::restore_entry(entry)?;
+        airlock_store::restore_entry(entry)?;
         if !ctx.json {
             println!(
                 "  {}  {} restored  {}",
@@ -73,7 +73,7 @@ pub fn run(target: Option<&str>, all: bool, ctx: &Context) -> Result<()> {
         manifest.entries.remove(i);
     }
 
-    quarantine_store::save_manifest(&manifest)?;
+    airlock_store::save_manifest(&manifest)?;
 
     if ctx.json {
         println!("{}", serde_json::to_string_pretty(&restored)?);
