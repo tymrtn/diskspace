@@ -44,6 +44,14 @@ pub struct Preferences {
     pub airlock_retention_days: u32,
     pub min_candidate_size_gb: f32,
     pub confirm_before_airlock: bool,
+    /// Below this much free space, `doctor` switches from airlock-then-purge
+    /// (reversible) to immediate-delete (irreversible) so bytes free up now.
+    #[serde(default = "default_pressure_threshold_gb")]
+    pub disk_pressure_threshold_gb: f32,
+}
+
+fn default_pressure_threshold_gb() -> f32 {
+    5.0
 }
 
 impl Default for Preferences {
@@ -52,6 +60,7 @@ impl Default for Preferences {
             airlock_retention_days: 7,
             min_candidate_size_gb: 0.1,
             confirm_before_airlock: true,
+            disk_pressure_threshold_gb: 5.0,
         }
     }
 }

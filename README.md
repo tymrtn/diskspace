@@ -32,8 +32,10 @@ brew install tymrtn/diskspace/diskspace
 Or with cargo:
 
 ```bash
-cargo install diskspace
+cargo install diskspace-cli
 ```
+
+(`diskspace` was squatted on crates.io, so the package name is `diskspace-cli`. The installed binary is still `diskspace`.)
 
 Or download the universal Mac binary from the [latest release](https://github.com/tymrtn/diskspace/releases/latest).
 

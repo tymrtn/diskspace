@@ -5,13 +5,15 @@ use crate::commands::check;
 use crate::commands::detect::build_candidates_pub;
 use crate::commands::scan::scan_cache_path;
 use crate::core::airlock_store;
+use crate::core::history::{self, ActionKind, Entry as HistEntry};
 use crate::core::scanner::ScanResult;
 use crate::output::{self, Context};
 use crate::profile;
+use std::path::Path;
 
 const IMMEDIATE_MIN_CONFIDENCE: f32 = 0.85;
 
-pub fn run(target: &str, immediate: bool, ctx: &Context) -> Result<()> {
+pub fn run(target: &str, immediate: bool, unsafe_confidence: bool, ctx: &Context) -> Result<()> {
     let cache = scan_cache_path();
     if !cache.exists() {
         if ctx.json {
@@ -44,22 +46,54 @@ pub fn run(target: &str, immediate: bool, ctx: &Context) -> Result<()> {
         }
     };
 
-    // --immediate requires high confidence
+    // --immediate requires high confidence, OR --unsafe-confidence + typed consent.
     if immediate && candidate.confidence < IMMEDIATE_MIN_CONFIDENCE {
-        if ctx.json {
-            eprintln!(
-                r#"{{"error":"confidence_too_low","confidence":{:.2},"required":{:.2},"hint":"use airlock without --immediate or raise confidence threshold"}}"#,
-                candidate.confidence, IMMEDIATE_MIN_CONFIDENCE
-            );
-        } else {
-            eprintln!(
-                "\n  --immediate requires confidence ≥ {:.0}%  (this candidate is {:.0}%)\n  Use `diskspace airlock {}` to airlock with restore option.\n",
-                IMMEDIATE_MIN_CONFIDENCE * 100.0,
-                candidate.confidence * 100.0,
-                target,
-            );
+        if !unsafe_confidence {
+            if ctx.json {
+                eprintln!(
+                    r#"{{"error":"confidence_too_low","confidence":{:.2},"required":{:.2},"hint":"use --unsafe-confidence and re-type the candidate id to override"}}"#,
+                    candidate.confidence, IMMEDIATE_MIN_CONFIDENCE
+                );
+            } else {
+                eprintln!(
+                    "\n  --immediate requires confidence ≥ {:.0}%  (this candidate is {:.0}%)\n  Override with: diskspace airlock {} --immediate --unsafe-confidence\n  Or use airlock (reversible): diskspace airlock {}\n",
+                    IMMEDIATE_MIN_CONFIDENCE * 100.0,
+                    candidate.confidence * 100.0,
+                    target,
+                    target,
+                );
+            }
+            std::process::exit(3);
         }
-        std::process::exit(3);
+        // Show consequences explicitly before asking for typed consent
+        if !ctx.json {
+            let dim = console::Style::new().dim();
+            let yellow = console::Style::new().yellow();
+            eprintln!();
+            eprintln!(
+                "  {}",
+                ctx.style(&output::rule("low-confidence override", 56), &yellow)
+            );
+            eprintln!();
+            if let Some(cons) = &candidate.consequences {
+                eprintln!("  recovery   {}", ctx.style(&cons.recovery, &yellow));
+                eprintln!("  impact     {}", ctx.style(&cons.impact, &dim));
+                if let Some(cmd) = &cons.recovery_cmd {
+                    eprintln!("  recover    {}", ctx.style(cmd, &dim));
+                }
+            } else {
+                eprintln!(
+                    "  {}",
+                    ctx.style("no consequence metadata for this rule — be careful", &dim)
+                );
+            }
+        }
+        if !ctx.confirm_typed_id(&candidate.id) {
+            if !ctx.json {
+                eprintln!("\n  Override not confirmed. Aborting.\n");
+            }
+            std::process::exit(3);
+        }
     }
 
     // Always pressure-test before acting
@@ -93,11 +127,36 @@ pub fn run(target: &str, immediate: bool, ctx: &Context) -> Result<()> {
             return Ok(());
         }
 
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/".into());
+        let df_before = history::free_bytes(Path::new(&home));
+
         if candidate.path.is_dir() {
             std::fs::remove_dir_all(&candidate.path)?;
         } else {
             std::fs::remove_file(&candidate.path)?;
         }
+
+        let df_after = history::free_bytes(Path::new(&home));
+        let actually_freed = match (df_before, df_after) {
+            (Some(b), Some(a)) if a > b => Some(a - b),
+            _ => None,
+        };
+
+        history::append(&HistEntry {
+            ts: chrono::Utc::now(),
+            command: ActionKind::Reclaim,
+            candidate_id: Some(candidate.id.clone()),
+            rule_id: Some(candidate.rule_id.clone()),
+            path: candidate.path.clone(),
+            size_bytes: candidate.size_bytes,
+            df_before,
+            df_after,
+            actually_freed,
+            reversible: false,
+            undo_cmd: None,
+            rule_confidence: Some(candidate.confidence),
+            context: serde_json::Map::new(),
+        });
 
         if ctx.json {
             println!(
@@ -141,7 +200,10 @@ pub fn run(target: &str, immediate: bool, ctx: &Context) -> Result<()> {
         }
     }
 
-    let entry = airlock_store::airlock_path(
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/".into());
+    let df_before = history::free_bytes(Path::new(&home));
+
+    let (entry, kind) = airlock_store::airlock_path(
         &candidate.id,
         &candidate.path,
         prof.preferences.airlock_retention_days,
@@ -151,21 +213,78 @@ pub fn run(target: &str, immediate: bool, ctx: &Context) -> Result<()> {
     manifest.entries.push(entry.clone());
     airlock_store::save_manifest(&manifest)?;
 
+    let df_after = history::free_bytes(Path::new(&home));
+    let actually_freed = match (kind, df_before, df_after) {
+        (airlock_store::MoveKind::CopyRemove, Some(b), Some(a)) if a > b => Some(a - b),
+        (airlock_store::MoveKind::Rename, _, _) => None, // bytes still on disk
+        _ => None,
+    };
+    let mut ctx_map = serde_json::Map::new();
+    ctx_map.insert(
+        "move_kind".into(),
+        serde_json::Value::String(
+            match kind {
+                airlock_store::MoveKind::Rename => "rename",
+                airlock_store::MoveKind::CopyRemove => "copy_remove",
+            }
+            .into(),
+        ),
+    );
+    history::append(&HistEntry {
+        ts: chrono::Utc::now(),
+        command: ActionKind::Airlock,
+        candidate_id: Some(candidate.id.clone()),
+        rule_id: Some(candidate.rule_id.clone()),
+        path: candidate.path.clone(),
+        size_bytes: candidate.size_bytes,
+        df_before,
+        df_after,
+        actually_freed,
+        reversible: true,
+        undo_cmd: Some(format!("diskspace restore {}", entry.id)),
+        rule_confidence: Some(candidate.confidence),
+        context: ctx_map,
+    });
+
     if ctx.json {
-        println!("{}", serde_json::to_string_pretty(&entry)?);
+        let payload = serde_json::json!({
+            "entry": entry,
+            "move_kind": match kind {
+                airlock_store::MoveKind::Rename => "rename",
+                airlock_store::MoveKind::CopyRemove => "copy_remove",
+            },
+            "actually_freed": kind == airlock_store::MoveKind::CopyRemove,
+        });
+        println!("{}", serde_json::to_string_pretty(&payload)?);
         return Ok(());
     }
 
     let green = Style::new().green().bold();
+    let yellow = Style::new().yellow();
     let bold = Style::new().bold();
     let dim = Style::new().dim();
 
     println!();
-    println!(
-        "  {}  {} freed",
-        ctx.style("✓", &green),
-        ctx.style(&size_str, &bold),
-    );
+    match kind {
+        airlock_store::MoveKind::CopyRemove => {
+            println!(
+                "  {}  {} freed",
+                ctx.style("✓", &green),
+                ctx.style(&size_str, &bold),
+            );
+        }
+        airlock_store::MoveKind::Rename => {
+            println!(
+                "  {}  {} staged for purge  {}",
+                ctx.style("◐", &yellow),
+                ctx.style(&size_str, &bold),
+                ctx.style(
+                    "(same-volume rename — bytes still on disk until purge)",
+                    &dim
+                ),
+            );
+        }
+    }
     println!(
         "     {} → airlock",
         ctx.style(&candidate.path.display().to_string(), &dim)
@@ -175,6 +294,16 @@ pub fn run(target: &str, immediate: bool, ctx: &Context) -> Result<()> {
         prof.preferences.airlock_retention_days,
         ctx.style(&entry.id, &dim),
     );
+    if kind == airlock_store::MoveKind::Rename {
+        println!(
+            "     {} {}",
+            ctx.style("→", &yellow),
+            ctx.style(
+                "to actually free now: diskspace purge --older-than 0 --yes",
+                &dim
+            ),
+        );
+    }
     println!();
 
     Ok(())

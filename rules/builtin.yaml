@@ -749,3 +749,30 @@
     recovery: redownload
     rebuild_seconds: 600
     impact: "Re-downloads ACE-Step checkpoints (slow, several GB)"
+
+- id: cursor-worktrees
+  category: dev-artifact
+  path_pattern: "~/.cursor/worktrees"
+  base_confidence: 0.70
+  reason: "Cursor's AI-edit git worktrees — accumulate over time, often stale"
+  exclude_if_recent_modified_days: 14
+  consequences:
+    recovery: irreversible
+    impact: "Any uncommitted work in stale worktrees is gone. Pressure-test should catch active ones via mtime."
+
+- id: codex-worktrees
+  category: dev-artifact
+  path_pattern: "~/.codex/worktrees"
+  base_confidence: 0.70
+  reason: "Codex AI-edit git worktrees — accumulate over time, often stale"
+  exclude_if_recent_modified_days: 14
+  consequences:
+    recovery: irreversible
+    impact: "Any uncommitted work in stale worktrees is gone. Pressure-test should catch active ones via mtime."
+
+- id: home-migrations-folder
+  category: download-entropy
+  path_pattern: "~/migrations"
+  base_confidence: 0.65
+  reason: "Migration scripts/dumps in $HOME — usually old DB exports, review then delete"
+  exclude_if_recent_modified_days: 30

@@ -6,13 +6,14 @@ use crate::commands::check;
 use crate::commands::detect::build_candidates_pub;
 use crate::commands::scan::scan_cache_path;
 use crate::core::candidate::Candidate;
+use crate::core::history::{self, ActionKind, Entry as HistEntry};
 use crate::core::scanner::ScanResult;
 use crate::output::{self, Context};
 use crate::profile;
 
 const MIN_CONFIDENCE: f32 = 0.85;
 
-pub fn run(top: usize, ctx: &Context) -> Result<()> {
+pub fn run(top: usize, unsafe_confidence: bool, ctx: &Context) -> Result<()> {
     let cache = scan_cache_path();
     if !cache.exists() {
         if ctx.json {
@@ -31,9 +32,16 @@ pub fn run(top: usize, ctx: &Context) -> Result<()> {
 
     let candidates = build_candidates_pub(&scan, &rules, &prof, &home);
 
+    // Honor the confidence floor unless --unsafe-confidence is set; in that case
+    // every below-threshold pick will require typed-id confirmation later.
+    let effective_floor = if unsafe_confidence {
+        0.0
+    } else {
+        MIN_CONFIDENCE
+    };
     let mut high_conf: Vec<Candidate> = candidates
         .into_iter()
-        .filter(|c| c.confidence >= MIN_CONFIDENCE)
+        .filter(|c| c.confidence >= effective_floor)
         .take(top)
         .collect();
 
@@ -143,6 +151,34 @@ pub fn run(top: usize, ctx: &Context) -> Result<()> {
         }
     }
 
+    // For --unsafe-confidence, require typed-id consent on each below-threshold survivor.
+    if unsafe_confidence {
+        let low_conf: Vec<&Candidate> = survivors
+            .iter()
+            .filter(|c| c.confidence < MIN_CONFIDENCE)
+            .collect();
+        if !low_conf.is_empty() {
+            let yellow = Style::new().yellow();
+            println!();
+            println!(
+                "  {}  {} below-threshold item(s) — confirm each by id",
+                ctx.style("⚠", &yellow),
+                low_conf.len()
+            );
+            for c in &low_conf {
+                println!(
+                    "      {} ({:.0}%)",
+                    ctx.style(&c.id, &yellow),
+                    c.confidence * 100.0
+                );
+                if !ctx.confirm_typed_id(&c.id) {
+                    eprintln!("\n  Aborting — id mismatch on {}.\n", c.id);
+                    return Ok(());
+                }
+            }
+        }
+    }
+
     let mut deleted: Vec<serde_json::Value> = Vec::new();
     let mut deleted_bytes: u64 = 0;
     for c in &survivors {
@@ -159,6 +195,21 @@ pub fn run(top: usize, ctx: &Context) -> Result<()> {
                     "path": c.path,
                     "size_bytes": c.size_bytes,
                 }));
+                history::append(&HistEntry {
+                    ts: chrono::Utc::now(),
+                    command: ActionKind::Reclaim,
+                    candidate_id: Some(c.id.clone()),
+                    rule_id: Some(c.rule_id.clone()),
+                    path: c.path.clone(),
+                    size_bytes: c.size_bytes,
+                    df_before: free_before,
+                    df_after: None,
+                    actually_freed: None,
+                    reversible: false,
+                    undo_cmd: None,
+                    rule_confidence: Some(c.confidence),
+                    context: serde_json::Map::new(),
+                });
                 if !ctx.json {
                     println!(
                         "  {}  {} freed  {}",

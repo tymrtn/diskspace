@@ -31,6 +31,28 @@ impl Context {
             false
         }
     }
+
+    /// Require the user to retype an exact id verbatim. Used for high-stakes
+    /// bypasses of safety gates (per-target typed consent). `--yes` does NOT
+    /// auto-pass this — that's the whole point.
+    pub fn confirm_typed_id(&self, id: &str) -> bool {
+        if self.json {
+            // Agents that opt out of consent flow get a non-pass here unless
+            // they've also pre-supplied the id elsewhere (we don't here).
+            return false;
+        }
+        let term = Term::stderr();
+        eprintln!();
+        eprintln!(
+            "  Type the candidate id verbatim to confirm: {}",
+            self.style(id, &Style::new().yellow().bold())
+        );
+        eprint!("  > ");
+        match term.read_line() {
+            Ok(line) => line.trim() == id,
+            Err(_) => false,
+        }
+    }
 }
 
 /// Render a confidence bar like [████████░░] 80%

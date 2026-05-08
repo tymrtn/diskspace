@@ -2,6 +2,7 @@ use anyhow::Result;
 use console::Style;
 
 use crate::core::airlock_store;
+use crate::core::history::{self, ActionKind, Entry as HistEntry};
 use crate::output::{self, Context};
 
 pub fn run(target: Option<&str>, all: bool, ctx: &Context) -> Result<()> {
@@ -70,6 +71,21 @@ pub fn run(target: Option<&str>, all: bool, ctx: &Context) -> Result<()> {
             "path": entry.original_path,
             "size_bytes": entry.size_bytes,
         }));
+        history::append(&HistEntry {
+            ts: chrono::Utc::now(),
+            command: ActionKind::Restore,
+            candidate_id: Some(entry.candidate_id.clone()),
+            rule_id: None,
+            path: entry.original_path.clone(),
+            size_bytes: entry.size_bytes,
+            df_before: None,
+            df_after: None,
+            actually_freed: None,
+            reversible: false,
+            undo_cmd: None,
+            rule_confidence: None,
+            context: serde_json::Map::new(),
+        });
         manifest.entries.remove(i);
     }
 

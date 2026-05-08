@@ -46,12 +46,23 @@ pub fn save_manifest(manifest: &AirlockManifest) -> Result<()> {
     Ok(())
 }
 
-/// Move a path into airlock. Returns the AirlockEntry.
+/// How the airlock move was performed. Same-volume rename keeps bytes on disk
+/// (they're not actually freed until purge); cross-volume copy+remove frees bytes
+/// from the original volume immediately.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MoveKind {
+    /// Same-volume rename — instant, but no bytes freed until purge.
+    Rename,
+    /// Cross-volume copy then delete — bytes freed from source immediately.
+    CopyRemove,
+}
+
+/// Move a path into airlock. Returns the AirlockEntry and the kind of move performed.
 pub fn airlock_path(
     candidate_id: &str,
     original: &Path,
     retention_days: u32,
-) -> Result<AirlockEntry> {
+) -> Result<(AirlockEntry, MoveKind)> {
     let entry_id = format!("{}-{}", candidate_id, Utc::now().timestamp());
     let dest = airlock_root()
         .join(&entry_id)
@@ -61,13 +72,16 @@ pub fn airlock_path(
 
     // Try rename first (same volume), fall back to copy+remove
     let size = dir_size(original);
-    if std::fs::rename(original, &dest).is_err() {
+    let kind = if std::fs::rename(original, &dest).is_ok() {
+        MoveKind::Rename
+    } else {
         copy_recursive(original, &dest)?;
         remove_recursive(original)?;
-    }
+        MoveKind::CopyRemove
+    };
 
     let now = Utc::now();
-    Ok(AirlockEntry {
+    let entry = AirlockEntry {
         id: entry_id,
         candidate_id: candidate_id.to_string(),
         original_path: original.to_path_buf(),
@@ -75,7 +89,8 @@ pub fn airlock_path(
         size_bytes: size,
         airlocked_at: now,
         auto_purge_at: now + chrono::Duration::days(retention_days as i64),
-    })
+    };
+    Ok((entry, kind))
 }
 
 /// Restore an airlocked entry back to its original path.

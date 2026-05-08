@@ -65,6 +65,9 @@ enum Commands {
         /// Delete immediately without airlock — only allowed for high-confidence candidates (≥0.85)
         #[arg(long)]
         immediate: bool,
+        /// Bypass the 0.85 confidence floor for --immediate. Requires retyping the candidate id.
+        #[arg(long)]
+        unsafe_confidence: bool,
     },
     /// Restore an airlocked item to its original location
     Restore {
@@ -88,6 +91,9 @@ enum Commands {
         /// Max items to delete (default: 10)
         #[arg(long, default_value = "10")]
         top: usize,
+        /// Lower the confidence floor below 0.85. Requires confirming each item by id.
+        #[arg(long)]
+        unsafe_confidence: bool,
     },
     /// Hunt for the largest directories that no rule covers — find the long tail
     Hunt {
@@ -97,6 +103,23 @@ enum Commands {
         /// Minimum directory size in MB (default: 500)
         #[arg(long, default_value = "500")]
         min_size_mb: u64,
+    },
+    /// Show recent action history (the receipts ledger)
+    Receipt {
+        /// Number of recent entries to show (default: 20)
+        #[arg(long, default_value = "20")]
+        last: usize,
+    },
+    /// Explain a path: matching rule, consequences, live pressure-test, recommended command
+    Explain {
+        /// Path to inspect (~ expands to $HOME)
+        path: String,
+    },
+    /// Emergency recovery — one-command scan + detect + execute to free a target amount
+    Doctor {
+        /// Free at least this much (e.g. 20G, 500M). Defaults to pressure threshold + 1 GB.
+        #[arg(long)]
+        need: Option<String>,
     },
     /// Show airlock state and pending purges
     Status,
@@ -136,9 +159,11 @@ fn main() -> Result<()> {
         Some(Commands::Scan { path }) => commands::scan::run(path, &ctx),
         Some(Commands::Detect { all, top }) => commands::detect::run(all, top, &ctx),
         Some(Commands::Check { candidate_id }) => commands::check::run(&candidate_id, &ctx),
-        Some(Commands::Airlock { target, immediate }) => {
-            commands::airlock::run(&target, immediate, &ctx)
-        }
+        Some(Commands::Airlock {
+            target,
+            immediate,
+            unsafe_confidence,
+        }) => commands::airlock::run(&target, immediate, unsafe_confidence, &ctx),
         Some(Commands::Restore { target, all }) => {
             commands::restore::run(target.as_deref(), all, &ctx)
         }
@@ -146,8 +171,14 @@ fn main() -> Result<()> {
             older_than,
             dry_run,
         }) => commands::purge::run(older_than, dry_run, &ctx),
-        Some(Commands::Reclaim { top }) => commands::reclaim::run(top, &ctx),
+        Some(Commands::Reclaim {
+            top,
+            unsafe_confidence,
+        }) => commands::reclaim::run(top, unsafe_confidence, &ctx),
         Some(Commands::Hunt { top, min_size_mb }) => commands::hunt::run(top, min_size_mb, &ctx),
+        Some(Commands::Receipt { last }) => commands::receipt::run(last, &ctx),
+        Some(Commands::Explain { path }) => commands::explain::run(&path, &ctx),
+        Some(Commands::Doctor { need }) => commands::doctor::run(need, &ctx),
         Some(Commands::Status) => commands::status::run(&ctx),
         Some(Commands::Profile { action }) => match action {
             ProfileAction::Get => commands::profile_cmd::get(&ctx),

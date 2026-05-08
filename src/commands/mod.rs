@@ -1,9 +1,12 @@
 pub mod airlock;
 pub mod check;
 pub mod detect;
+pub mod doctor;
+pub mod explain;
 pub mod hunt;
 pub mod profile_cmd;
 pub mod purge;
+pub mod receipt;
 pub mod reclaim;
 pub mod restore;
 pub mod scan;

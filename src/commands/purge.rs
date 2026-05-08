@@ -2,6 +2,7 @@ use anyhow::Result;
 use console::Style;
 
 use crate::core::airlock_store;
+use crate::core::history::{self, ActionKind, Entry as HistEntry};
 use crate::output::{self, Context};
 
 pub fn run(older_than: Option<u32>, dry_run: bool, ctx: &Context) -> Result<()> {
@@ -125,6 +126,21 @@ pub fn run(older_than: Option<u32>, dry_run: bool, ctx: &Context) -> Result<()> 
             "size_bytes": entry.size_bytes,
             "original_path": entry.original_path,
         }));
+        history::append(&HistEntry {
+            ts: chrono::Utc::now(),
+            command: ActionKind::Purge,
+            candidate_id: Some(entry.candidate_id.clone()),
+            rule_id: None,
+            path: entry.original_path.clone(),
+            size_bytes: entry.size_bytes,
+            df_before: None,
+            df_after: None,
+            actually_freed: Some(entry.size_bytes), // purge actually frees bytes
+            reversible: false,
+            undo_cmd: None,
+            rule_confidence: None,
+            context: serde_json::Map::new(),
+        });
         manifest.entries.remove(i);
     }
 
