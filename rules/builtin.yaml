@@ -595,3 +595,157 @@
     rebuild_seconds: 90
     impact: "If you ever revive the archived project: npm install"
     recovery_cmd: "npm install"
+
+# ── Hidden home dirs (added M9 from hunt findings) ───────────────────────────
+
+- id: cursor-extension-cache
+  category: app-cache
+  path_pattern: "~/.cursor/CachedExtensionVSIXs"
+  domain: web_development
+  base_confidence: 0.92
+  reason: "Cursor extension installer cache — VSIX files re-downloaded on demand"
+  consequences:
+    recovery: redownload
+    rebuild_seconds: 30
+    impact: "Re-installing an extension downloads its VSIX again"
+
+- id: cursor-cached-data
+  category: app-cache
+  path_pattern: "~/.cursor/CachedData"
+  domain: web_development
+  base_confidence: 0.88
+  reason: "Cursor cached data — rebuilt as you use the editor"
+  consequences:
+    recovery: rebuild
+    rebuild_seconds: 30
+    impact: "Cursor rebuilds caches transparently on next launch"
+
+- id: cursor-logs
+  category: app-cache
+  path_pattern: "~/.cursor/logs"
+  base_confidence: 0.95
+  reason: "Cursor log files — historical, never read after the session"
+
+- id: cursor-extensions-obsolete
+  category: app-cache
+  path_pattern: "~/.cursor/extensions/.obsolete"
+  base_confidence: 0.95
+  reason: "Cursor's marker file for extensions pending removal"
+
+- id: huggingface-incomplete
+  category: dev-artifact
+  path_pattern: "~/.cache/huggingface/hub/**/*.incomplete"
+  base_confidence: 0.95
+  reason: "Interrupted HuggingFace model downloads — restart the download to recover"
+  consequences:
+    recovery: redownload
+    impact: "These are partial downloads, not usable until completed"
+
+- id: huggingface-hub-cache
+  category: dev-artifact
+  path_pattern: "~/.cache/huggingface/hub"
+  base_confidence: 0.55
+  reason: "Cached ML model weights — re-downloaded on next use (large, slow)"
+  exclude_if_recent_access_days: 30
+  consequences:
+    recovery: redownload
+    rebuild_seconds: 1800
+    impact: "Each model is multi-GB and may take 5-30 minutes to redownload"
+    recovery_cmd: "(automatic on next model load via huggingface_hub or transformers)"
+
+- id: ollama-blobs
+  category: dev-artifact
+  path_pattern: "~/.ollama/models/blobs"
+  base_confidence: 0.50
+  reason: "Local LLM model weights — only delete if you can re-pull the models"
+  exclude_if_recent_access_days: 30
+  consequences:
+    recovery: redownload
+    rebuild_seconds: 600
+    impact: "Each model is several GB and takes minutes to re-pull from Ollama registry"
+    recovery_cmd: "ollama pull <model>"
+
+- id: codex-app-cache
+  category: app-cache
+  path_pattern: "~/.codex/cache"
+  base_confidence: 0.85
+  reason: "Codex (OpenAI) desktop app cache — rebuilt automatically"
+
+- id: codex-logs
+  category: app-cache
+  path_pattern: "~/.codex/logs"
+  base_confidence: 0.95
+  reason: "Codex log files — historical only"
+
+- id: hermes-cache
+  category: app-cache
+  path_pattern: "~/.hermes/cache"
+  base_confidence: 0.85
+  reason: "Hermes runtime cache — rebuilt on next launch"
+
+- id: screenpipe-database
+  category: app-cache
+  path_pattern: "~/.screenpipe/db.sqlite"
+  base_confidence: 0.45
+  reason: "Screenpipe screen-recording database — irreversible loss of recording history"
+  exclude_if_recent_access_days: 14
+  consequences:
+    recovery: irreversible
+    impact: "All Screenpipe recording history and indexed content is gone permanently"
+
+- id: npm-npx-cache
+  category: dev-artifact
+  path_pattern: "~/.npm/_npx"
+  domain: web_development
+  base_confidence: 0.92
+  reason: "npx temporary execution cache — re-downloaded on next npx invocation"
+  consequences:
+    recovery: redownload
+    rebuild_seconds: 30
+    impact: "Next `npx <pkg>` re-downloads the package"
+
+- id: npm-logs
+  category: app-cache
+  path_pattern: "~/.npm/_logs"
+  base_confidence: 0.95
+  reason: "npm log files — historical only"
+
+- id: tmp-old
+  category: download-entropy
+  path_pattern: "/private/tmp"
+  base_confidence: 0.60
+  reason: "System scratch — usually safe to clear when nothing's actively running"
+  exclude_if_recent_modified_days: 1
+
+- id: uv-cache
+  category: dev-artifact
+  path_pattern: "~/.cache/uv"
+  domain: python_development
+  base_confidence: 0.88
+  reason: "uv (Astral) Python package cache — repopulated on next install"
+  exclude_if_recent_modified_days: 14
+  consequences:
+    recovery: redownload
+    rebuild_seconds: 60
+    impact: "Next `uv pip install` redownloads packages"
+    recovery_cmd: "(automatic on next uv invocation)"
+
+- id: whisper-cache
+  category: dev-artifact
+  path_pattern: "~/.cache/whisper"
+  base_confidence: 0.65
+  reason: "Whisper ASR model cache — re-downloaded on next transcription"
+  consequences:
+    recovery: redownload
+    rebuild_seconds: 300
+    impact: "Next whisper run downloads model weights again (slow)"
+
+- id: ace-step-cache
+  category: dev-artifact
+  path_pattern: "~/.cache/ace-step"
+  base_confidence: 0.65
+  reason: "ACE-Step music-gen model cache — re-downloaded on next use"
+  consequences:
+    recovery: redownload
+    rebuild_seconds: 600
+    impact: "Re-downloads ACE-Step checkpoints (slow, several GB)"

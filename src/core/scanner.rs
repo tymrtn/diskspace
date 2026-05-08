@@ -67,6 +67,9 @@ pub fn scan(root: &Path, rules: &[Rule]) -> Result<ScanResult> {
 
         // Skip iCloud Drive evicted and Dropbox Smart Sync online-only files —
         // they have reported size but zero disk blocks allocated.
+        // Also use actual on-disk allocation (not logical size) for everything else,
+        // so sparse files like virtual disk images report what they really take up.
+        let size: u64;
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;
@@ -74,13 +77,20 @@ pub fn scan(root: &Path, rules: &[Rule]) -> Result<ScanResult> {
                 cloud_placeholder_bytes += metadata.len();
                 continue;
             }
+            size = if metadata.is_file() {
+                metadata.blocks() * 512
+            } else {
+                0
+            };
         }
-
-        let size = if metadata.is_file() {
-            metadata.len()
-        } else {
-            0
-        };
+        #[cfg(not(unix))]
+        {
+            size = if metadata.is_file() {
+                metadata.len()
+            } else {
+                0
+            };
+        }
 
         total_bytes += size;
 

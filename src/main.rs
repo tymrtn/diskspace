@@ -89,6 +89,15 @@ enum Commands {
         #[arg(long, default_value = "10")]
         top: usize,
     },
+    /// Hunt for the largest directories that no rule covers — find the long tail
+    Hunt {
+        /// Max results to show (default: 15)
+        #[arg(long, default_value = "15")]
+        top: usize,
+        /// Minimum directory size in MB (default: 500)
+        #[arg(long, default_value = "500")]
+        min_size_mb: u64,
+    },
     /// Show airlock state and pending purges
     Status,
     /// Read or write your personalization profile
@@ -138,6 +147,7 @@ fn main() -> Result<()> {
             dry_run,
         }) => commands::purge::run(older_than, dry_run, &ctx),
         Some(Commands::Reclaim { top }) => commands::reclaim::run(top, &ctx),
+        Some(Commands::Hunt { top, min_size_mb }) => commands::hunt::run(top, min_size_mb, &ctx),
         Some(Commands::Status) => commands::status::run(&ctx),
         Some(Commands::Profile { action }) => match action {
             ProfileAction::Get => commands::profile_cmd::get(&ctx),
