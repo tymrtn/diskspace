@@ -11,5 +11,6 @@ pub mod reclaim;
 pub mod restore;
 pub mod scan;
 pub mod status;
+pub mod undo;
 pub mod welcome;
 pub mod wizard;

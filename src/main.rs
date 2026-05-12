@@ -121,6 +121,8 @@ enum Commands {
         #[arg(long)]
         need: Option<String>,
     },
+    /// Reverse the most recent reversible action from the receipts ledger
+    Undo,
     /// Show airlock state and pending purges
     Status,
     /// Read or write your personalization profile
@@ -179,6 +181,7 @@ fn main() -> Result<()> {
         Some(Commands::Receipt { last }) => commands::receipt::run(last, &ctx),
         Some(Commands::Explain { path }) => commands::explain::run(&path, &ctx),
         Some(Commands::Doctor { need }) => commands::doctor::run(need, &ctx),
+        Some(Commands::Undo) => commands::undo::run(&ctx),
         Some(Commands::Status) => commands::status::run(&ctx),
         Some(Commands::Profile { action }) => match action {
             ProfileAction::Get => commands::profile_cmd::get(&ctx),
