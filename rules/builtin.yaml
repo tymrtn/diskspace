@@ -118,6 +118,11 @@
   base_confidence: 0.78
   reason: "Python virtualenv — recreate with `python -m venv venv`"
   exclude_if_recent_access_days: 7
+  consequences:
+    recovery: recreate
+    rebuild_seconds: 60
+    impact: "Project won't run until you recreate the venv and pip-install"
+    recovery_cmd: "python -m venv venv && source venv/bin/activate && pip install -r requirements.txt"
 
 - id: python-pycache
   category: dev-artifact
@@ -125,6 +130,10 @@
   domain: python_development
   base_confidence: 0.90
   reason: "Python bytecode cache — regenerated automatically"
+  consequences:
+    recovery: auto
+    rebuild_seconds: 5
+    impact: "Python recompiles .pyc on next import — barely noticeable"
 
 - id: python-pip-cache
   category: dev-artifact
@@ -171,6 +180,10 @@
   base_confidence: 0.75
   reason: "Cargo git dependency cache — repopulated on next build"
   exclude_if_recent_modified_days: 30
+  consequences:
+    recovery: redownload
+    rebuild_seconds: 60
+    impact: "Next cargo build re-clones git dependencies"
 
 - id: next-build
   category: dev-artifact
@@ -200,6 +213,10 @@
   domain: web_development
   base_confidence: 0.82
   reason: "Turborepo build cache — regenerated automatically"
+  consequences:
+    recovery: rebuild
+    rebuild_seconds: 60
+    impact: "Next turbo build runs every task from scratch (no cache hits)"
 
 - id: vite-cache
   category: dev-artifact
@@ -233,6 +250,10 @@
   base_confidence: 0.72
   reason: "Gradle wrapper distributions — re-downloaded on demand"
   exclude_if_recent_access_days: 30
+  consequences:
+    recovery: redownload
+    rebuild_seconds: 60
+    impact: "Next Gradle build re-downloads the wrapper for the project's version"
 
 - id: maven-repository
   category: dev-artifact
@@ -241,6 +262,10 @@
   base_confidence: 0.70
   reason: "Maven local repository — repopulated on next build"
   exclude_if_recent_modified_days: 30
+  consequences:
+    recovery: redownload
+    rebuild_seconds: 180
+    impact: "Next Maven build re-downloads dependencies (~3 min for big projects)"
 
 - id: go-pkg-cache
   category: dev-artifact
@@ -288,6 +313,11 @@
   base_confidence: 0.75
   reason: "Ruby gems — reinstall with `bundle install`"
   exclude_if_recent_modified_days: 30
+  consequences:
+    recovery: redownload
+    rebuild_seconds: 120
+    impact: "Next `bundle install` re-downloads gems"
+    recovery_cmd: "bundle install"
 
 - id: cocoapods-cache
   category: dev-artifact
@@ -295,6 +325,11 @@
   domain: ios_development
   base_confidence: 0.85
   reason: "CocoaPods download cache — repopulated on `pod install`"
+  consequences:
+    recovery: redownload
+    rebuild_seconds: 60
+    impact: "Next pod install re-downloads pods from CocoaPods specs"
+    recovery_cmd: "pod install"
 
 - id: swift-pm-cache
   category: dev-artifact
@@ -302,6 +337,10 @@
   domain: ios_development
   base_confidence: 0.82
   reason: "Swift Package Manager cache — repopulated on next resolve"
+  consequences:
+    recovery: redownload
+    rebuild_seconds: 60
+    impact: "Next swift build or Xcode build re-resolves package dependencies"
 
 - id: jetbrains-caches
   category: app-cache
@@ -321,72 +360,120 @@
   path_pattern: "~/Library/Application Support/Slack/Cache"
   base_confidence: 0.88
   reason: "Slack media cache — rebuilt on demand"
+  consequences:
+    recovery: rebuild
+    rebuild_seconds: 30
+    impact: "Slack re-downloads media/avatars as you scroll — slight lag on first view"
 
 - id: chrome-cache
   category: app-cache
   path_pattern: "~/Library/Caches/Google/Chrome"
   base_confidence: 0.88
   reason: "Chrome browser cache — rebuilt on demand"
+  consequences:
+    recovery: rebuild
+    rebuild_seconds: 30
+    impact: "First page load per domain is slightly slower until cache rebuilds"
 
 - id: arc-cache
   category: app-cache
   path_pattern: "~/Library/Caches/company.thebrowser.Browser"
   base_confidence: 0.85
   reason: "Arc browser cache — rebuilt on demand"
+  consequences:
+    recovery: rebuild
+    rebuild_seconds: 30
+    impact: "First page load per domain is slightly slower until cache rebuilds"
 
 - id: firefox-cache
   category: app-cache
   path_pattern: "~/Library/Caches/Firefox"
   base_confidence: 0.88
   reason: "Firefox browser cache — rebuilt on demand"
+  consequences:
+    recovery: rebuild
+    rebuild_seconds: 30
+    impact: "First page load per domain is slightly slower until cache rebuilds"
 
 - id: safari-cache
   category: app-cache
   path_pattern: "~/Library/Caches/com.apple.Safari"
   base_confidence: 0.82
   reason: "Safari browser cache — rebuilt on demand"
+  consequences:
+    recovery: rebuild
+    rebuild_seconds: 30
+    impact: "First page load per domain is slightly slower until cache rebuilds"
 
 - id: spotify-cache
   category: app-cache
   path_pattern: "~/Library/Caches/com.spotify.client"
   base_confidence: 0.85
   reason: "Spotify audio cache — rebuilt as you listen"
+  consequences:
+    recovery: rebuild
+    rebuild_seconds: 60
+    impact: "Tracks redownload as you listen — only noticeable on metered connections"
 
 - id: discord-cache
   category: app-cache
   path_pattern: "~/Library/Application Support/discord/Cache"
   base_confidence: 0.88
   reason: "Discord media cache — rebuilt on demand"
+  consequences:
+    recovery: rebuild
+    rebuild_seconds: 30
+    impact: "Re-downloads avatars and inline media as you browse channels"
 
 - id: figma-cache
   category: app-cache
   path_pattern: "~/Library/Application Support/Figma/DesktopProfile/Cache"
   base_confidence: 0.85
   reason: "Figma desktop cache — rebuilt on demand"
+  consequences:
+    recovery: rebuild
+    rebuild_seconds: 30
+    impact: "Figma re-downloads font/asset caches on next open"
 
 - id: notion-cache
   category: app-cache
   path_pattern: "~/Library/Application Support/Notion/Cache"
   base_confidence: 0.85
   reason: "Notion desktop cache — rebuilt on demand"
+  consequences:
+    recovery: rebuild
+    rebuild_seconds: 30
+    impact: "Notion re-syncs as you open pages — first open is slower"
 
 - id: zoom-cache
   category: app-cache
   path_pattern: "~/Library/Application Support/zoom.us/Cache"
   base_confidence: 0.88
   reason: "Zoom media cache — rebuilt on demand"
+  consequences:
+    recovery: rebuild
+    rebuild_seconds: 10
+    impact: "Zoom rebuilds its local profile cache on next launch"
 
 - id: teams-cache
   category: app-cache
   path_pattern: "~/Library/Application Support/Microsoft/Teams/Cache"
   base_confidence: 0.88
   reason: "Microsoft Teams cache — rebuilt on demand"
+  consequences:
+    recovery: rebuild
+    rebuild_seconds: 30
+    impact: "Teams rebuilds caches on next launch — first sync is slightly slower"
 
 - id: linear-cache
   category: app-cache
   path_pattern: "~/Library/Application Support/Linear/Cache"
   base_confidence: 0.85
   reason: "Linear desktop cache — rebuilt on demand"
+  consequences:
+    recovery: rebuild
+    rebuild_seconds: 15
+    impact: "Linear re-syncs on next launch — brief loading state"
 
 - id: apple-mail-cache
   category: app-cache
@@ -394,6 +481,10 @@
   base_confidence: 0.70
   reason: "Mail write-ahead log — safe to remove when Mail is closed"
   exclude_if_recent_access_days: 1
+  consequences:
+    recovery: rebuild
+    rebuild_seconds: 60
+    impact: "Mail rebuilds the local search index on next launch — search lags briefly"
 
 - id: ios-device-backups
   category: app-cache
@@ -411,6 +502,10 @@
   base_confidence: 0.80
   reason: "Disk image installer — app is already installed or abandoned"
   exclude_if_recent_modified_days: 30
+  consequences:
+    recovery: redownload
+    rebuild_seconds: 120
+    impact: "If you need to reinstall the app, you re-download the DMG from the vendor"
 
 - id: old-zip-installers
   category: download-entropy
@@ -418,6 +513,10 @@
   base_confidence: 0.70
   reason: "Downloaded archive — likely already extracted or abandoned"
   exclude_if_recent_modified_days: 60
+  consequences:
+    recovery: redownload
+    rebuild_seconds: 60
+    impact: "If still needed, re-download from source"
 
 - id: old-pkg-installers
   category: download-entropy
@@ -425,6 +524,10 @@
   base_confidence: 0.82
   reason: "macOS package installer — already installed or abandoned"
   exclude_if_recent_modified_days: 30
+  consequences:
+    recovery: redownload
+    rebuild_seconds: 120
+    impact: "If you need to reinstall, re-download the .pkg from the vendor"
 
 - id: desktop-screenshots
   category: download-entropy
@@ -432,6 +535,9 @@
   base_confidence: 0.72
   reason: "Screenshots accumulate on Desktop — move or delete once reviewed"
   exclude_if_recent_modified_days: 7
+  consequences:
+    recovery: irreversible
+    impact: "Screenshots are gone — review first if any are worth keeping"
 
 - id: downloads-screenshots
   category: download-entropy
@@ -625,12 +731,18 @@
   path_pattern: "~/.cursor/logs"
   base_confidence: 0.95
   reason: "Cursor log files — historical, never read after the session"
+  consequences:
+    recovery: auto
+    impact: "No user-visible impact — logs are historical only"
 
 - id: cursor-extensions-obsolete
   category: app-cache
   path_pattern: "~/.cursor/extensions/.obsolete"
   base_confidence: 0.95
   reason: "Cursor's marker file for extensions pending removal"
+  consequences:
+    recovery: auto
+    impact: "Removes marker files for extensions Cursor was going to clean up anyway"
 
 - id: huggingface-incomplete
   category: dev-artifact
@@ -670,18 +782,29 @@
   path_pattern: "~/.codex/cache"
   base_confidence: 0.85
   reason: "Codex (OpenAI) desktop app cache — rebuilt automatically"
+  consequences:
+    recovery: rebuild
+    rebuild_seconds: 30
+    impact: "Codex desktop rebuilds caches on next launch"
 
 - id: codex-logs
   category: app-cache
   path_pattern: "~/.codex/logs"
   base_confidence: 0.95
   reason: "Codex log files — historical only"
+  consequences:
+    recovery: auto
+    impact: "No user-visible impact — logs are historical only"
 
 - id: hermes-cache
   category: app-cache
   path_pattern: "~/.hermes/cache"
   base_confidence: 0.85
   reason: "Hermes runtime cache — rebuilt on next launch"
+  consequences:
+    recovery: rebuild
+    rebuild_seconds: 15
+    impact: "Hermes rebuilds runtime cache on next launch"
 
 - id: screenpipe-database
   category: app-cache
@@ -709,6 +832,9 @@
   path_pattern: "~/.npm/_logs"
   base_confidence: 0.95
   reason: "npm log files — historical only"
+  consequences:
+    recovery: auto
+    impact: "No user-visible impact — logs are historical only"
 
 - id: tmp-old
   category: download-entropy

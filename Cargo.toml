@@ -1,6 +1,6 @@
 [package]
 name = "diskspace-cli"
-version = "0.9.0"
+version = "0.10.0"
 edition = "2021"
 description = "Find the dead weight in your cargo hold — a personalized, reversible disk-cleanup CLI"
 license-file = "LICENSE"
