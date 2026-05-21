@@ -902,3 +902,71 @@
   base_confidence: 0.65
   reason: "Migration scripts/dumps in $HOME — usually old DB exports, review then delete"
   exclude_if_recent_modified_days: 30
+
+# ── On-device AI models silently downloaded by Chromium-family browsers ───────
+#
+# Chrome (and other Chromium forks) download "Gemini Nano" / TFLite helpers in
+# the background to power features like "Help me write". On Windows this lands
+# as ~4 GB at OptGuideOnDeviceModel/weights.bin; on macOS it's smaller TFLite
+# files under optimization_guide_model_store/. Either way, the browser will
+# re-download them unless the user disables on-device AI in Settings first.
+
+- id: chrome-on-device-ai-models
+  category: app-cache
+  path_pattern: "~/Library/Application Support/Google/Chrome/optimization_guide_model_store"
+  base_confidence: 0.55
+  reason: "Chrome on-device AI models (Gemini Nano / TFLite). Re-downloads unless on-device AI is disabled in Chrome settings."
+  consequences:
+    recovery: redownload
+    impact: "Chrome re-fetches these unless you first turn off Settings → System → On-device AI (or set chrome://flags 'Optimization guide on device model' → Disabled). Disables Help-me-write and related features."
+    recovery_cmd: "Re-enable On-device AI in Chrome → Settings → System"
+
+- id: chrome-optguide-weights-windows-shape
+  category: app-cache
+  path_pattern: "~/Library/Application Support/Google/Chrome/*/OptGuideOnDeviceModel"
+  base_confidence: 0.55
+  reason: "Chrome Gemini Nano weights (Windows-style layout if it ever appears on macOS)"
+  consequences:
+    recovery: redownload
+    impact: "Chrome re-downloads ~4 GB unless on-device AI is disabled in Settings first."
+    recovery_cmd: "Re-enable On-device AI in Chrome → Settings → System"
+
+- id: edge-on-device-ai-models
+  category: app-cache
+  path_pattern: "~/Library/Application Support/Microsoft Edge/optimization_guide_model_store"
+  base_confidence: 0.55
+  reason: "Edge on-device AI models. Re-downloads unless on-device AI features are disabled in Edge settings."
+  consequences:
+    recovery: redownload
+    impact: "Edge re-fetches these unless on-device AI features are turned off in Settings."
+    recovery_cmd: "Disable on-device AI in Edge → Settings"
+
+- id: brave-on-device-ai-models
+  category: app-cache
+  path_pattern: "~/Library/Application Support/BraveSoftware/Brave-Browser/optimization_guide_model_store"
+  base_confidence: 0.55
+  reason: "Brave on-device AI models inherited from Chromium upstream"
+  consequences:
+    recovery: redownload
+    impact: "Brave (Chromium-based) re-fetches these unless on-device AI is disabled."
+    recovery_cmd: "Disable on-device AI in brave://settings or brave://flags"
+
+- id: arc-on-device-ai-models
+  category: app-cache
+  path_pattern: "~/Library/Application Support/Arc/User Data/optimization_guide_model_store"
+  base_confidence: 0.55
+  reason: "Arc on-device AI models inherited from Chromium upstream"
+  consequences:
+    recovery: redownload
+    impact: "Arc re-fetches these unless on-device AI is disabled."
+    recovery_cmd: "Disable on-device AI in Arc settings"
+
+- id: chromium-on-device-ai-models
+  category: app-cache
+  path_pattern: "~/Library/Application Support/Chromium/optimization_guide_model_store"
+  base_confidence: 0.55
+  reason: "Chromium on-device AI models"
+  consequences:
+    recovery: redownload
+    impact: "Chromium re-fetches these unless on-device AI is disabled in Settings."
+    recovery_cmd: "Disable on-device AI in chrome://settings"

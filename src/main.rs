@@ -123,6 +123,11 @@ enum Commands {
     },
     /// Reverse the most recent reversible action from the receipts ledger
     Undo,
+    /// Background disk-pressure monitor (launchd-backed). Nudges at 10% free, urgent at 5%.
+    Watch {
+        #[command(subcommand)]
+        action: WatchAction,
+    },
     /// Show airlock state and pending purges
     Status,
     /// Read or write your personalization profile
@@ -130,6 +135,18 @@ enum Commands {
         #[command(subcommand)]
         action: ProfileAction,
     },
+}
+
+#[derive(Subcommand)]
+enum WatchAction {
+    /// Install the launchd agent so diskspace checks disk pressure in the background
+    Install,
+    /// Remove the launchd agent
+    Uninstall,
+    /// Show whether the agent is installed/loaded and what the last check saw
+    Status,
+    /// Run one disk-pressure check (called by launchd; you can also run it by hand)
+    Run,
 }
 
 #[derive(Subcommand)]
@@ -182,6 +199,12 @@ fn main() -> Result<()> {
         Some(Commands::Explain { path }) => commands::explain::run(&path, &ctx),
         Some(Commands::Doctor { need }) => commands::doctor::run(need, &ctx),
         Some(Commands::Undo) => commands::undo::run(&ctx),
+        Some(Commands::Watch { action }) => match action {
+            WatchAction::Install => commands::watch::install(&ctx),
+            WatchAction::Uninstall => commands::watch::uninstall(&ctx),
+            WatchAction::Status => commands::watch::status(&ctx),
+            WatchAction::Run => commands::watch::run(&ctx),
+        },
         Some(Commands::Status) => commands::status::run(&ctx),
         Some(Commands::Profile { action }) => match action {
             ProfileAction::Get => commands::profile_cmd::get(&ctx),
