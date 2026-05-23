@@ -19,6 +19,7 @@
 use anyhow::{Context, Result};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 /// Raw bytes of the bundled icon — see assets/icon/AppIcon.icns.
 const APP_ICON_ICNS: &[u8] = include_bytes!("../../assets/icon/AppIcon.icns");
@@ -59,7 +60,31 @@ pub fn ensure_bundle() -> Result<PathBuf> {
         .with_context(|| format!("copying {} -> {}", src_bin.display(), dst_bin.display()))?;
     set_executable(&dst_bin)?;
 
+    // Ad-hoc sign the whole bundle. Without this, the bundle has no
+    // _CodeSignature/CodeResources sealing Info.plist + Resources to the
+    // binary, and macOS Gatekeeper throws "DiskspaceWatch.app is damaged"
+    // when anything tries to launch it interactively. Ad-hoc signing ("-"
+    // identity) gives the bundle a valid local signature without needing
+    // the Developer ID cert on the user's machine. --deep replaces the
+    // inner binary's signature so it's bound to the bundle.
+    let _ = adhoc_sign(&bundle_root);
+
     Ok(dst_bin)
+}
+
+fn adhoc_sign(bundle: &Path) -> Result<()> {
+    let output = Command::new("codesign")
+        .args(["--force", "--deep", "--sign", "-"])
+        .arg(bundle)
+        .output()
+        .context("running codesign")?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "codesign ad-hoc failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(())
 }
 
 /// Remove the bundle if it exists. Best-effort.
