@@ -23,6 +23,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use crate::core::bundle;
 use crate::output::Context;
 
 const PLIST_LABEL: &str = "com.tymrtn.diskspace.watch";
@@ -53,7 +54,9 @@ struct WatchState {
 
 pub fn install(ctx: &Context) -> Result<()> {
     let plist_path = launch_agent_plist_path()?;
-    let bin = std::env::current_exe().context("could not resolve diskspace binary path")?;
+    // Build (or refresh) the .app bundle so macOS Background Items has metadata
+    // and an icon to display. The launchd plist points at the bundle's binary.
+    let bin = bundle::ensure_bundle().context("creating DiskspaceWatch.app bundle")?;
     let log_dir = state_dir()?;
     fs::create_dir_all(&log_dir)?;
     let stdout_log = log_dir.join("watch.stdout.log");
@@ -168,6 +171,8 @@ pub fn uninstall(ctx: &Context) -> Result<()> {
         .arg(&plist_path)
         .output();
     fs::remove_file(&plist_path)?;
+    // Also remove the .app bundle (the metadata wrapper); state files stay.
+    let _ = bundle::remove_bundle();
     if ctx.json {
         println!(r#"{{"uninstalled":true}}"#);
     } else {

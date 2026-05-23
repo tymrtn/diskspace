@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  diskspace app icon
+  ──────────────────
+  Charcoal rounded-square (macOS app-icon corner radius ~22% of side).
+  Centered "disk" rendered as a thick ring in warm cream, with a 70° wedge
+  rendered in the diskspace amber accent (#E5A100). Visual metaphor: space
+  being reclaimed from a full disk.
+
+  Ring math (radius 320 → circumference 2π·320 = 2010.619):
+    cream  arc (290°) length = 290/360 · 2010.619 = 1619.388
+    amber wedge (70°) length =  70/360 · 2010.619 =  391.231
+
+  The group is rotated -90° so the SVG default start (+x, 3 o'clock) becomes
+  12 o'clock. Cream then sweeps clockwise 12 → 3 → 6 → 9 → ~11. Amber fills
+  the remaining 70° in the upper-left quadrant.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <defs>
+    <linearGradient id="bgGrad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0"   stop-color="#1F2024"/>
+      <stop offset="1"   stop-color="#0F1013"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Rounded-square background — r/w ≈ 21.9% (macOS app-icon spec). -->
+  <rect x="0" y="0" width="1024" height="1024" rx="224" ry="224" fill="url(#bgGrad)"/>
+
+  <!-- Ring centered at (512, 512), rotated so dash start sits at 12 o'clock. -->
+  <g transform="translate(512 512) rotate(-90)">
+    <!-- Cream arc: 290° from 12 o'clock clockwise -->
+    <circle r="320" fill="none" stroke="#F2E7CE" stroke-width="96"
+            stroke-dasharray="1619.388 391.231"
+            stroke-dashoffset="0"/>
+
+    <!-- Amber wedge: 70° filling the upper-left gap.
+         Offset by -1619.388 so the dash starts where cream ended. -->
+    <circle r="320" fill="none" stroke="#E5A100" stroke-width="96"
+            stroke-dasharray="391.231 1619.388"
+            stroke-dashoffset="-1619.388"/>
+  </g>
+</svg>
