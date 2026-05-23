@@ -1,8 +1,10 @@
 # Contributing to diskspace
 
+Two easy ways in: **add a new rule**, or **backfill a consequence block** on a rule that doesn't have one yet. Both require zero Rust.
+
 ## The easiest contribution: adding a rule
 
-The rule library is the main contribution surface. Adding a rule requires no Rust — just a 10-line YAML entry in [`rules/builtin.yaml`](rules/builtin.yaml).
+The rule library is the main contribution surface. Adding a rule requires no Rust — just a ~12-line YAML entry in [`rules/builtin.yaml`](rules/builtin.yaml).
 
 ```yaml
 - id: your-rule-id            # kebab-case, unique
@@ -47,7 +49,12 @@ The `consequences` block is what `diskspace check` and agents use to explain wha
 - Anything below 0.50 confidence with no domain guard
 - Rules that match source code directories (not build artifacts)
 - Rules that match `~/Documents`, `~/Desktop` broadly
-- Rules requiring internet access to recover from deletion
+- Rules without a consequences block for anything below confidence 0.85
+- Rules that hide a re-download in the consequences (e.g. Chrome on-device AI models that silently come back unless a setting is changed first — the impact line must call this out)
+
+## Easy second contribution: backfill a consequences block
+
+16 of 91 rules in `rules/builtin.yaml` don't have a `consequences:` block yet. Adding one is a great first PR — pick one of those rules, figure out what actually happens when its target is deleted (try it on a scratch directory), and add the block. Confidence floor for rules without consequences should be ≥ 0.85; everything below needs an impact statement.
 
 ## Running tests
 
