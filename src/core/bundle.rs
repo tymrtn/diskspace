@@ -60,16 +60,83 @@ pub fn ensure_bundle() -> Result<PathBuf> {
         .with_context(|| format!("copying {} -> {}", src_bin.display(), dst_bin.display()))?;
     set_executable(&dst_bin)?;
 
-    // Ad-hoc sign the whole bundle. Without this, the bundle has no
-    // _CodeSignature/CodeResources sealing Info.plist + Resources to the
-    // binary, and macOS Gatekeeper throws "DiskspaceWatch.app is damaged"
-    // when anything tries to launch it interactively. Ad-hoc signing ("-"
-    // identity) gives the bundle a valid local signature without needing
-    // the Developer ID cert on the user's machine. --deep replaces the
-    // inner binary's signature so it's bound to the bundle.
-    let _ = adhoc_sign(&bundle_root);
+    // Sign the bundle so macOS Gatekeeper has something to validate.
+    // Preference order:
+    //   1. A "Developer ID Application" identity from the keychain (best —
+    //      preserves the inner binary's notarized signature and gives the
+    //      bundle a real, attributable signature). This applies on the
+    //      developer's machine and on any other Mac that happens to have a
+    //      Developer ID cert installed.
+    //   2. Ad-hoc fallback when no Developer ID identity is available
+    //      (the case on most end-user machines). Ad-hoc is valid but
+    //      Gatekeeper will still reject the bundle for interactive
+    //      launches — launchd doesn't care, which is what we need.
+    let _ = sign_bundle(&bundle_root);
 
     Ok(dst_bin)
+}
+
+/// Sign the bundle. Prefers Developer ID Application from the keychain,
+/// falls back to ad-hoc. Best-effort; signature failures aren't fatal because
+/// launchd will still run the agent regardless.
+fn sign_bundle(bundle: &Path) -> Result<()> {
+    if let Some(identity) = find_developer_id_identity() {
+        // Use the Developer ID cert. Notably we do NOT pass `--deep` here,
+        // so the inner Mach-O's existing Developer ID + notarized signature
+        // is left intact. codesign only seals the bundle wrapper
+        // (Info.plist + Resources + a CodeResources file that records the
+        // inner binary's existing signature hash).
+        let output = Command::new("codesign")
+            .args([
+                "--force",
+                "--options",
+                "runtime",
+                "--timestamp",
+                "--sign",
+                &identity,
+            ])
+            .arg(bundle)
+            .output()
+            .context("running codesign with Developer ID")?;
+        if output.status.success() {
+            return Ok(());
+        }
+        // If Developer ID signing failed (e.g. timestamp server timeout, or
+        // the inner binary's identifier conflicts) fall through to ad-hoc.
+        eprintln!(
+            "  note: Developer ID signing failed, falling back to ad-hoc: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    adhoc_sign(bundle)
+}
+
+/// Returns the full SecIdentity name of the first "Developer ID Application"
+/// cert in the user's codesigning keychain, if any.
+fn find_developer_id_identity() -> Option<String> {
+    let output = Command::new("security")
+        .args(["find-identity", "-v", "-p", "codesigning"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Each line looks like:
+    //   `  1) <HASH> "Developer ID Application: Xoder PR LLC (RST67A4A6S)"`
+    // We want the quoted string for the first line containing
+    // "Developer ID Application:".
+    for line in stdout.lines() {
+        if !line.contains("Developer ID Application:") {
+            continue;
+        }
+        let first = line.find('"')?;
+        let last = line.rfind('"')?;
+        if last > first {
+            return Some(line[first + 1..last].to_string());
+        }
+    }
+    None
 }
 
 fn adhoc_sign(bundle: &Path) -> Result<()> {
@@ -77,7 +144,7 @@ fn adhoc_sign(bundle: &Path) -> Result<()> {
         .args(["--force", "--deep", "--sign", "-"])
         .arg(bundle)
         .output()
-        .context("running codesign")?;
+        .context("running codesign --sign -")?;
     if !output.status.success() {
         anyhow::bail!(
             "codesign ad-hoc failed: {}",
