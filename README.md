@@ -199,6 +199,17 @@ diskspace profile set domains.ios_development.active=false
 
 Exit codes: `0` success · `1` no candidates · `2` pressure-test failed · `3` profile policy blocked · `127` unknown error.
 
+## Claude Code plugin
+
+This repo doubles as a [Claude Code](https://docs.claude.com/en/docs/claude-code) plugin marketplace. Install the skill so an agent reaches for `diskspace` the moment a build dies with *"No space left on device"* — safely, because the airlock + pressure-test make it the rare cleanup tool that's safe to auto-invoke:
+
+```
+/plugin marketplace add tymrtn/diskspace
+/plugin install diskspace@diskspace
+```
+
+The plugin ships one skill (a deterministic `doctor`/exit-code runbook over this CLI); it expects the `diskspace` binary on `PATH` (see [Install](#install)). Manifests live in [`.claude-plugin/`](.claude-plugin/marketplace.json) and [`plugins/diskspace/`](plugins/diskspace).
+
 ## Trust model
 
 Diskspace's whole pitch is that you can trust it without watching it. The structural pieces:

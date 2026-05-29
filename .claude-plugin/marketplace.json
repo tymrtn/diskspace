@@ -1,0 +1,21 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "diskspace",
+  "description": "Safely recover disk space on macOS from Claude Code. When a build or command dies with 'No space left on device' (ENOSPC), diskspace reversibly frees the disk — airlock + pressure-test means it's safe to auto-invoke where a blunt rm -rf would not be.",
+  "owner": {
+    "name": "Tyler Martin",
+    "email": "ty@tmrtn.com"
+  },
+  "plugins": [
+    {
+      "name": "diskspace",
+      "description": "Safe, reversible disk-space recovery on macOS. Auto-invokes when a build, install, or command fails with 'No space left on device' / ENOSPC / errno 28 / 'disk full', or when asked to free up space or clean caches, node_modules, DerivedData, Docker, Xcode, or Homebrew. Wraps the diskspace CLI's airlock + 4-validator pressure-test + stable exit-code contract.",
+      "author": {
+        "name": "Tyler Martin"
+      },
+      "source": "./plugins/diskspace",
+      "category": "productivity",
+      "homepage": "https://github.com/tymrtn/diskspace"
+    }
+  ]
+}

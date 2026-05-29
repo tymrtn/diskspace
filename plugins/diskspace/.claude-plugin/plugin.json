@@ -1,0 +1,24 @@
+{
+  "name": "diskspace",
+  "version": "0.1.0",
+  "description": "Safe, reversible disk-space recovery on macOS. Auto-invokes when a build, install, or command fails with 'No space left on device' / ENOSPC / errno 28 / 'disk full', or when asked to free up space or clean caches, node_modules, DerivedData, Docker, Xcode, or Homebrew. Wraps the diskspace CLI (airlock + 4-validator pressure-test + stable exit-code contract).",
+  "author": {
+    "name": "Tyler Martin",
+    "email": "ty@tmrtn.com"
+  },
+  "homepage": "https://github.com/tymrtn/diskspace",
+  "repository": "https://github.com/tymrtn/diskspace",
+  "license": "PolyForm-Noncommercial-1.0.0",
+  "keywords": [
+    "disk",
+    "storage",
+    "cleanup",
+    "macos",
+    "enospc",
+    "no-space-left-on-device",
+    "ci",
+    "skills"
+  ],
+  "category": "productivity",
+  "skills": "./skills/"
+}
