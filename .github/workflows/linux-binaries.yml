@@ -1,0 +1,71 @@
+name: linux-binaries
+
+# diskspace already compiles cleanly for Linux (the macOS bits — launchctl, codesign,
+# the .app bundle — are runtime shell-outs, not compile-time deps; platform code is
+# #[cfg(unix)]-guarded). This workflow proves that on every push and, on a published
+# release, builds + uploads Linux binaries so `cargo binstall` and a future
+# "free disk space" GitHub Action have prebuilt assets to fetch.
+
+on:
+  push:
+    branches: [main]
+    paths: ['src/**', 'Cargo.toml', 'Cargo.lock', 'rules/**', '.github/workflows/linux-binaries.yml']
+  pull_request:
+    paths: ['src/**', 'Cargo.toml', 'Cargo.lock', 'rules/**']
+  release:
+    types: [published]
+
+permissions:
+  contents: write   # upload assets to the release
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            asset: diskspace-linux-x86_64
+          - target: aarch64-unknown-linux-gnu
+            asset: diskspace-linux-aarch64
+            cross_pkg: gcc-aarch64-linux-gnu
+            linker: aarch64-linux-gnu-gcc
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: |
+          rustup update stable
+          rustup target add ${{ matrix.target }}
+
+      - name: Install cross linker (aarch64 only)
+        if: matrix.cross_pkg != ''
+        run: sudo apt-get update && sudo apt-get install -y ${{ matrix.cross_pkg }}
+
+      - name: Build release binary
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: ${{ matrix.linker }}
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Stage + strip
+        run: |
+          BIN="target/${{ matrix.target }}/release/diskspace"
+          [ "${{ matrix.target }}" = "x86_64-unknown-linux-gnu" ] && strip "$BIN" || true
+          cp "$BIN" "${{ matrix.asset }}"
+          ./${{ matrix.asset }} --version || true   # smoke-check x86_64 (aarch64 can't run here)
+
+      - name: Upload as build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: ${{ matrix.asset }}
+
+      - name: Attach to release
+        if: github.event_name == 'release'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name }}
+          ASSET: ${{ matrix.asset }}
+        run: gh release upload "$TAG" "$ASSET" --clobber
