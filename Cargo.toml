@@ -12,6 +12,18 @@ categories = ["command-line-utilities", "filesystem"]
 authors = ["Tyler Martin <ty@tmrtn.com>"]
 exclude = ["target/*", ".github/*"]
 
+# `cargo binstall diskspace-cli` fetches the notarized universal macOS binary from the GitHub
+# release instead of compiling from source — seconds, not minutes (the difference between an
+# agent self-installing mid disk-pressure and giving up). macOS only today; other targets fall
+# back to a source build. Bump the version in lockstep with the release tag (vX.Y.Z).
+[package.metadata.binstall.overrides.aarch64-apple-darwin]
+pkg-url = "{ repo }/releases/download/v{ version }/diskspace-universal"
+pkg-fmt = "bin"
+
+[package.metadata.binstall.overrides.x86_64-apple-darwin]
+pkg-url = "{ repo }/releases/download/v{ version }/diskspace-universal"
+pkg-fmt = "bin"
+
 [[bin]]
 name = "diskspace"
 path = "src/main.rs"
