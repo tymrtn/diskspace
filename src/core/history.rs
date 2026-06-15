@@ -152,17 +152,12 @@ pub fn tail(n: usize) -> Result<Vec<Entry>> {
 }
 
 /// Free bytes available on the filesystem containing `path`. Returns None if `df` fails.
+///
+/// Delegates to the single consolidated POSIX `df -kP` parser in
+/// [`crate::core::fsutil`] so macOS and Linux share one code path (the old
+/// inline `df -k` parse mis-read Linux's line-wrapped output).
 pub fn free_bytes(path: &Path) -> Option<u64> {
-    let output = std::process::Command::new("df")
-        .arg("-k")
-        .arg(path)
-        .output()
-        .ok()?;
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let line = stdout.lines().nth(1)?;
-    let fields: Vec<&str> = line.split_whitespace().collect();
-    let kb_avail: u64 = fields.get(3)?.parse().ok()?;
-    Some(kb_avail * 1024)
+    crate::core::fsutil::free_bytes(path)
 }
 
 #[cfg(test)]

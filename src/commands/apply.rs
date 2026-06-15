@@ -25,6 +25,7 @@ use std::path::Path;
 use crate::commands::check;
 use crate::commands::doctor::{self, Plan};
 use crate::commands::plan as plan_cmd;
+use crate::core::grant::Grant;
 use crate::core::history;
 use crate::output::Context;
 use crate::profile;
@@ -194,10 +195,30 @@ fn revalidate(
     Ok(Ok(()))
 }
 
-pub fn run(plan_hash: &str, ctx: &Context) -> Result<()> {
+pub fn run(plan_hash: &str, grant: Option<&Grant>, ctx: &Context) -> Result<()> {
+    // Keep the parameter live for the non-actuation build (grant ignored there).
+    #[cfg(not(feature = "actuation"))]
+    let _ = grant;
+
     let prof = profile::load()?;
     let home = std::env::var("HOME").unwrap_or_else(|_| "/".into());
     let home_path = Path::new(&home);
+
+    // AGENT-PATH GRANT GATE (actuation only). Like doctor, a NON-INTERACTIVE apply
+    // (`--json`/`--yes`) that will MUTATE requires a valid grant; without one we
+    // refuse with a machine-parseable `no_grant` error before loading the plan.
+    #[cfg(feature = "actuation")]
+    {
+        let non_interactive = ctx.json || ctx.yes;
+        if non_interactive && grant.is_none() {
+            if ctx.json {
+                println!(r#"{{"error":"no_grant","hint":"issue a grant token"}}"#);
+            } else {
+                eprintln!("\n  Refusing: no grant. Issue one with `diskspace grant issue …`.\n");
+            }
+            std::process::exit(4);
+        }
+    }
 
     // Load the persisted plan. A missing/unparseable file is a refusal, not a panic.
     let plan = match plan_cmd::load_plan(plan_hash) {
@@ -231,7 +252,7 @@ pub fn run(plan_hash: &str, ctx: &Context) -> Result<()> {
     // the SAME executor doctor uses (airlock / immediate + history receipts).
     let df_before = history::free_bytes(home_path).unwrap_or(0);
     let need_bytes = df_before.saturating_add(plan.need_bytes);
-    let outcome = doctor::execute_plan(&plan, &prof, ctx, df_before, need_bytes, home_path)?;
+    let outcome = doctor::execute_plan(&plan, &prof, grant, ctx, df_before, need_bytes, home_path)?;
 
     if ctx.json {
         let payload = serde_json::json!({
@@ -477,6 +498,7 @@ mod tests {
         let outcome = doctor::execute_plan(
             &plan,
             &prof,
+            None,
             &quiet_ctx(),
             df_before,
             df_before + plan.need_bytes,

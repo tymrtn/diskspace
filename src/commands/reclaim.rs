@@ -6,6 +6,7 @@ use crate::commands::check;
 use crate::commands::detect::build_candidates_pub;
 use crate::commands::scan::scan_cache_path;
 use crate::core::candidate::Candidate;
+use crate::core::grant::Grant;
 use crate::core::history::{self, ActionKind, Entry as HistEntry};
 use crate::core::scanner::ScanResult;
 use crate::output::{self, Context};
@@ -13,7 +14,19 @@ use crate::profile;
 
 const MIN_CONFIDENCE: f32 = 0.85;
 
-pub fn run(top: usize, unsafe_confidence: bool, ctx: &Context) -> Result<()> {
+/// `grant` is threaded through but only consulted under the `actuation` feature,
+/// and ALWAYS strictly after `pressure_test` has returned `safe == true`. Without
+/// the feature it is ignored and the existing human-consent flow is unchanged.
+pub fn run(
+    top: usize,
+    unsafe_confidence: bool,
+    grant: Option<&Grant>,
+    ctx: &Context,
+) -> Result<()> {
+    // Keep the parameter live for the non-actuation build (where the grant is
+    // intentionally ignored) without tripping the unused-variable lint.
+    #[cfg(not(feature = "actuation"))]
+    let _ = grant;
     let cache = scan_cache_path();
     if !cache.exists() {
         if ctx.json {
@@ -151,7 +164,88 @@ pub fn run(top: usize, unsafe_confidence: bool, ctx: &Context) -> Result<()> {
         }
     }
 
-    // For --unsafe-confidence, require typed-id consent on each below-threshold survivor.
+    // Below-floor consent. A survivor below MIN_CONFIDENCE needs an explicit
+    // override before we permanently delete it. There are two override paths:
+    //
+    //   * The grant path (only when the `actuation` feature is built AND a valid
+    //     grant is present): the grant SUBSTITUTES for typed-id consent on a
+    //     below-floor survivor whose action falls inside its bound. The grant is
+    //     consulted ONLY here, strictly AFTER the pressure-test already cleared
+    //     the survivor (`result.safe == true` above) — it can NEVER make an unsafe
+    //     candidate actionable. Denied below-floor survivors are SKIPPED (removed
+    //     from the act-list) and recorded so the JSON output and the audit log
+    //     both show the denial.
+    //   * The human path (no feature, or no grant): the existing typed-id consent
+    //     loop, unchanged.
+    //
+    // Above-floor survivors already cleared the human floor and never consult a
+    // grant. `grant_denied` collects the JSON records for skipped survivors. It is
+    // only mutated under the `actuation` feature (`allow(unused_mut)` keeps the
+    // non-actuation build warning-free, where it stays an empty Vec).
+    #[allow(unused_mut)]
+    let mut grant_denied: Vec<serde_json::Value> = Vec::new();
+
+    #[cfg(feature = "actuation")]
+    let grant_acted: Vec<(String, u64)> = {
+        use crate::core::grant::{self, GrantDecision};
+        let mut acted = Vec::new();
+        if let Some(g) = grant {
+            // Track cumulative spend across this run so max_bytes bounds the WHOLE
+            // batch, not each item in isolation.
+            let mut spent: u64 = 0;
+            let mut kept: Vec<Candidate> = Vec::with_capacity(survivors.len());
+            for c in survivors.drain(..) {
+                if c.confidence >= MIN_CONFIDENCE {
+                    // Above the floor — no grant needed.
+                    kept.push(c);
+                    continue;
+                }
+                let decision = grant::allows(
+                    g,
+                    c.consequences.as_ref(),
+                    c.confidence,
+                    c.size_bytes,
+                    &c.path,
+                    spent,
+                );
+                // Audit the consultation regardless of outcome.
+                grant::audit(g, "reclaim", &c.path, c.size_bytes, &decision);
+                match decision {
+                    GrantDecision::Allow => {
+                        spent = spent.saturating_add(c.size_bytes);
+                        acted.push((c.id.clone(), c.size_bytes));
+                        kept.push(c);
+                    }
+                    GrantDecision::Deny(reason) => {
+                        if !ctx.json {
+                            let dim = Style::new().dim();
+                            println!(
+                                "  {}  {}  grant denied: {}",
+                                ctx.style("✗", &Style::new().red().bold()),
+                                ctx.style(&c.id, &dim),
+                                ctx.style(&reason, &dim),
+                            );
+                        }
+                        grant_denied.push(serde_json::json!({
+                            "id": c.id,
+                            "path": c.path,
+                            "size_bytes": c.size_bytes,
+                            "reason": reason,
+                        }));
+                        // SKIP: do not act on a denied candidate.
+                    }
+                }
+            }
+            survivors = kept;
+        }
+        acted
+    };
+
+    // Typed-id consent fallback: only when NO grant satisfied the override above.
+    // Under actuation with a present grant, every below-floor survivor was already
+    // resolved (allowed→kept, denied→dropped), so there is nothing left below the
+    // floor and this loop is a no-op. Without the feature (or without a grant) it
+    // is the unchanged human path.
     if unsafe_confidence {
         let low_conf: Vec<&Candidate> = survivors
             .iter()
@@ -235,12 +329,24 @@ pub fn run(top: usize, unsafe_confidence: bool, ctx: &Context) -> Result<()> {
     let free_after = free_bytes(Path::new(&home));
 
     if ctx.json {
-        let out = serde_json::json!({
+        let mut out = serde_json::json!({
             "reclaimed": deleted,
             "bytes_deleted": deleted_bytes,
             "free_before": free_before,
             "free_after": free_after,
         });
+        if !grant_denied.is_empty() {
+            out["grant_denied"] = serde_json::Value::Array(grant_denied);
+        }
+        #[cfg(feature = "actuation")]
+        if !grant_acted.is_empty() {
+            out["grant_acted"] = serde_json::Value::Array(
+                grant_acted
+                    .into_iter()
+                    .map(|(id, bytes)| serde_json::json!({ "id": id, "size_bytes": bytes }))
+                    .collect(),
+            );
+        }
         println!("{}", serde_json::to_string_pretty(&out)?);
     } else {
         println!();
@@ -266,16 +372,10 @@ pub fn run(top: usize, unsafe_confidence: bool, ctx: &Context) -> Result<()> {
     Ok(())
 }
 
-/// Free bytes available on the filesystem containing `path`. Uses `df -k`.
+/// Free bytes available on the filesystem containing `path`. Delegates to the
+/// single consolidated POSIX `df -kP` parser in [`crate::core::fsutil`] so this
+/// path is cross-platform (the old inline `df -k` parse mis-read Linux's
+/// line-wrapped `df` output).
 fn free_bytes(path: &Path) -> Option<u64> {
-    let output = std::process::Command::new("df")
-        .arg("-k")
-        .arg(path)
-        .output()
-        .ok()?;
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let line = stdout.lines().nth(1)?;
-    let fields: Vec<&str> = line.split_whitespace().collect();
-    let kb_avail: u64 = fields.get(3)?.parse().ok()?;
-    Some(kb_avail * 1024)
+    crate::core::fsutil::free_bytes(path)
 }

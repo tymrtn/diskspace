@@ -35,6 +35,14 @@ struct Cli {
     /// Minimal output — no confidence bars or decorations
     #[arg(long, global = true)]
     quiet: bool,
+
+    /// Path to a signed capability grant (`grant.json`) authorizing autonomous
+    /// actuation. Defaults to `preferences.grant_path` from the profile, then to
+    /// `~/.diskspace/grant.json`. The grant is VERIFIED against the trusted public
+    /// key; it can never widen a candidate past the hard pressure-test. Only
+    /// consulted when the binary is built with the `actuation` feature.
+    #[arg(long, global = true)]
+    grant: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -165,6 +173,13 @@ enum Commands {
         #[command(subcommand)]
         action: ProfileAction,
     },
+    /// Issue, inspect, and key the ed25519 capability grants that bound an
+    /// autonomous actor. `keygen`/`issue` use the PRIVATE key and run OFF-BOX on
+    /// your Mac; the actor box holds only the public key and merely verifies.
+    Grant {
+        #[command(subcommand)]
+        action: GrantAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -177,6 +192,51 @@ enum WatchAction {
     Status,
     /// Run one disk-pressure check (called by launchd; you can also run it by hand)
     Run,
+}
+
+#[derive(Subcommand)]
+enum GrantAction {
+    /// Generate an ed25519 keypair. Private key → --out (mode 0600, keep OFF the
+    /// actor box); public key → ~/.diskspace/grant.pub (or --pub-out).
+    Keygen {
+        /// Where to write the PRIVATE key (hex, mode 0600). Keep this off-box.
+        #[arg(long)]
+        out: PathBuf,
+        /// Where to write the public key (default: ~/.diskspace/grant.pub)
+        #[arg(long)]
+        pub_out: Option<PathBuf>,
+    },
+    /// Mint + sign a grant with the private key (off-box). Writes the signed
+    /// grant to ~/.diskspace/grant.json (or --out).
+    Issue {
+        /// build-recovery | routine-cleanup | agent-autonomy
+        #[arg(long)]
+        category: String,
+        /// Cumulative byte budget, e.g. 20G, 500M, 1024
+        #[arg(long)]
+        max_bytes: String,
+        /// Highest recovery class to authorize: auto | redownload | rebuild |
+        /// recreate | manual | irreversible
+        #[arg(long)]
+        recovery_ceiling: String,
+        /// Confidence floor a candidate must meet (0.0–1.0)
+        #[arg(long)]
+        min_confidence: f32,
+        /// Optional glob the path must match (~ expands to $HOME)
+        #[arg(long)]
+        path_scope: Option<String>,
+        /// Validity window, e.g. 2h, 7d, 30m, 90s
+        #[arg(long)]
+        expires_in: String,
+        /// Path to the PRIVATE key (off-box)
+        #[arg(long)]
+        priv_key: PathBuf,
+        /// Where to write the signed grant (default: ~/.diskspace/grant.json)
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+    /// Show the active grant and whether its signature verifies.
+    Show,
 }
 
 #[derive(Subcommand)]
@@ -203,6 +263,55 @@ fn main() -> Result<()> {
         quiet: cli.quiet,
     };
 
+    // Resolve the capability grant ONCE, here, so every actuation site shares the
+    // same loaded+validated authority. Precedence for the grant FILE:
+    //   1. `--grant <path>` on the command line
+    //   2. `preferences.grant_path` in the profile
+    //   3. `~/.diskspace/grant.json` (grant::load's default)
+    // `grant::load` parses AND verifies the signature against the trusted public
+    // key; a present-but-INVALID grant is a hard error (fail-closed — a corrupt or
+    // tampered grant must never silently degrade to "no grant / human consent").
+    // A missing file yields `None` (the human-consent fallback). The actor only
+    // ever VERIFIES — minting requires the off-box private key it does not hold.
+    //
+    // Gated on the `actuation` feature: WITHOUT it, the grant is never loaded and
+    // every command keeps EXACTLY the existing human-consent behavior (a stray or
+    // even malformed grant.json on disk changes nothing). The `grant_ref` is still
+    // threaded into the call sites in both builds — the commands simply ignore it
+    // when the feature is off.
+    #[cfg(feature = "actuation")]
+    let grant: Option<core::grant::Grant> = {
+        let explicit = cli.grant.clone();
+        let from_profile = profile::load()
+            .ok()
+            .and_then(|p| p.preferences.grant_path.clone());
+        let chosen_path = explicit.or(from_profile);
+        let load_arg = chosen_path.as_deref().map(std::path::Path::new);
+        match core::grant::load(load_arg) {
+            Ok(g) => g,
+            Err(e) => {
+                if ctx.json {
+                    println!(
+                        "{}",
+                        serde_json::json!({ "error": "invalid_grant", "detail": e.to_string() })
+                    );
+                } else {
+                    eprintln!("\n  Grant present but INVALID: {}\n", e);
+                }
+                std::process::exit(2);
+            }
+        }
+    };
+    #[cfg(not(feature = "actuation"))]
+    let grant: Option<core::grant::Grant> = {
+        // `--grant` is accepted on the CLI in every build for a stable interface,
+        // but without the `actuation` feature it is inert. Bind it to silence the
+        // unused-field lint and make the no-op explicit.
+        let _ = &cli.grant;
+        None
+    };
+    let grant_ref = grant.as_ref();
+
     match cli.command {
         None => commands::welcome::run(&ctx),
         Some(Commands::Scan { path }) => commands::scan::run(path, &ctx),
@@ -212,7 +321,7 @@ fn main() -> Result<()> {
             target,
             immediate,
             unsafe_confidence,
-        }) => commands::airlock::run(&target, immediate, unsafe_confidence, &ctx),
+        }) => commands::airlock::run(&target, immediate, unsafe_confidence, grant_ref, &ctx),
         Some(Commands::Restore { target, all }) => {
             commands::restore::run(target.as_deref(), all, &ctx)
         }
@@ -223,14 +332,16 @@ fn main() -> Result<()> {
         Some(Commands::Reclaim {
             top,
             unsafe_confidence,
-        }) => commands::reclaim::run(top, unsafe_confidence, &ctx),
+        }) => commands::reclaim::run(top, unsafe_confidence, grant_ref, &ctx),
         Some(Commands::Hunt { top, min_size_mb }) => commands::hunt::run(top, min_size_mb, &ctx),
         Some(Commands::Receipt { last }) => commands::receipt::run(last, &ctx),
         Some(Commands::Explain { path }) => commands::explain::run(&path, &ctx),
-        Some(Commands::Doctor { need }) => commands::doctor::run(need, &ctx),
+        Some(Commands::Doctor { need }) => commands::doctor::run(need, grant_ref, &ctx),
         Some(Commands::Plan { need, mode }) => commands::plan::run(&need, &mode, &ctx),
-        Some(Commands::Apply { plan_hash }) => commands::apply::run(&plan_hash, &ctx),
-        Some(Commands::Guard { exec, need }) => commands::guard::run(&exec, need.as_deref(), &ctx),
+        Some(Commands::Apply { plan_hash }) => commands::apply::run(&plan_hash, grant_ref, &ctx),
+        Some(Commands::Guard { exec, need }) => {
+            commands::guard::run(&exec, need.as_deref(), grant_ref, &ctx)
+        }
         Some(Commands::Undo) => commands::undo::run(&ctx),
         Some(Commands::Watch { action }) => match action {
             WatchAction::Install => commands::watch::install(&ctx),
@@ -244,6 +355,32 @@ fn main() -> Result<()> {
             ProfileAction::Get => commands::profile_cmd::get(&ctx),
             ProfileAction::Set { assignment } => commands::profile_cmd::set(&assignment, &ctx),
             ProfileAction::Edit => commands::profile_cmd::edit(&ctx),
+        },
+        Some(Commands::Grant { action }) => match action {
+            GrantAction::Keygen { out, pub_out } => {
+                commands::grant_cmd::keygen(&out, pub_out.as_deref(), &ctx)
+            }
+            GrantAction::Issue {
+                category,
+                max_bytes,
+                recovery_ceiling,
+                min_confidence,
+                path_scope,
+                expires_in,
+                priv_key,
+                out,
+            } => commands::grant_cmd::issue(
+                &category,
+                &max_bytes,
+                &recovery_ceiling,
+                min_confidence,
+                path_scope.as_deref(),
+                &expires_in,
+                &priv_key,
+                out.as_deref(),
+                &ctx,
+            ),
+            GrantAction::Show => commands::grant_cmd::show(&ctx),
         },
     }
 }

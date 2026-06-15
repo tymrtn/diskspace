@@ -5,6 +5,7 @@ pub mod check;
 pub mod detect;
 pub mod doctor;
 pub mod explain;
+pub mod grant_cmd;
 pub mod guard;
 pub mod hunt;
 pub mod plan;

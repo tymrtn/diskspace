@@ -24,9 +24,32 @@ pkg-fmt = "bin"
 pkg-url = "{ repo }/releases/download/v{ version }/diskspace-universal"
 pkg-fmt = "bin"
 
+# Linux: `cargo binstall diskspace-cli` fetches the per-arch release binary built
+# by .github/workflows/linux-binaries.yml (assets `diskspace-linux-x86_64` /
+# `diskspace-linux-aarch64`). This is the OpenClaw (Linux) self-install path —
+# the agent grabs a prebuilt binary instead of compiling under disk pressure.
+# Asset names MUST stay in lockstep with the `asset:` matrix in linux-binaries.yml.
+[package.metadata.binstall.overrides.x86_64-unknown-linux-gnu]
+pkg-url = "{ repo }/releases/download/v{ version }/diskspace-linux-x86_64"
+pkg-fmt = "bin"
+
+[package.metadata.binstall.overrides.aarch64-unknown-linux-gnu]
+pkg-url = "{ repo }/releases/download/v{ version }/diskspace-linux-aarch64"
+pkg-fmt = "bin"
+
 [[bin]]
 name = "diskspace"
 path = "src/main.rs"
+
+[features]
+# Actuation ships OFF by default. With it OFF, behavior is the existing
+# human-consent flow; the grant module compiles either way (the off-box mint
+# tools and the verify path are always present — security comes from WHERE the
+# private key lives, never from a build flag). The `actuation` feature is the
+# gate for the *autonomous* consult path that lets a verified grant substitute
+# for typed-id consent / relax the confidence floor AFTER the hard pressure-test
+# has already returned safe==true.
+actuation = []
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
@@ -46,6 +69,8 @@ include_dir = "0.7"
 fs4 = "1.1.0"
 sha2 = "0.10"
 shell-words = "1"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+rand = "0.8"
 
 [profile.release]
 opt-level = 3

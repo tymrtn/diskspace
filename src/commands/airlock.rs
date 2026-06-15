@@ -5,6 +5,7 @@ use crate::commands::check;
 use crate::commands::detect::build_candidates_pub;
 use crate::commands::scan::scan_cache_path;
 use crate::core::airlock_store;
+use crate::core::grant::Grant;
 use crate::core::history::{self, ActionKind, Entry as HistEntry};
 use crate::core::scanner::ScanResult;
 use crate::output::{self, Context};
@@ -13,7 +14,20 @@ use std::path::Path;
 
 const IMMEDIATE_MIN_CONFIDENCE: f32 = 0.85;
 
-pub fn run(target: &str, immediate: bool, unsafe_confidence: bool, ctx: &Context) -> Result<()> {
+/// `grant` is threaded through but only consulted under the `actuation` feature,
+/// and ALWAYS strictly after `pressure_test` returns `safe == true`. Without the
+/// feature it is ignored and the existing human-consent flow is unchanged.
+pub fn run(
+    target: &str,
+    immediate: bool,
+    unsafe_confidence: bool,
+    grant: Option<&Grant>,
+    ctx: &Context,
+) -> Result<()> {
+    // Keep the parameter live for the non-actuation build without the
+    // unused-variable lint (the grant is intentionally ignored there).
+    #[cfg(not(feature = "actuation"))]
+    let _ = grant;
     let cache = scan_cache_path();
     if !cache.exists() {
         if ctx.json {
@@ -46,8 +60,21 @@ pub fn run(target: &str, immediate: bool, unsafe_confidence: bool, ctx: &Context
         }
     };
 
-    // --immediate requires high confidence, OR --unsafe-confidence + typed consent.
-    if immediate && candidate.confidence < IMMEDIATE_MIN_CONFIDENCE {
+    // Whether a present, valid grant will SUBSTITUTE for typed-id consent on a
+    // below-floor `--immediate`. Under the `actuation` feature, if a grant is
+    // present we DEFER the below-floor override decision to a grant consultation
+    // that happens strictly AFTER the pressure-test clears the candidate (the
+    // grant can never make an unsafe candidate actionable). Without the feature,
+    // or without a grant, this stays false and the human typed-consent path runs
+    // exactly as before.
+    #[cfg(feature = "actuation")]
+    let grant_may_satisfy_floor = grant.is_some();
+    #[cfg(not(feature = "actuation"))]
+    let grant_may_satisfy_floor = false;
+
+    // --immediate requires high confidence, OR --unsafe-confidence + typed consent,
+    // OR (under actuation) a present grant that authorizes it after the gate.
+    if immediate && candidate.confidence < IMMEDIATE_MIN_CONFIDENCE && !grant_may_satisfy_floor {
         if !unsafe_confidence {
             if ctx.json {
                 eprintln!(
@@ -96,7 +123,8 @@ pub fn run(target: &str, immediate: bool, unsafe_confidence: bool, ctx: &Context
         }
     }
 
-    // Always pressure-test before acting
+    // Always pressure-test before acting. THIS is the HARD gate; all grant logic
+    // below runs strictly after it returns safe == true.
     let check_result = check::pressure_test(&candidate.id, &candidate.path, &prof)?;
     if !check_result.safe {
         if ctx.json {
@@ -111,6 +139,49 @@ pub fn run(target: &str, immediate: bool, unsafe_confidence: bool, ctx: &Context
             eprintln!("  Airlock aborted — candidate did not pass pressure test.\n");
         }
         std::process::exit(2);
+    }
+
+    // Grant consultation — AFTER the hard gate. Only relevant under actuation when
+    // a grant is present AND this is a below-floor `--immediate` that the grant is
+    // standing in for typed consent on. `allows()` is the pure in-bound check; on
+    // Deny we SKIP (act on nothing) and exit non-zero, recording the denial in the
+    // JSON output and an audit line. On Allow we proceed; an above-floor candidate
+    // or a non-immediate airlock never needs the grant and is unaffected.
+    #[cfg(feature = "actuation")]
+    {
+        use crate::core::grant::{self, GrantDecision};
+        if let Some(g) = grant {
+            if immediate && candidate.confidence < IMMEDIATE_MIN_CONFIDENCE {
+                let decision = grant::allows(
+                    g,
+                    candidate.consequences.as_ref(),
+                    candidate.confidence,
+                    candidate.size_bytes,
+                    &candidate.path,
+                    0,
+                );
+                grant::audit(
+                    g,
+                    "airlock",
+                    &candidate.path,
+                    candidate.size_bytes,
+                    &decision,
+                );
+                if let GrantDecision::Deny(reason) = decision {
+                    if ctx.json {
+                        let out = serde_json::json!({
+                            "error": "grant_denied",
+                            "candidate_id": target,
+                            "reason": reason,
+                        });
+                        eprintln!("{}", serde_json::to_string_pretty(&out)?);
+                    } else {
+                        eprintln!("\n  Grant denied: {}\n", reason);
+                    }
+                    std::process::exit(3);
+                }
+            }
+        }
     }
 
     let size_str = output::format_bytes(candidate.size_bytes);

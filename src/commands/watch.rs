@@ -466,7 +466,18 @@ fn notify(level: Level, free_bytes: u64, pct_free: f32) {
         ),
     };
 
-    // macOS user notification via osascript. Keep quiet on failure — best-effort.
+    deliver_notification(&title, &body);
+}
+
+/// Deliver a desktop notification. macOS uses `osascript display notification`.
+/// On every other OS (Linux is the portable target) this is a graceful no-op:
+/// the watch tick still runs, records its measurement, and prints/JSON-emits its
+/// result — only the macOS-only GUI ping is skipped. `osascript` does not exist
+/// on Linux, so shelling out to it there would just be a silent failure anyway;
+/// we cfg it out so no macOS-only assumption leaks into the Linux build.
+#[cfg(target_os = "macos")]
+fn deliver_notification(title: &str, body: &str) {
+    // Keep quiet on failure — best-effort.
     let escaped_title = title.replace('"', "'");
     let escaped_body = body.replace('"', "'");
     let script = format!(
@@ -475,6 +486,11 @@ fn notify(level: Level, free_bytes: u64, pct_free: f32) {
     );
     let _ = Command::new("osascript").arg("-e").arg(script).output();
 }
+
+/// Non-macOS graceful no-op (see the macOS variant above). The watch run
+/// recorder is the portable core and is NOT cfg-gated; only this GUI ping is.
+#[cfg(not(target_os = "macos"))]
+fn deliver_notification(_title: &str, _body: &str) {}
 
 fn launch_agent_plist_path() -> Result<PathBuf> {
     let home = home_dir()?;
@@ -542,25 +558,14 @@ fn home_dir() -> Result<PathBuf> {
         .context("HOME not set")
 }
 
-/// Reads `df -k <path>` and returns (free_bytes, total_bytes).
+/// Reads `df -kP <path>` and returns (free_bytes, total_bytes).
+///
+/// Delegates to the single consolidated POSIX parser in
+/// [`crate::core::fsutil`], shared with `history` / `reclaim`, so the watch tick
+/// reads disk free identically on macOS and Linux (POSIX `-P` keeps the columns
+/// stable even when GNU `df` would otherwise line-wrap a long device name).
 fn df_free_and_total(path: &Path) -> Result<(u64, u64)> {
-    let output = Command::new("df").arg("-k").arg(path).output()?;
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let line = stdout
-        .lines()
-        .nth(1)
-        .ok_or_else(|| anyhow::anyhow!("df returned no data row"))?;
-    let fields: Vec<&str> = line.split_whitespace().collect();
-    // macOS df -k: Filesystem  1024-blocks  Used  Available  Capacity  ...
-    let total_kb: u64 = fields
-        .get(1)
-        .ok_or_else(|| anyhow::anyhow!("df: missing total"))?
-        .parse()?;
-    let avail_kb: u64 = fields
-        .get(3)
-        .ok_or_else(|| anyhow::anyhow!("df: missing avail"))?
-        .parse()?;
-    Ok((avail_kb * 1024, total_kb * 1024))
+    crate::core::fsutil::df_free_and_total(path)
 }
 
 #[cfg(test)]

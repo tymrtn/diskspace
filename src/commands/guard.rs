@@ -39,6 +39,7 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 
 use crate::commands::doctor::{self, Mode};
+use crate::core::grant::Grant;
 use crate::core::history;
 use crate::output::Context;
 use crate::profile;
@@ -123,7 +124,7 @@ fn stderr_signals_enospc(stderr: &str) -> bool {
         || lower.contains("enospc")
 }
 
-pub fn run(exec: &str, need: Option<&str>, ctx: &Context) -> Result<()> {
+pub fn run(exec: &str, need: Option<&str>, grant: Option<&Grant>, ctx: &Context) -> Result<()> {
     // Tokenize the command via shell_words into an argv vector. This is the ONLY
     // place the string is parsed; from here on we deal in discrete tokens and
     // never re-serialize back into a shell.
@@ -162,7 +163,7 @@ pub fn run(exec: &str, need: Option<&str>, ctx: &Context) -> Result<()> {
     // A recovery error (e.g. profile::load failing mid-recovery) must ALSO emit a
     // trace rather than bubble silently — the ENOSPC was real and detected, so the
     // trace records enospc_detected:true with the error and the original first_exit.
-    let freed = match free_space(need, ctx) {
+    let freed = match free_space(need, grant, ctx) {
         Ok(f) => f,
         Err(e) => emit_error_trace_and_exit(ctx, exec, first_exit, true, 0, None, false, &e),
     };
@@ -222,7 +223,22 @@ fn emit_error_trace_and_exit(
 /// actually freed (the df delta), so a no-op recovery yields 0 and suppresses the
 /// re-exec. Mode is chosen exactly as doctor does (immediate under pressure,
 /// airlock above it).
-fn free_space(need: Option<&str>, ctx: &Context) -> Result<u64> {
+fn free_space(need: Option<&str>, grant: Option<&Grant>, ctx: &Context) -> Result<u64> {
+    // AGENT-PATH GRANT GATE (actuation only). `guard` is the no-human-in-the-loop
+    // autonomous primitive (it is ALWAYS effectively non-interactive), so unlike
+    // doctor/apply — which gate on `ctx.json || ctx.yes` — guard must demand a
+    // grant unconditionally before any mutation. Without one we refuse here, BEFORE
+    // build_plan/execute_plan run, so no pressure-test survivor (and no below-floor
+    // item build_plan kept) can be deleted/airlocked with no signed authority. The
+    // Err is routed by `run` through `emit_error_trace_and_exit`, which preserves
+    // `first_exit` and emits a trace carrying `error:"no_grant"` with a non-zero
+    // exit — matching the doctor/apply no_grant contract. WITHOUT the actuation
+    // feature this gate does not exist and `grant` is inert (the existing flow).
+    #[cfg(feature = "actuation")]
+    if grant.is_none() {
+        return Err(anyhow!("no_grant"));
+    }
+
     let prof = profile::load()?;
     let home = std::env::var("HOME").unwrap_or_else(|_| "/".into());
     let home_path = Path::new(&home);
@@ -250,7 +266,9 @@ fn free_space(need: Option<&str>, ctx: &Context) -> Result<u64> {
     if plan.steps.is_empty() {
         return Ok(0);
     }
-    let outcome = doctor::execute_plan(&plan, &prof, ctx, df_before, need_bytes, home_path)?;
+    // `grant` is threaded through to the shared executor; under actuation it bounds
+    // which steps act (see doctor::execute_plan). Without the feature it is ignored.
+    let outcome = doctor::execute_plan(&plan, &prof, grant, ctx, df_before, need_bytes, home_path)?;
     Ok(outcome.actually_freed)
 }
 
@@ -556,6 +574,7 @@ mod tests {
         let outcome = doctor::execute_plan(
             &plan,
             &prof,
+            None,
             &quiet_ctx(),
             df_before,
             df_before + need,

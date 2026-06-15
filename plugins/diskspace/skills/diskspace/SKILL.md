@@ -13,7 +13,7 @@ The trust model — internalize it before acting:
 - **The pressure-test is the boundary, not the confidence score.** If it fails (exit `2`), STOP. Never override it.
 - **Metrics never override safety.** They inform *which* candidate and *whether to ask a human*. They never widen the gate, reorder by themselves, or flip `safe`. They are best-effort and may be `null` until history accumulates — do NOT treat them as authoritative.
 - **Airlock is the default.** Reversible holding area first; `restore`/`undo` always work. Permanent deletion is a separate, deliberate step.
-- **No autonomous deletion.** `guard`/`plan`/`apply` all route through the SAME human-consent / pressure-test path. There is no agent grant token.
+- **Autonomous deletion needs a signed grant.** `guard`/`plan`/`apply` all route through the SAME pressure-test gate (the hard boundary). In the default (non-`actuation`) build there is no autonomous deletion: they fall back to the human-consent path. In an `actuation` build, a non-interactive (`--json`/`--yes`) `doctor`/`apply` — and `guard` always, since it is inherently headless — REFUSES with `{"error":"no_grant"}` (exit `4`) unless a valid, signed grant token is present. A grant can only ever SHRINK what acts; it can never make an unsafe candidate actionable and never overrides `never_touch`.
 
 ```
 ┌─ AGENT CONSTRAINTS (non-negotiable) ─────────────────────────────────┐
@@ -21,8 +21,9 @@ The trust model — internalize it before acting:
 │ • The pressure-test is the boundary. Exit 2 = STOP. Never override.  │
 │ • There is NO --force. Drift / unsafe = hard refusal, by design.     │
 │ • Metrics are advisory. They never override the safety gate.         │
-│ • NO autonomous deletion. guard/plan/apply use the existing consent  │
-│   path. (Grant-token autonomy is a future feature — NOT available.)  │
+│ • Autonomous deletion needs a SIGNED grant (actuation builds). With  │
+│   none, guard / non-interactive doctor & apply refuse (exit 4). A    │
+│   grant only SHRINKS what acts — never overrides the gate/never_touch.│
 └──────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -103,7 +104,9 @@ Three agent primitives. **All three route through the SAME pressure-test gate. T
 diskspace guard --exec "cargo build --release" --need 10G   # --need optional, default 5G
 ```
 
-Runs the command **via ARGV** (tokenized with shell-words — NEVER `sh -c`, so no shell-injection surface). If it fails with ENOSPC (exit 28, or "No space left on device" / "errno 28" / "enospc" on stderr), `guard` frees space through the existing `doctor` recovery path (same pressure-test, same consent) and re-runs the command **exactly once**. No retry loop. It emits one JSON trace on stdout always: `{cmd, first_exit, enospc_detected, freed_bytes, second_exit, success, re_execed}`. If nothing could be freed, it does NOT re-run — it reports the original failure honestly.
+Runs the command **via ARGV** (tokenized with shell-words — NEVER `sh -c`, so no shell-injection surface). If it fails with ENOSPC (exit 28, or "No space left on device" / "errno 28" / "enospc" on stderr), `guard` frees space through the existing `doctor` recovery path (same pressure-test) and re-runs the command **exactly once**. No retry loop. It emits one JSON trace on stdout always: `{cmd, first_exit, enospc_detected, freed_bytes, second_exit, success, re_execed}` (plus an additive `error` field on a refusal). If nothing could be freed, it does NOT re-run — it reports the original failure honestly.
+
+In an **`actuation` build**, `guard` is inherently headless, so it **requires a signed grant** before freeing anything: with no valid grant on disk (and no `--grant`), the recovery refuses and the trace carries `"error":"no_grant"` (non-zero exit) — nothing is deleted or airlocked. In the default build, `guard` has no grant gate and follows the existing path.
 
 ### `plan` → hash, then `apply <hash>` — TOCTOU-safe two-phase recovery
 
@@ -115,6 +118,27 @@ diskspace apply <hash> --json           # RE-VALIDATES live, then acts
 
 - `plan` does selection only and **never touches the filesystem** — no airlock, no delete. It content-addresses the *intended actions* `(candidate_id, path, size_bytes, mode)` into `plan_hash` and persists the plan under `~/.diskspace/plans/`.
 - `apply` is **TOCTOU-safe**: before acting it (1) recomputes the hash and refuses on mismatch (tampered/stale plan), (2) re-stats every target and refuses if it vanished or drifted >10% in size, and (3) **RE-RUNS the live pressure-test** — it NEVER trusts the `safe` captured at plan time. Any single drift refuses the WHOLE apply (all-or-nothing). A now-unsafe gate exits `2`; other refusals exit `1`. Only after every step clears does it execute via the same airlock/immediate path with history receipts.
+
+## grant — signed capability tokens (autonomous actuation)
+
+`diskspace grant …` exists in **every** build (it is not feature-gated). It mints and inspects the ed25519-signed grant token that authorizes autonomous deletion in an `actuation` build. The threat model is "cooperating-agent capability": the grant does not defend against a malicious local process (which could `rm -rf` without diskspace), it (1) stops a cooperating agent from minting itself broader authority — the PRIVATE key lives OFF-BOX with the user; the actor box holds only the public key and merely VERIFIES — and (2) bounds an honest-but-buggy agent to a category / recovery-class ceiling / `max_bytes` / `min_confidence` floor / `path_scope` / expiry, with a tamper-evident audit trail.
+
+```bash
+# OFF-BOX (on the user's Mac, where the private key lives):
+diskspace grant keygen --out ~/secret/grant.key          # writes private key (0600) + ~/.diskspace/grant.pub
+diskspace grant issue \
+  --category build-recovery --recovery-ceiling rebuild \
+  --max-bytes 20G --min-confidence 0.85 \
+  --path-scope '~/Library/Caches/**' --expires-in 2h \
+  --priv-key ~/secret/grant.key                          # writes signed ~/.diskspace/grant.json
+
+# ON THE ACTOR BOX (verifies only — never has the private key):
+diskspace grant show --json                              # {present, valid, grant} or {present:false}
+```
+
+- `--min-confidence` MUST be finite and in `0.0..=1.0`; a NaN/out-of-range floor is rejected at issue time (a NaN floor would otherwise silently void the floor).
+- The grant is consulted **only after** the pressure-test passes. It can relax the confidence floor / substitute for typed-id consent, but it can **never** make an unsafe candidate actionable and **never** overrides `never_touch`. A denied step is skipped, not forced.
+- A present-but-invalid grant is a HARD error (`{"error":"invalid_grant"}`, exit `2`) — it never silently degrades to "no grant / human consent".
 
 ## Emergency one-shot
 
@@ -144,8 +168,9 @@ Note: `check` and `apply` take ids/hashes; `explain` takes a **path**. `airlock 
 |------|---------|-----------|
 | `0` | success | proceed; report `actually_freed` from JSON |
 | `1` | no candidates / plan refused (stale, missing, size drift, parse) | nothing safe here, or the plan no longer matches disk — re-`plan`; consider `hunt` |
-| `2` | **pressure-test failed (the boundary)** | **STOP.** Path is live/in-use/protected, or `apply` found it now-unsafe. Do NOT force. Pick another candidate or surface to the human. |
-| `3` | profile policy blocked | path is in `never_touch` / an active domain — respect it; do not override |
+| `2` | **pressure-test failed (the boundary)**, OR a present-but-invalid grant (`{"error":"invalid_grant"}`) | **STOP.** Path is live/in-use/protected, or `apply` found it now-unsafe, or the grant signature/expiry/schema failed. Do NOT force. Re-issue a valid grant or pick another candidate. |
+| `3` | profile policy blocked, OR grant denied this item (`{"error":"grant_denied"}` on `airlock`/`reclaim`) | path is in `never_touch` / an active domain, or it fell outside the grant's ceiling/floor/budget/scope — respect it; do not override |
+| `4` | **no grant** under `actuation` (`{"error":"no_grant"}`) | a non-interactive `doctor`/`apply` or any `guard` needs a signed grant — issue one with `diskspace grant issue …`, or run interactively for human consent |
 | `127` | unknown error | inspect stderr; do not retry blindly |
 
 ## Safety rules — CRITICAL
@@ -177,5 +202,5 @@ diskspace watch uninstall
 - Don't hand-`rm -rf` caches/`node_modules`/`DerivedData` when `diskspace` is available — you lose the pressure-test, the consequence contract, and reversibility.
 - Don't bypass or retry past a pressure-test failure, and don't `--force` (it doesn't exist).
 - Don't trust `metrics` as authoritative — `metric_confidence < 0.5` means fall back to rule confidence.
-- Don't reference grant tokens or autonomous deletion — they are not shipped.
-- Don't assume a command exists beyond: `scan`, `detect`, `check`, `explain`, `airlock`, `restore`, `purge`, `reclaim`, `hunt`, `receipt`, `doctor`, `guard`, `plan`, `apply`, `undo`, `status`, `watch`, `profile`. Run `diskspace --help` if unsure.
+- Don't try to mint a grant on the actor box — `grant keygen`/`issue` need the PRIVATE key, which lives OFF-BOX with the user. The actor only ever VERIFIES (`grant show`). A grant never overrides the pressure-test or `never_touch`; it only narrows what may act.
+- Don't assume a command exists beyond: `scan`, `detect`, `check`, `explain`, `airlock`, `restore`, `purge`, `reclaim`, `hunt`, `receipt`, `doctor`, `guard`, `plan`, `apply`, `grant`, `undo`, `status`, `watch`, `profile`. Run `diskspace --help` if unsure.

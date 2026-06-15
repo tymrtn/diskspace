@@ -48,6 +48,13 @@ pub struct Preferences {
     /// (reversible) to immediate-delete (irreversible) so bytes free up now.
     #[serde(default = "default_pressure_threshold_gb")]
     pub disk_pressure_threshold_gb: f32,
+    /// Default path to the signed capability grant (`grant.json`) the actor reads
+    /// when no `--grant <path>` is passed on the command line. `None` falls back to
+    /// `grant::grant_path()` (`~/.diskspace/grant.json`). Lets a user pin a grant
+    /// location in the profile without re-passing the flag on every invocation.
+    /// Additive + serde-default so legacy profiles still parse.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grant_path: Option<String>,
 }
 
 fn default_pressure_threshold_gb() -> f32 {
@@ -61,6 +68,7 @@ impl Default for Preferences {
             min_candidate_size_gb: 0.1,
             confirm_before_airlock: true,
             disk_pressure_threshold_gb: 5.0,
+            grant_path: None,
         }
     }
 }

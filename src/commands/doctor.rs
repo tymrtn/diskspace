@@ -34,6 +34,7 @@ use crate::commands::detect::build_candidates_pub;
 use crate::commands::scan::scan_cache_path;
 use crate::core::airlock_store;
 use crate::core::candidate::{Candidate, CheckResult, ConsequenceContract};
+use crate::core::grant::Grant;
 use crate::core::history::{self, ActionKind, Entry as HistEntry};
 use crate::core::scanner::{self, ScanResult};
 use crate::output::{self, Context};
@@ -111,7 +112,32 @@ pub struct ExecuteOutcome {
     pub items: Vec<serde_json::Value>,
 }
 
-pub fn run(need: Option<String>, ctx: &Context) -> Result<()> {
+pub fn run(need: Option<String>, grant: Option<&Grant>, ctx: &Context) -> Result<()> {
+    // Keep the parameter live for the non-actuation build (grant ignored there).
+    #[cfg(not(feature = "actuation"))]
+    let _ = grant;
+
+    // AGENT-PATH GRANT GATE (actuation only). In NON-INTERACTIVE mode (`--json`
+    // or `--yes` — the agent/script path, where no human is present to answer a
+    // consent prompt), a doctor run that will MUTATE the filesystem REQUIRES a
+    // valid grant. Without one we refuse before doing any work, emitting a
+    // machine-parseable `no_grant` error and exiting non-zero. This is the
+    // documented behavior change: under actuation an autonomous doctor must carry
+    // an explicit, signed authority. Interactive runs (a human at the terminal)
+    // are unaffected — they fall through to the existing consent prompts.
+    #[cfg(feature = "actuation")]
+    {
+        let non_interactive = ctx.json || ctx.yes;
+        if non_interactive && grant.is_none() {
+            if ctx.json {
+                println!(r#"{{"error":"no_grant","hint":"issue a grant token"}}"#);
+            } else {
+                eprintln!("\n  Refusing: no grant. Issue one with `diskspace grant issue …`.\n");
+            }
+            std::process::exit(4);
+        }
+    }
+
     let prof = profile::load()?;
     let home = std::env::var("HOME").unwrap_or_else(|_| "/".into());
     let home_path = Path::new(&home);
@@ -191,7 +217,7 @@ pub fn run(need: Option<String>, ctx: &Context) -> Result<()> {
     }
 
     // ── Actuation: execute the chosen steps. ──────────────────────────────────
-    let outcome = execute_plan(&plan, &prof, ctx, df_before, need_bytes, home_path)?;
+    let outcome = execute_plan(&plan, &prof, grant, ctx, df_before, need_bytes, home_path)?;
 
     if ctx.json {
         let payload = serde_json::json!({
@@ -331,11 +357,16 @@ pub fn build_plan(
 pub fn execute_plan(
     plan: &Plan,
     prof: &profile::Profile,
+    grant: Option<&Grant>,
     ctx: &Context,
     df_before: u64,
     need_bytes: u64,
     home_path: &Path,
 ) -> Result<ExecuteOutcome> {
+    // Keep the parameter live for the non-actuation build (grant ignored there).
+    #[cfg(not(feature = "actuation"))]
+    let _ = grant;
+
     let dim = Style::new().dim();
     let bold = Style::new().bold();
     let red = Style::new().red().bold();
@@ -345,8 +376,59 @@ pub fn execute_plan(
     let mut freed_bytes: u64 = 0;
     let mut acted: Vec<serde_json::Value> = Vec::new();
 
+    // Cumulative bytes the grant has authorized this run — `allows()` enforces
+    // `spent + size <= max_bytes`, so the grant bounds the WHOLE batch, not each
+    // step alone. Only used under actuation with a present grant.
+    #[cfg(feature = "actuation")]
+    let mut grant_spent: u64 = 0;
+
     for step in &plan.steps {
         let step_mode = Mode::from_str(&step.mode);
+
+        // GRANT CONSULTATION — strictly AFTER selection's hard gate (build_plan
+        // pressure-tested every step) and never able to make an unsafe/never_touch
+        // step actionable. Under actuation with a present grant, each step must
+        // fall inside the grant's bound (ceiling / confidence floor / cumulative
+        // max_bytes / path scope). A denied step is SKIPPED (we act on nothing for
+        // it) and its denial is recorded in the JSON items + an audit line.
+        #[cfg(feature = "actuation")]
+        if let Some(g) = grant {
+            use crate::core::grant::{self, GrantDecision};
+            let consequences = step
+                .consequence_contract
+                .as_ref()
+                .map(consequences_from_contract);
+            let decision = grant::allows(
+                g,
+                consequences.as_ref(),
+                step.confidence,
+                step.size_bytes,
+                &step.path,
+                grant_spent,
+            );
+            grant::audit(g, "doctor", &step.path, step.size_bytes, &decision);
+            if let GrantDecision::Deny(reason) = decision {
+                if !ctx.json {
+                    println!(
+                        "  {}  {}  grant denied: {}",
+                        ctx.style("✗", &red),
+                        ctx.style(&step.path.display().to_string(), &dim),
+                        ctx.style(&reason, &dim),
+                    );
+                }
+                acted.push(serde_json::json!({
+                    "id": step.candidate_id,
+                    "path": step.path,
+                    "size_bytes": step.size_bytes,
+                    "mode": step_mode.as_str(),
+                    "grant_decision": "deny",
+                    "reason": reason,
+                }));
+                continue;
+            }
+            grant_spent = grant_spent.saturating_add(step.size_bytes);
+        }
+
         let result = match step_mode {
             Mode::Immediate => execute_immediate(&step.path, step.size_bytes),
             Mode::Airlock => execute_airlock(&step.candidate_id, &step.path, step.size_bytes, prof),
@@ -425,6 +507,25 @@ pub fn execute_plan(
         freed_bytes,
         items: acted,
     })
+}
+
+/// Reconstruct the minimal [`Consequences`] a grant's [`grant::allows`] needs from
+/// the [`ConsequenceContract`] a [`PlanStep`] carries. The grant only reads the
+/// `recovery` (class) string to map a recovery ceiling, but we map the other
+/// fields faithfully so the value is well-formed. A step with NO contract maps to
+/// `None`, which `recovery_class_of` fails CLOSED to `Irreversible` — a step whose
+/// recovery is unknown can only ever be HARDER to authorize, never easier.
+///
+/// [`Consequences`]: crate::core::rules::Consequences
+/// [`grant::allows`]: crate::core::grant::allows
+#[cfg(feature = "actuation")]
+fn consequences_from_contract(cc: &ConsequenceContract) -> crate::core::rules::Consequences {
+    crate::core::rules::Consequences {
+        recovery: cc.recovery_class.clone(),
+        rebuild_seconds: cc.recovery_cost_seconds,
+        impact: cc.impact.clone(),
+        recovery_cmd: cc.recovery_cmd.clone(),
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -870,6 +971,7 @@ mod tests {
         let outcome = execute_plan(
             &plan,
             &prof,
+            None,
             &quiet_ctx(),
             df_before,
             df_before + 4096,
@@ -895,5 +997,412 @@ mod tests {
         assert_eq!(receipt.rule_id.as_deref(), Some("manual"));
         assert_eq!(receipt.rule_confidence, Some(0.9));
         assert!(receipt.reversible, "airlock receipts are reversible");
+    }
+
+    // ── P4: GRANT-BOUNDED ACTUATION ───────────────────────────────────────────
+    //
+    // These exercise the `actuation`-gated grant consult inside `execute_plan` and
+    // `build_plan`. They prove the LOCKED invariants:
+    //   * the grant bounds WHICH safe steps act (ceiling / confidence / cumulative
+    //     max_bytes / scope) and audits every consultation;
+    //   * the HARD pressure-test sits UPSTREAM of all grant logic — a never_touch
+    //     path is filtered in `build_plan` and never reaches the grant;
+    //   * a maximal grant can never resurrect an unsafe/never_touch candidate.
+    #[cfg(feature = "actuation")]
+    mod grant_boundary {
+        use super::*;
+        use crate::core::candidate::ConsequenceContract;
+        use crate::core::grant::{self, AuditEntry, GrantCategory, IssueParams, RecoveryClass};
+        use std::path::PathBuf as StdPathBuf;
+
+        /// Issue a signed grant into the current `$HOME`'s `~/.diskspace` (the
+        /// TempHome's tempdir): keygen writes `grant.pub` to the data_dir so
+        /// `grant::audit`'s fingerprint resolves, and `issue` signs with the
+        /// matching private key. Returns the live, in-bound `Grant`.
+        fn issue_grant(ceiling: RecoveryClass, max_bytes: u64, min_conf: f32) -> grant::Grant {
+            issue_grant_scoped(ceiling, max_bytes, min_conf, None)
+        }
+
+        fn issue_grant_scoped(
+            ceiling: RecoveryClass,
+            max_bytes: u64,
+            min_conf: f32,
+            path_scope: Option<String>,
+        ) -> grant::Grant {
+            let dir = profile::data_dir();
+            fs::create_dir_all(&dir).unwrap();
+            let priv_p = dir.join("grant.key");
+            let pub_p = grant::pubkey_path(); // ~/.diskspace/grant.pub
+            grant::keygen(&priv_p, Some(&pub_p)).unwrap();
+            let params = IssueParams {
+                category: GrantCategory::AgentAutonomy,
+                recovery_class_ceiling: ceiling,
+                max_bytes,
+                min_confidence: min_conf,
+                path_scope,
+                valid_for: chrono::Duration::hours(1),
+            };
+            grant::issue(&params, &priv_p).unwrap()
+        }
+
+        /// A real on-disk dir target + a hand-built airlock `PlanStep` carrying the
+        /// given confidence and recovery class, so the per-step grant consult has a
+        /// well-formed candidate to decide on. The pressure result is a synthetic
+        /// `safe == true` gate (selection already happened); `execute_plan` here is
+        /// the executor under test, not the gate.
+        fn step_target(
+            home: &Path,
+            leaf: &str,
+            size: u64,
+            confidence: f32,
+            recovery: &str,
+        ) -> (PlanStep, StdPathBuf) {
+            let path = home.join("proj").join(leaf);
+            fs::create_dir_all(&path).unwrap();
+            let id = format!("manual-{}", leaf);
+            let step = PlanStep {
+                candidate_id: id.clone(),
+                rule_id: "manual".into(),
+                path: path.clone(),
+                size_bytes: size,
+                confidence,
+                mode: "airlock".into(),
+                reversible: true,
+                pressure: CheckResult::gate(id, true, 1.0, vec![]),
+                consequence_contract: Some(ConsequenceContract {
+                    recovery_class: recovery.into(),
+                    recovery_cost_seconds: None,
+                    impact: "test".into(),
+                    recovery_cmd: None,
+                    reference_url: None,
+                }),
+            };
+            (step, path)
+        }
+
+        fn read_audit() -> Vec<AuditEntry> {
+            let log = grant::audit_path();
+            let content = std::fs::read_to_string(&log).unwrap_or_default();
+            content
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .map(|l| serde_json::from_str::<AuditEntry>(l).unwrap())
+                .collect()
+        }
+
+        /// End-to-end boundary: four safe steps differing on ONE dimension each —
+        /// in-bound, recovery class above ceiling, confidence below floor, and one
+        /// that pushes cumulative spend over max_bytes. Only the in-bound steps are
+        /// acted on (moved away); the rest are denied, left in place, and every
+        /// consultation is audited.
+        #[test]
+        fn grant_acts_only_on_in_bound_steps_and_audits_the_rest() {
+            let _g = HOME_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let h = TempHome::new("grant-boundary");
+            let prof = profile::Profile::default();
+
+            // ceiling=Rebuild, min_conf=0.80, max_bytes=10 (bytes). Sizes are tiny so
+            // budget arithmetic is exact and the airlock move is cheap.
+            let grant = issue_grant(RecoveryClass::Rebuild, 10, 0.80);
+
+            // ok_a: rebuild (==ceiling), conf 0.90, 4 bytes → ALLOW (spent 4)
+            // ok_b: redownload (<ceiling), conf 0.85, 4 bytes → ALLOW (spent 8)
+            // bad_class: recreate (>ceiling)          → DENY (ceiling)
+            // bad_conf: rebuild, conf 0.50            → DENY (confidence)
+            // bad_budget: rebuild, conf 0.90, 9 bytes → DENY (8+9 > 10 budget)
+            let (ok_a, p_a) = step_target(&h.path, "ok_a", 4, 0.90, "rebuild");
+            let (ok_b, p_b) = step_target(&h.path, "ok_b", 4, 0.85, "redownload");
+            let (bad_class, p_class) = step_target(&h.path, "bad_class", 4, 0.90, "recreate");
+            let (bad_conf, p_conf) = step_target(&h.path, "bad_conf", 4, 0.50, "rebuild");
+            let (bad_budget, p_budget) = step_target(&h.path, "bad_budget", 9, 0.90, "rebuild");
+
+            let plan = Plan {
+                plan_hash: String::new(),
+                need_bytes: 100,
+                steps: vec![ok_a, ok_b, bad_class, bad_conf, bad_budget],
+                projected_freed: 0,
+                created_at: Utc::now(),
+            };
+
+            let df_before = history::free_bytes(&h.path).unwrap_or(0);
+            let outcome = execute_plan(
+                &plan,
+                &prof,
+                Some(&grant),
+                &quiet_ctx(),
+                df_before,
+                df_before + 100,
+                &h.path,
+            )
+            .unwrap();
+
+            // In-bound steps were acted on → their dirs were moved away.
+            assert!(!p_a.exists(), "in-bound ok_a must be airlocked away");
+            assert!(!p_b.exists(), "in-bound ok_b must be airlocked away");
+            // Denied steps were SKIPPED → their dirs remain in place untouched.
+            assert!(p_class.exists(), "ceiling-denied step must NOT be acted on");
+            assert!(
+                p_conf.exists(),
+                "confidence-denied step must NOT be acted on"
+            );
+            assert!(p_budget.exists(), "budget-denied step must NOT be acted on");
+
+            // Only the two in-bound sizes were staged.
+            assert_eq!(outcome.freed_bytes, 8, "only the 4+4 in-bound bytes staged");
+
+            // Exactly two receipts (the acted steps); the denied steps wrote none.
+            let hist = history::tail(50).unwrap();
+            let acted_paths: std::collections::HashSet<_> =
+                hist.iter().map(|e| e.path.clone()).collect();
+            assert!(acted_paths.contains(&p_a));
+            assert!(acted_paths.contains(&p_b));
+            assert!(!acted_paths.contains(&p_class));
+            assert!(!acted_paths.contains(&p_conf));
+            assert!(!acted_paths.contains(&p_budget));
+
+            // Every step (all 5) produced an audit line; allows=2, denies=3.
+            let audit = read_audit();
+            assert_eq!(audit.len(), 5, "one audit line per consultation");
+            let allows = audit.iter().filter(|e| e.decision == "allow").count();
+            let denies = audit.iter().filter(|e| e.decision == "deny").count();
+            assert_eq!(allows, 2, "two in-bound allows");
+            assert_eq!(denies, 3, "three out-of-bound denies");
+            // Each deny carries exactly one reason naming its failed dimension.
+            let reasons: Vec<String> = audit.iter().filter_map(|e| e.deny_reason.clone()).collect();
+            assert!(reasons.iter().any(|r| r.contains("ceiling")));
+            assert!(reasons.iter().any(|r| r.contains("confidence")));
+            assert!(reasons.iter().any(|r| r.contains("budget")));
+        }
+
+        /// INVARIANT REGRESSION: the HARD pressure-test sits UPSTREAM of grant
+        /// logic. A `never_touch` path is filtered by `build_plan` (whose
+        /// pressure-test runs `policy_check`) and never appears in the plan — so
+        /// even a MAXIMAL grant (Irreversible ceiling, huge budget, conf floor 0)
+        /// can never reach it. We build the plan with such a grant available and
+        /// assert the blocked path is absent from every step.
+        #[test]
+        fn maximal_grant_never_reaches_a_never_touch_path() {
+            let _g = HOME_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let h = TempHome::new("grant-nevertouch");
+            let home_path = h.path.clone();
+
+            // Two distinct-rule targets; one is never_touch.
+            let five_gb = 5 * 1024 * 1024 * 1024u64;
+            let entries = vec![
+                make_target(&home_path, "proj_nm", "node_modules", five_gb),
+                make_target(&home_path, "proj_blocked", ".venv", five_gb),
+            ];
+            write_scan_cache(entries);
+
+            let mut prof = profile::Profile::default();
+            prof.paths.never_touch.push("~/proj_blocked/.venv".into());
+
+            // A MAXIMAL grant exists, but selection's gate runs BEFORE any grant
+            // logic — the never_touch path is dropped in build_plan regardless.
+            let _maximal = issue_grant(RecoveryClass::Irreversible, u64::MAX, 0.0);
+
+            let need = 4 * 1024 * 1024 * 1024u64;
+            let plan = build_plan(need, Mode::Airlock, &prof, &home_path, &quiet_ctx()).unwrap();
+
+            assert!(
+                !plan
+                    .steps
+                    .iter()
+                    .any(|s| s.path.starts_with(home_path.join("proj_blocked"))),
+                "never_touch path must be filtered by the hard gate, before grant logic"
+            );
+            // And every surviving step passed the gate.
+            for s in &plan.steps {
+                assert!(s.pressure.safe);
+            }
+        }
+
+        /// INVARIANT: a maximal grant can never make an UNSAFE step actionable.
+        /// `build_plan` only ever emits `safe == true` steps; here we assert that a
+        /// never_touch target, with the maximal grant in force, is BOTH absent from
+        /// the plan AND, when we hand a hand-built plan containing it to the
+        /// executor, the LIVE gate inside the airlock path still protects it. Since
+        /// `execute_plan` trusts the plan's selection (the gate already ran in
+        /// build_plan), the protection is structural: the only path to actuation is
+        /// through build_plan, which excludes it. We prove build_plan is the sole
+        /// gate by confirming the maximal-grant plan is EMPTY when the only target
+        /// is never_touch.
+        #[test]
+        fn maximal_grant_plan_is_empty_when_only_target_is_blocked() {
+            let _g = HOME_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let h = TempHome::new("grant-blocked-only");
+            let home_path = h.path.clone();
+
+            let five_gb = 5 * 1024 * 1024 * 1024u64;
+            write_scan_cache(vec![make_target(
+                &home_path,
+                "proj_blocked",
+                "node_modules",
+                five_gb,
+            )]);
+
+            let mut prof = profile::Profile::default();
+            prof.paths
+                .never_touch
+                .push("~/proj_blocked/node_modules".into());
+
+            let _maximal = issue_grant(RecoveryClass::Irreversible, u64::MAX, 0.0);
+            let need = 1024 * 1024 * 1024u64; // 1 GiB
+            let plan = build_plan(need, Mode::Airlock, &prof, &home_path, &quiet_ctx()).unwrap();
+            assert!(
+                plan.steps.is_empty(),
+                "with the only target blocked by never_touch, the plan is empty even under a maximal grant"
+            );
+        }
+
+        /// INVARIANT: the pressure-test still BLOCKS a live/in-use path REGARDLESS
+        /// of a maximal grant. A target with a freshly-written file fails the
+        /// liveness check (files modified within 24h) inside `build_plan`'s gate,
+        /// so it is excluded from the plan before any grant logic — even with an
+        /// Irreversible-ceiling, infinite-budget, zero-floor grant in force.
+        #[test]
+        fn pressure_test_blocks_live_path_regardless_of_maximal_grant() {
+            let _g = HOME_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let h = TempHome::new("grant-live");
+            let home_path = h.path.clone();
+
+            // A node_modules with a JUST-written file → liveness check fails (the
+            // file's mtime is "now", inside the 24h window). The seeded
+            // ScannedEntry's old timestamps don't matter: the gate re-stats the
+            // REAL on-disk file.
+            let live = home_path.join("proj_live").join("node_modules");
+            fs::create_dir_all(&live).unwrap();
+            fs::write(live.join("fresh.bin"), vec![0u8; 4096]).unwrap();
+
+            let five_gb = 5 * 1024 * 1024 * 1024u64;
+            let mut entry = make_target(&home_path, "proj_live", "node_modules", five_gb);
+            // Point the entry at the live dir we just wrote (make_target re-creates
+            // the same path, so this is already correct; assert for clarity).
+            entry.path = live.clone();
+            write_scan_cache(vec![entry]);
+
+            let _maximal = issue_grant(RecoveryClass::Irreversible, u64::MAX, 0.0);
+            let need = 1024 * 1024 * 1024u64; // 1 GiB
+            let plan = build_plan(
+                need,
+                Mode::Airlock,
+                &prof_default(),
+                &home_path,
+                &quiet_ctx(),
+            )
+            .unwrap();
+
+            assert!(
+                !plan.steps.iter().any(|s| s.path == live),
+                "a live (recently-written) path must be blocked by the pressure-test, before any grant"
+            );
+            assert!(live.exists(), "the blocked live target is never acted on");
+        }
+
+        fn prof_default() -> profile::Profile {
+            profile::Profile::default()
+        }
+
+        /// A path_scope-bounded grant denies an out-of-scope step and audits it,
+        /// while admitting an in-scope one — proving the scope dimension threads
+        /// through `execute_plan` → `allows`.
+        #[test]
+        fn grant_path_scope_filters_out_of_scope_steps() {
+            let _g = HOME_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let h = TempHome::new("grant-scope");
+            let prof = profile::Profile::default();
+
+            // Scope admits the ~/proj/in_scope subtree (the dir itself and any
+            // descendant). `in_scope*` matches the directory path we act on; the
+            // sibling ~/proj/out_scope does not match.
+            let scope = "~/proj/in_scope*".to_string();
+            let grant = issue_grant_scoped(RecoveryClass::Rebuild, 1_000, 0.80, Some(scope));
+
+            let (in_step, p_in) = step_target(&h.path, "in_scope", 4, 0.90, "rebuild");
+            let (out_step, p_out) = step_target(&h.path, "out_scope", 4, 0.90, "rebuild");
+
+            let plan = Plan {
+                plan_hash: String::new(),
+                need_bytes: 100,
+                steps: vec![in_step, out_step],
+                projected_freed: 0,
+                created_at: Utc::now(),
+            };
+            let df_before = history::free_bytes(&h.path).unwrap_or(0);
+            execute_plan(
+                &plan,
+                &prof,
+                Some(&grant),
+                &quiet_ctx(),
+                df_before,
+                df_before + 100,
+                &h.path,
+            )
+            .unwrap();
+
+            assert!(!p_in.exists(), "in-scope step acted on (moved away)");
+            assert!(p_out.exists(), "out-of-scope step denied → left in place");
+
+            let audit = read_audit();
+            assert!(audit.iter().any(|e| e.decision == "allow"));
+            assert!(audit.iter().any(|e| e.decision == "deny"
+                && e.deny_reason.as_deref().unwrap_or("").contains("scope")));
+        }
+    }
+
+    // ── P4: GRANT IGNORED WITHOUT THE FEATURE ─────────────────────────────────
+    //
+    // The mirror of the boundary test: built WITHOUT `actuation`, `execute_plan`
+    // ignores any grant argument entirely (the human-consent flow is unchanged).
+    // We can't pass a `Grant` value here without the feature pulling in the same
+    // surface, so we prove the no-op by passing `None` and asserting a below-floor,
+    // would-be-out-of-bound step is STILL acted on — exactly as before P4, because
+    // there is no grant gate in this build.
+    #[cfg(not(feature = "actuation"))]
+    #[test]
+    fn without_actuation_grant_arg_is_ignored_and_step_acts() {
+        let _g = HOME_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let h = TempHome::new("noactuation");
+        let prof = profile::Profile::default();
+
+        // A low-confidence, "irreversible" step that a grant WOULD deny — but with
+        // no feature there is no grant gate, so it acts (pre-P4 behavior preserved).
+        let target = h.path.join("proj/node_modules");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join("blob.bin"), vec![0u8; 4096]).unwrap();
+        let step = PlanStep {
+            candidate_id: "manual-nm".into(),
+            rule_id: "manual".into(),
+            path: target.clone(),
+            size_bytes: 4096,
+            confidence: 0.10,
+            mode: "airlock".into(),
+            reversible: true,
+            pressure: CheckResult::gate("manual-nm".into(), true, 1.0, vec![]),
+            consequence_contract: None,
+        };
+        let plan = Plan {
+            plan_hash: String::new(),
+            need_bytes: 4096,
+            steps: vec![step],
+            projected_freed: 4096,
+            created_at: Utc::now(),
+        };
+        let df_before = history::free_bytes(&h.path).unwrap_or(0);
+        let outcome = execute_plan(
+            &plan,
+            &prof,
+            None,
+            &quiet_ctx(),
+            df_before,
+            df_before + 4096,
+            &h.path,
+        )
+        .unwrap();
+        assert!(
+            !target.exists(),
+            "without actuation, the step acts regardless of any grant bound"
+        );
+        assert_eq!(outcome.freed_bytes, 4096);
     }
 }

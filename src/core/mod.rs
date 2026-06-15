@@ -1,6 +1,8 @@
 pub mod airlock_store;
 pub mod bundle;
 pub mod candidate;
+pub mod fsutil;
+pub mod grant;
 pub mod history;
 pub mod metrics;
 pub mod rules;

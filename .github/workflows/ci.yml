@@ -17,6 +17,14 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - name: cargo test (default features — the SHIPPED config, actuation OFF)
+        # `actuation` ships OFF by default, so the exact build that
+        # `cargo install diskspace-cli` / `cargo binstall` produce for end users is
+        # this one. Test it explicitly so every `#[cfg(not(feature="actuation"))]`
+        # branch (main.rs, airlock.rs, reclaim.rs, doctor.rs, apply.rs — incl. the
+        # `without_actuation_grant_arg_is_ignored_and_step_acts` doctor test) is
+        # compiled AND run in CI, not only the all-features path below.
+        run: cargo test
       - name: cargo test
         # Runs the unit tests (incl. the scope-fence guards in metrics.rs that
         # assert check.rs / candidate.rs never reference `metrics`) AND the
@@ -31,10 +39,39 @@ jobs:
         # scratch dir. Exits non-zero on any violation so the branch can't merge
         # with the fence broken.
         run: cargo run --quiet -- selfcheck --measurement --json
+      - name: cargo clippy (default features — the SHIPPED config, actuation OFF)
+        # Lint the default (feature-OFF) build under -D warnings too. Without this
+        # a cfg-leak / unused-import / unused-variable / dead-code regression in the
+        # actuation-off path — the path users actually install — would pass CI
+        # green. The all-features clippy below covers the actuation-ON path.
+        run: cargo clippy --all-targets -- -D warnings
       - name: cargo clippy
-        run: cargo clippy -- -D warnings
+        run: cargo clippy --all-targets --all-features -- -D warnings
       - name: cargo fmt check
         run: cargo fmt --check
+
+  test-linux:
+    name: Test (Linux / actuation)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo test (default features — the SHIPPED config, actuation OFF)
+        # The Linux release binary (linux-binaries.yml) ships with actuation OFF,
+        # so compile + run the default config on Linux too. Pairs with the macOS
+        # default-features test job; together they gate the shipped build on both
+        # platforms.
+        run: cargo test
+      - name: cargo test --features actuation
+        # Proves grant / guard / plan / apply + the consolidated POSIX `df -kP`
+        # parser on the OpenClaw (Linux) target — the portable core diskspace
+        # actually ships to. `--features actuation` exercises the autonomous
+        # grant-consult path (gated behind the feature) on Linux specifically, so
+        # the actuation code is covered on the platform that runs it. The macOS
+        # job above remains the clippy/fmt authority; this job is the Linux test
+        # gate.
+        run: cargo test --features actuation
 
   build-release:
     name: Build universal binary
