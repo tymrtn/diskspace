@@ -214,7 +214,7 @@ fn build_candidates(
                 &format!("{:x}", md5_short(&entry.path.to_string_lossy()))
             );
 
-            candidates.push(Candidate {
+            let mut candidate = Candidate {
                 id,
                 rule_id: rule.id.clone(),
                 path: entry.path.clone(),
@@ -226,7 +226,17 @@ fn build_candidates(
                 modified: entry.modified,
                 accessed: entry.accessed,
                 consequences: rule.consequences.clone(),
-            });
+                consequence_contract: None,
+                metrics: None,
+                reference_url: None,
+            };
+
+            // Agent-surface enrichment: attach reference_url, consequence
+            // contract, and advisory metrics. Purely additive / advisory — it
+            // never touches the score() inputs, so ranking stays unaffected.
+            crate::commands::agent_surface::enrich_candidate(&mut candidate, rule, prof);
+
+            candidates.push(candidate);
 
             // Only match first entry per rule to avoid duplicates from glob walking
             break;

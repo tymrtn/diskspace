@@ -46,6 +46,23 @@ pub fn run(target: &str, ctx: &Context) -> Result<()> {
     let pressure = check::pressure_test("(explain)", &path, &prof)?;
 
     if ctx.json {
+        // Agent-surface enrichment for the JSON consumer (single source of truth
+        // in `agent_surface`). Purely advisory — computed AFTER the pressure test
+        // and never feeding `pressure.safe` or the recommendation.
+        let reference_url = matched.map(|r| {
+            crate::commands::agent_surface::reference_url(&r.id, r.reference_url.as_deref())
+        });
+        let consequence_contract = matched.and_then(|r| {
+            r.consequences.as_ref().map(|cons| {
+                crate::commands::agent_surface::contract_from_consequences(
+                    cons,
+                    &r.id,
+                    r.reference_url.as_deref(),
+                )
+            })
+        });
+        let metrics = crate::core::metrics::compute_metrics(&path, &prof).ok();
+
         let payload = serde_json::json!({
             "path": path,
             "size_bytes": size,
@@ -58,6 +75,9 @@ pub fn run(target: &str, ctx: &Context) -> Result<()> {
                 "consequences": r.consequences,
             })),
             "pressure": pressure,
+            "consequence_contract": consequence_contract,
+            "metrics": metrics,
+            "reference_url": reference_url,
             "recommended_command": recommended_command(&path, matched, &pressure),
         });
         println!("{}", serde_json::to_string_pretty(&payload)?);

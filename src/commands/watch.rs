@@ -661,14 +661,13 @@ mod tests {
     // (scanner::tick → series::append_batch, metrics::append_df_sample,
     // scanner::save_tick_state) WITHOUT ever touching the real `~/.diskspace`.
     //
-    // `$HOME` is process-global, so this test serializes itself via a static
-    // mutex and restores the prior value on the way out. No other test in this
-    // crate reads `$HOME` concurrently (series/scanner/metrics tests target an
-    // explicit `base` tempdir, not `$HOME`).
+    // `$HOME` is process-global, so this test serializes itself via the SHARED
+    // crate-wide `HOME_TEST_LOCK` (also held by the `doctor` and `selfcheck`
+    // tests) and restores the prior value on the way out. The shared lock is what
+    // keeps those modules from flipping `$HOME` concurrently with each other.
     // =======================================================================
 
-    use std::sync::Mutex;
-    static HOME_LOCK: Mutex<()> = Mutex::new(());
+    use crate::core::HOME_TEST_LOCK;
 
     /// RAII guard: swap `$HOME` to `new_home` for the test, restore on drop.
     struct HomeGuard {
@@ -678,7 +677,7 @@ mod tests {
     impl HomeGuard {
         fn set(new_home: &Path) -> Self {
             // Poisoning is fine — we only guard a unit `()`; recover the guard.
-            let lock = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let lock = HOME_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
             let prior = std::env::var("HOME").ok();
             std::env::set_var("HOME", new_home);
             Self { prior, _lock: lock }

@@ -121,6 +121,30 @@ enum Commands {
         #[arg(long)]
         need: Option<String>,
     },
+    /// Build a content-addressed recovery plan WITHOUT executing it (TOCTOU-safe phase 1)
+    Plan {
+        /// Free at least this much (e.g. 20G, 500M)
+        #[arg(long)]
+        need: String,
+        /// Execution mode the plan records: `airlock` (reversible) or `immediate`
+        #[arg(long, default_value = "airlock")]
+        mode: String,
+    },
+    /// Apply a previously-built plan by hash, re-validating every step LIVE first (phase 2)
+    Apply {
+        /// The plan hash printed by `diskspace plan`
+        plan_hash: String,
+    },
+    /// Run a command; on ENOSPC, free space via the doctor path and re-run it ONCE
+    Guard {
+        /// The command to run, e.g. --exec "cargo build --release". Tokenized via
+        /// shell-words and run by ARGV — never through a shell.
+        #[arg(long)]
+        exec: String,
+        /// How much to free if the command hits ENOSPC (e.g. 20G, 500M). Default 5G.
+        #[arg(long)]
+        need: Option<String>,
+    },
     /// Reverse the most recent reversible action from the receipts ledger
     Undo,
     /// Background disk-pressure monitor (launchd-backed). Nudges at 10% free, urgent at 5%.
@@ -204,6 +228,9 @@ fn main() -> Result<()> {
         Some(Commands::Receipt { last }) => commands::receipt::run(last, &ctx),
         Some(Commands::Explain { path }) => commands::explain::run(&path, &ctx),
         Some(Commands::Doctor { need }) => commands::doctor::run(need, &ctx),
+        Some(Commands::Plan { need, mode }) => commands::plan::run(&need, &mode, &ctx),
+        Some(Commands::Apply { plan_hash }) => commands::apply::run(&plan_hash, &ctx),
+        Some(Commands::Guard { exec, need }) => commands::guard::run(&exec, need.as_deref(), &ctx),
         Some(Commands::Undo) => commands::undo::run(&ctx),
         Some(Commands::Watch { action }) => match action {
             WatchAction::Install => commands::watch::install(&ctx),

@@ -44,6 +44,14 @@ pub fn run(candidate_id: &str, ctx: &Context) -> Result<()> {
     let mut result = pressure_test(candidate_id, &candidate.path, &prof)?;
     result.consequences = candidate.consequences.clone();
 
+    // Agent-surface enrichment — attached AFTER the gate has decided `safe`, so
+    // it can NEVER influence the actuation decision. The candidate was already
+    // enriched in build_candidates (single source of truth), so copy the derived
+    // fields onto the result for agents reading `diskspace check --json`.
+    result.consequence_contract = candidate.consequence_contract.clone();
+    result.metrics = candidate.metrics.clone();
+    result.reference_url = candidate.reference_url.clone();
+
     if ctx.json {
         println!("{}", serde_json::to_string_pretty(&result)?);
         if !result.safe {
@@ -78,13 +86,16 @@ pub fn pressure_test(
         .iter()
         .fold(1.0f32, |acc, s| if s.passed { acc } else { acc * 0.5 });
 
-    Ok(CheckResult {
-        candidate_id: candidate_id.to_string(),
+    // Use the `gate` constructor so this gate function never names the advisory
+    // agent-surface fields. The scope-fence guard textually scans THIS function
+    // body, so keeping the advisory field names out of it preserves the blind
+    // gate. Enrichment is attached later in `run`, strictly after `safe` is set.
+    Ok(CheckResult::gate(
+        candidate_id.to_string(),
         safe,
         confidence,
         steps,
-        consequences: None,
-    })
+    ))
 }
 
 pub fn render_check_result_pub(result: &CheckResult, ctx: &Context) {

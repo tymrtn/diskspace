@@ -1,9 +1,13 @@
+pub mod agent_surface;
 pub mod airlock;
+pub mod apply;
 pub mod check;
 pub mod detect;
 pub mod doctor;
 pub mod explain;
+pub mod guard;
 pub mod hunt;
+pub mod plan;
 pub mod profile_cmd;
 pub mod purge;
 pub mod receipt;

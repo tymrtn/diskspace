@@ -816,11 +816,13 @@ mod tests {
     /// scratch-base writes land in `/tmp/diskspace-selfcheck-*`, not here.
     #[test]
     fn gate_does_not_write_to_real_data_dir() {
-        use std::sync::Mutex;
         // `$HOME` is process-global; serialize the few tests that mutate it so
-        // they don't race each other (or other tests reading `data_dir()`).
-        static HOME_LOCK: Mutex<()> = Mutex::new(());
-        let _guard = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // they don't race each other (or other tests reading `data_dir()`). This
+        // is the SHARED crate-wide lock (also held by `doctor` and `watch`), so
+        // overrides across modules are mutually exclusive.
+        let _guard = crate::core::HOME_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
 
         // A fresh, empty fake-$HOME tempdir.
         let mut fake_home = std::env::temp_dir();
@@ -832,7 +834,7 @@ mod tests {
         std::fs::create_dir_all(&fake_home).unwrap();
 
         let prev_home = std::env::var_os("HOME");
-        // SAFETY: serialized by HOME_LOCK; restored before the guard drops.
+        // SAFETY: serialized by HOME_TEST_LOCK; restored before the guard drops.
         unsafe {
             std::env::set_var("HOME", &fake_home);
         }

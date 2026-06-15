@@ -35,6 +35,14 @@ pub struct ScanResult {
     /// random/extra deps). Used to tag series observations back to their scan.
     #[serde(default)]
     pub scan_id: String,
+    /// Agent-surface enrichment (P2): ONE whole-$HOME advisory metric for this
+    /// scan (burn-rate / days-to-full / staleness over the scan root). Populated
+    /// by the `scan` command (which has a `Profile`); `None` from the pure
+    /// `scanner::scan` walk. Deliberately a SINGLE metric — per-entry metrics
+    /// would bloat the 589k-entry cache. Additive + serde-default skip-if-none
+    /// so legacy scan.json still deserializes. ADVISORY ONLY.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metrics: Option<crate::core::metrics::Metrics>,
 }
 
 /// Walk the filesystem in parallel, classify entries against rules.
@@ -202,6 +210,9 @@ pub fn scan(root: &Path, rules: &[Rule]) -> Result<ScanResult> {
         category_totals,
         schema: crate::core::series::SERIES_SCHEMA,
         scan_id,
+        // The pure walk has no Profile; the `scan` command computes the single
+        // whole-$HOME metric after the walk (see commands/scan.rs).
+        metrics: None,
     })
 }
 
@@ -1171,6 +1182,7 @@ mod tests {
             category_totals: HashMap::new(),
             schema: SERIES_SCHEMA,
             scan_id: "1700000000-9999".to_string(),
+            metrics: None,
         };
         let json = serde_json::to_string(&result).unwrap();
         let back: ScanResult = serde_json::from_str(&json).unwrap();
@@ -1231,6 +1243,7 @@ mod tests {
             exclude_if_recent_access_days: None,
             exclude_if_recent_modified_days: None,
             consequences: None,
+            reference_url: None,
         };
 
         let result = scan(&dir, &[rule]).unwrap();
@@ -1551,6 +1564,7 @@ mod tests {
             exclude_if_recent_access_days: None,
             exclude_if_recent_modified_days: None,
             consequences: None,
+            reference_url: None,
         };
 
         let now = Utc::now();
@@ -1563,7 +1577,7 @@ mod tests {
             registry: Vec::new(),
             last_df_free: 0,
         };
-        let out_recent = tick_in(&base, &tree, &[rule.clone()], &recent, now).unwrap();
+        let out_recent = tick_in(&base, &tree, std::slice::from_ref(&rule), &recent, now).unwrap();
         assert!(
             !out_recent.widened_to_full,
             "within 24h must NOT widen to a full walk"

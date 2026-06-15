@@ -42,11 +42,19 @@ pub fn run(path: Option<PathBuf>, ctx: &Context) -> Result<()> {
         None
     };
 
-    let result = scanner::scan(&root, &rule_list)?;
+    let mut result = scanner::scan(&root, &rule_list)?;
 
     if let Some(pb) = &spinner {
         pb.finish_and_clear();
     }
+
+    // Agent-surface enrichment (P2): attach ONE whole-$HOME advisory metric for
+    // the scan root (burn-rate / days-to-full / staleness). Best-effort — a
+    // missing/short df_series just yields None. Deliberately a single metric,
+    // NOT per-entry, so the scan cache stays small. Advisory only; never feeds
+    // the scan walk or any actuation.
+    let prof = profile::load().unwrap_or_default();
+    result.metrics = crate::core::metrics::compute_metrics(&root, &prof).ok();
 
     // Persist cache
     std::fs::create_dir_all(profile::data_dir())?;
