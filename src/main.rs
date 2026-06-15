@@ -130,6 +130,12 @@ enum Commands {
     },
     /// Show airlock state and pending purges
     Status,
+    /// Verify the P1 measurement layer's invariants hold at runtime (read-only)
+    Selfcheck {
+        /// Run the G1–G7 measurement-layer gate
+        #[arg(long)]
+        measurement: bool,
+    },
     /// Read or write your personalization profile
     Profile {
         #[command(subcommand)]
@@ -206,6 +212,7 @@ fn main() -> Result<()> {
             WatchAction::Run => commands::watch::run(&ctx),
         },
         Some(Commands::Status) => commands::status::run(&ctx),
+        Some(Commands::Selfcheck { measurement }) => commands::selfcheck::run(measurement, &ctx),
         Some(Commands::Profile { action }) => match action {
             ProfileAction::Get => commands::profile_cmd::get(&ctx),
             ProfileAction::Set { assignment } => commands::profile_cmd::set(&assignment, &ctx),

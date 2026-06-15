@@ -24,6 +24,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::core::bundle;
+use crate::core::metrics::{self, DfSample};
+use crate::core::rules;
+use crate::core::scanner;
 use crate::output::Context;
 
 const PLIST_LABEL: &str = "com.tymrtn.diskspace.watch";
@@ -301,6 +304,22 @@ pub fn run(ctx: &Context) -> Result<()> {
         100.0
     };
 
+    // --- Measurement recorder (additive, best-effort, advisory-only) --------
+    //
+    // After the df read we record this tick into the P1 measurement layer:
+    //   * scanner::tick — emits per-entry Observations (Incremental / Restat /
+    //     Tombstone, or a daily Full true-up) and the next TickState.
+    //   * series::append_batch — persists those observations under one lock.
+    //   * append one df sample to df_series.jsonl (whole-volume burn-rate signal).
+    //   * persist the next TickState atomically.
+    //
+    // This is strictly additive to the df-level/notify/save_state flow below and
+    // takes NO action. A scan or write error here must NEVER crash `watch run`
+    // (mirrors history's best-effort posture), so the whole thing is swallowed
+    // with a log line. The returned advisory (if any) is surfaced in output but
+    // never acted upon — df can never widen a scan (locked invariant).
+    let advisory = record_tick(&home, free_bytes, total_bytes);
+
     let level = if pct_free < URGENT_PCT_FREE {
         Level::Urgent
     } else if pct_free < SOFT_PCT_FREE {
@@ -340,6 +359,7 @@ pub fn run(ctx: &Context) -> Result<()> {
                 "free_bytes": free_bytes,
                 "total_bytes": total_bytes,
                 "notified": should_notify,
+                "advisory": advisory,
             }))?
         );
     } else if !ctx.quiet {
@@ -356,8 +376,66 @@ pub fn run(ctx: &Context) -> Result<()> {
             crate::output::format_bytes(total_bytes),
             ctx.style(if should_notify { "  · notified" } else { "" }, &dim),
         );
+        if let Some(note) = &advisory {
+            println!("  {}", ctx.style(note, &dim));
+        }
     }
     Ok(())
+}
+
+/// Record this watch tick into the P1 measurement layer. Returns the tick's
+/// advisory note (if any) so the caller can surface it — but the caller takes NO
+/// action on it (advisory only; df can never widen a scan).
+///
+/// Best-effort throughout: every sub-step that can fail (rule load, scan, series
+/// append, df-sample append, tick-state persist) is swallowed with a log line so
+/// a measurement error can never crash `watch run`. Mirrors `history::append`'s
+/// posture. Production state lands under `~/.diskspace` via the `profile`-keyed
+/// helpers (which resolve from `$HOME`).
+fn record_tick(home: &Path, free_bytes: u64, total_bytes: u64) -> Option<String> {
+    // Load the rule set the same way `scan` / `detect` do.
+    let rules = match rules::load_builtin() {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("(watch: recorder skipped — failed to load rules: {})", e);
+            return None;
+        }
+    };
+
+    // Load prior tick state (default if absent → "due for a full walk").
+    let state = scanner::load_tick_state();
+
+    // Run the incremental measurement step. NOTE: `tick` ALREADY appends its
+    // observations to `series.jsonl` internally, under one batch lock (see
+    // `scanner::tick_in` → `series_append_batch`). We therefore do NOT call
+    // `series::append_batch(&outcome.observations)` again here — that would
+    // double-write every observation and corrupt the burn-rate / regrowth
+    // analysis. The observations are returned only so callers/tests can inspect
+    // them; the durable write is owned by `tick`.
+    let outcome = match scanner::tick(home, &rules, &state) {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("(watch: recorder tick failed: {})", e);
+            return None;
+        }
+    };
+
+    // Append one whole-volume df sample (burn-rate signal). Best-effort.
+    let sample = DfSample {
+        ts: chrono::Utc::now(),
+        free_bytes,
+        total_bytes,
+    };
+    if let Err(e) = metrics::append_df_sample(&sample) {
+        eprintln!("(watch: recorder failed to append df sample: {})", e);
+    }
+
+    // Persist the next tick state atomically (temp + rename). Best-effort.
+    if let Err(e) = scanner::save_tick_state(&outcome.next_state) {
+        eprintln!("(watch: recorder failed to persist tick state: {})", e);
+    }
+
+    outcome.advisory
 }
 
 fn notify(level: Level, free_bytes: u64, pct_free: f32) {
@@ -416,10 +494,17 @@ fn state_file() -> Result<PathBuf> {
 
 fn load_state() -> Result<WatchState> {
     let path = state_file()?;
+    load_state_from(&path)
+}
+
+/// Load state from `path`, tolerating a missing or garbage file (returns
+/// [`WatchState::default`]). A stray `.json.tmp` from an interrupted
+/// [`save_state_to`] is irrelevant here — we only ever read the renamed target.
+fn load_state_from(path: &Path) -> Result<WatchState> {
     if !path.exists() {
         return Ok(WatchState::default());
     }
-    let s = fs::read_to_string(&path)?;
+    let s = fs::read_to_string(path)?;
     Ok(serde_json::from_str(&s).unwrap_or_default())
 }
 
@@ -427,8 +512,27 @@ fn save_state(state: &WatchState) -> Result<()> {
     let dir = state_dir()?;
     fs::create_dir_all(&dir)?;
     let path = state_file()?;
+    save_state_to(&path, state)
+}
+
+/// Atomically persist `state` to `path`: serialize, write+flush a sibling
+/// `.json.tmp`, then `fs::rename` it over the target. Rename is atomic on the
+/// same filesystem (always `~/.diskspace` here), so a crash or concurrent
+/// reader never observes a torn/half-written state file.
+fn save_state_to(path: &Path, state: &WatchState) -> Result<()> {
     let s = serde_json::to_string_pretty(state)?;
-    fs::write(&path, s)?;
+    let tmp = path.with_extension("json.tmp");
+    {
+        use std::io::Write as _;
+        let mut f = fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&tmp)?;
+        f.write_all(s.as_bytes())?;
+        f.flush()?;
+    }
+    fs::rename(&tmp, path)?;
     Ok(())
 }
 
@@ -457,4 +561,231 @@ fn df_free_and_total(path: &Path) -> Result<(u64, u64)> {
         .ok_or_else(|| anyhow::anyhow!("df: missing avail"))?
         .parse()?;
     Ok((avail_kb * 1024, total_kb * 1024))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct TempBase {
+        path: PathBuf,
+    }
+    impl TempBase {
+        fn new(tag: &str) -> Self {
+            let mut p = std::env::temp_dir();
+            let uniq = format!(
+                "diskspace-watch-test-{}-{}-{}",
+                tag,
+                std::process::id(),
+                chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+            );
+            p.push(uniq);
+            fs::create_dir_all(&p).unwrap();
+            Self { path: p }
+        }
+        fn state_file(&self) -> PathBuf {
+            self.path.join("watch_state.json")
+        }
+    }
+    impl Drop for TempBase {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn sample_state() -> WatchState {
+        WatchState {
+            last_level: Some(Level::Soft),
+            last_ts: Some(chrono::Utc::now()),
+            last_pct_free: Some(7.5),
+            last_free_bytes: Some(1234),
+            last_total_bytes: Some(98765),
+        }
+    }
+
+    #[test]
+    fn save_then_load_roundtrips() {
+        let base = TempBase::new("roundtrip");
+        let path = base.state_file();
+        let state = sample_state();
+        save_state_to(&path, &state).unwrap();
+
+        let loaded = load_state_from(&path).unwrap();
+        assert_eq!(loaded.last_level, state.last_level);
+        assert_eq!(loaded.last_pct_free, state.last_pct_free);
+        assert_eq!(loaded.last_free_bytes, state.last_free_bytes);
+        assert_eq!(loaded.last_total_bytes, state.last_total_bytes);
+    }
+
+    /// A stray/garbage `.json.tmp` left by an interrupted save must NOT corrupt
+    /// the real state file: load reads only the renamed target, and a fresh
+    /// atomic save renames a complete temp over it. Rename semantics mean the
+    /// reader never sees a half-written file.
+    #[test]
+    fn interrupted_temp_does_not_corrupt_real_state() {
+        let base = TempBase::new("interrupted");
+        let path = base.state_file();
+
+        // 1. A good, complete state file exists.
+        let good = sample_state();
+        save_state_to(&path, &good).unwrap();
+
+        // 2. Simulate an interrupted save: a garbage half-written temp is left
+        //    behind. It is a sibling, never renamed over the target.
+        let tmp = path.with_extension("json.tmp");
+        fs::write(&tmp, b"{ this is not valid json, torn mid-wri").unwrap();
+
+        // 3. The real state file is still intact and parses correctly — the
+        //    garbage temp is irrelevant to the reader.
+        let loaded = load_state_from(&path).unwrap();
+        assert_eq!(
+            loaded.last_free_bytes, good.last_free_bytes,
+            "real state survived the interrupted temp"
+        );
+
+        // 4. A subsequent atomic save overwrites the target via rename and the
+        //    new value is observed (no corruption from the stale temp).
+        let mut next = sample_state();
+        next.last_free_bytes = Some(42);
+        save_state_to(&path, &next).unwrap();
+        let reloaded = load_state_from(&path).unwrap();
+        assert_eq!(reloaded.last_free_bytes, Some(42));
+    }
+
+    // =======================================================================
+    // Recorder wiring — integration-style test against a tempdir $HOME.
+    //
+    // `record_tick` drives the PRODUCTION measurement helpers, all of which
+    // resolve their on-disk location from `profile::data_dir()` → `$HOME`. By
+    // pointing `$HOME` at a throwaway tempdir we exercise the real append path
+    // (scanner::tick → series::append_batch, metrics::append_df_sample,
+    // scanner::save_tick_state) WITHOUT ever touching the real `~/.diskspace`.
+    //
+    // `$HOME` is process-global, so this test serializes itself via a static
+    // mutex and restores the prior value on the way out. No other test in this
+    // crate reads `$HOME` concurrently (series/scanner/metrics tests target an
+    // explicit `base` tempdir, not `$HOME`).
+    // =======================================================================
+
+    use std::sync::Mutex;
+    static HOME_LOCK: Mutex<()> = Mutex::new(());
+
+    /// RAII guard: swap `$HOME` to `new_home` for the test, restore on drop.
+    struct HomeGuard {
+        prior: Option<String>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+    impl HomeGuard {
+        fn set(new_home: &Path) -> Self {
+            // Poisoning is fine — we only guard a unit `()`; recover the guard.
+            let lock = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let prior = std::env::var("HOME").ok();
+            std::env::set_var("HOME", new_home);
+            Self { prior, _lock: lock }
+        }
+    }
+    impl Drop for HomeGuard {
+        fn drop(&mut self) {
+            match &self.prior {
+                Some(h) => std::env::set_var("HOME", h),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+    }
+
+    /// Seed a small tree under `home` so the recorder's scan/tick has something
+    /// real to measure. We create a `node_modules` directory (matched by the
+    /// builtin `**/node_modules` rule) with a couple of files, so the daily
+    /// true-up's `scan()` keeps it and emits a `Source::Full` observation.
+    fn seed_tree(home: &Path) {
+        let nm = home.join("proj").join("node_modules");
+        fs::create_dir_all(&nm).unwrap();
+        for (name, n) in [("a.bin", 8 * 1024usize), ("b.bin", 16 * 1024)] {
+            let mut f = fs::File::create(nm.join(name)).unwrap();
+            use std::io::Write as _;
+            f.write_all(&vec![b'x'; n]).unwrap();
+            f.flush().unwrap();
+        }
+    }
+
+    /// The recorder appends to `series.jsonl` + `df_series.jsonl` and writes
+    /// `tick_state.json`, and a second run reuses the prior state (incremental).
+    #[test]
+    fn recorder_appends_series_df_and_persists_tick_state() {
+        let base = TempBase::new("recorder");
+        let home = base.path.clone();
+        seed_tree(&home);
+
+        let _guard = HomeGuard::set(&home);
+
+        // `profile::data_dir()` now resolves under the tempdir HOME.
+        let data_dir = crate::profile::data_dir();
+        let series = data_dir.join("series.jsonl");
+        let df_series = data_dir.join("df_series.jsonl");
+        let tick_state = data_dir.join("tick_state.json");
+
+        // Nothing recorded yet.
+        assert!(!series.exists(), "no series before first tick");
+        assert!(!df_series.exists(), "no df_series before first tick");
+        assert!(!tick_state.exists(), "no tick_state before first tick");
+
+        // --- First run: default tick state (epoch) → daily true-up (full walk).
+        let _ = record_tick(&home, 100 * 1024 * 1024 * 1024, 500 * 1024 * 1024 * 1024);
+
+        assert!(series.exists(), "series.jsonl created on first tick");
+        assert!(df_series.exists(), "df_series.jsonl created on first tick");
+        assert!(tick_state.exists(), "tick_state.json written on first tick");
+
+        let series_len_1 = fs::read_to_string(&series).unwrap().lines().count();
+        let df_len_1 = fs::read_to_string(&df_series).unwrap().lines().count();
+        assert!(series_len_1 > 0, "series got at least one observation");
+        assert_eq!(df_len_1, 1, "exactly one df sample appended per tick");
+
+        // The first tick was a full true-up: last_full_walk is now (not epoch).
+        let state_1 = scanner::load_tick_state();
+        let epoch = chrono::DateTime::<chrono::Utc>::from_timestamp(0, 0).unwrap();
+        assert!(
+            state_1.last_full_walk > epoch,
+            "first tick ran the daily true-up and advanced last_full_walk off the epoch sentinel"
+        );
+
+        // --- Second run: reuses prior state → within 24h → incremental path.
+        let _ = record_tick(&home, 99 * 1024 * 1024 * 1024, 500 * 1024 * 1024 * 1024);
+
+        let df_len_2 = fs::read_to_string(&df_series).unwrap().lines().count();
+        assert_eq!(df_len_2, 2, "second tick appended a second df sample");
+
+        // df_series is append-only — the first sample is still present.
+        let df_samples: Vec<crate::core::metrics::DfSample> =
+            crate::core::metrics::read_df_series().unwrap();
+        assert_eq!(
+            df_samples.len(),
+            2,
+            "both df samples persisted, append-only"
+        );
+        assert_eq!(df_samples[0].free_bytes, 100 * 1024 * 1024 * 1024);
+        assert_eq!(df_samples[1].free_bytes, 99 * 1024 * 1024 * 1024);
+
+        // The second run reused the prior state: it stayed within 24h, so it did
+        // NOT run another full walk — last_full_walk is UNCHANGED from run 1.
+        let state_2 = scanner::load_tick_state();
+        assert_eq!(
+            state_2.last_full_walk, state_1.last_full_walk,
+            "second tick reused prior state (incremental — no new full walk within 24h)"
+        );
+
+        // series.jsonl is append-only: the second tick never truncated it.
+        let series_len_2 = fs::read_to_string(&series).unwrap().lines().count();
+        assert!(
+            series_len_2 >= series_len_1,
+            "series.jsonl is append-only across ticks (never truncated)"
+        );
+
+        // Every persisted series line parses (no torn/interleaved writes).
+        let obs = crate::core::series::read_all().unwrap();
+        assert!(
+            !obs.is_empty(),
+            "series observations round-trip via the store"
+        );
+    }
 }

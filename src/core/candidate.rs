@@ -32,6 +32,23 @@ pub struct ScannedEntry {
     pub category: Category,
     pub modified: Option<DateTime<Utc>>,
     pub accessed: Option<DateTime<Utc>>,
+    /// Device id (unix `stat.st_dev`) — half of the inode identity used to key
+    /// the time series. `None` on non-unix or when unavailable. Additive +
+    /// serde-default so legacy scan.json still deserializes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dev: Option<u64>,
+    /// Inode number (unix `stat.st_ino`). `None` on non-unix or when unavailable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ino: Option<u64>,
+    /// Inode change time as nanoseconds-since-epoch (`st_ctime * 1e9 +
+    /// st_ctime_nsec`), NOT whole seconds. The series layer keys continuity on
+    /// `(dev, ino)` alone and uses this ctime only as an inode-reuse tiebreaker;
+    /// full sub-second resolution is required because a delete + create can
+    /// reuse the same inode inside one wall-clock second. `None` on non-unix or
+    /// when unavailable. Additive + serde-default so legacy scan.json still
+    /// deserializes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ctime: Option<i64>,
 }
 
 /// A candidate for cleanup: a scanned entry promoted by a matching rule.

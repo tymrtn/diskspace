@@ -18,7 +18,19 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: cargo test
+        # Runs the unit tests (incl. the scope-fence guards in metrics.rs that
+        # assert check.rs / candidate.rs never reference `metrics`) AND the
+        # tests/ integration guards (incl. the finding-6 selfcheck read-only
+        # check). Keeps the metrics scope fence enforced in CI, not just locally.
         run: cargo test --all-features
+      - name: selfcheck measurement gate (G1-G7 runtime fence)
+        # The runtime counterpart to the unit proofs: re-verifies the P1
+        # measurement invariants (provenance/confidence, rollup idempotency,
+        # in-place growth caught + df stays advisory, rename continuity, lock
+        # integrity, $HOME-scope/no-sudo, cost budget) against a throwaway temp
+        # scratch dir. Exits non-zero on any violation so the branch can't merge
+        # with the fence broken.
+        run: cargo run --quiet -- selfcheck --measurement --json
       - name: cargo clippy
         run: cargo clippy -- -D warnings
       - name: cargo fmt check

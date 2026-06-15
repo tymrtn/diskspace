@@ -10,6 +10,7 @@ pub mod receipt;
 pub mod reclaim;
 pub mod restore;
 pub mod scan;
+pub mod selfcheck;
 pub mod status;
 pub mod undo;
 pub mod watch;
