@@ -589,6 +589,7 @@ mod tests {
             schema: 0,
             scan_id: String::new(),
             metrics: None,
+            largest_dirs: Vec::new(),
         }
     }
 

@@ -111,6 +111,10 @@ enum Commands {
         /// Minimum directory size in MB (default: 500)
         #[arg(long, default_value = "500")]
         min_size_mb: u64,
+        /// Force a fresh live walk of $HOME instead of reading the scan cache.
+        /// Slow (minutes on a large disk); the cache path is sub-second.
+        #[arg(long)]
+        fresh: bool,
     },
     /// Show recent action history (the receipts ledger)
     Receipt {
@@ -333,7 +337,11 @@ fn main() -> Result<()> {
             top,
             unsafe_confidence,
         }) => commands::reclaim::run(top, unsafe_confidence, grant_ref, &ctx),
-        Some(Commands::Hunt { top, min_size_mb }) => commands::hunt::run(top, min_size_mb, &ctx),
+        Some(Commands::Hunt {
+            top,
+            min_size_mb,
+            fresh,
+        }) => commands::hunt::run(top, min_size_mb, fresh, &ctx),
         Some(Commands::Receipt { last }) => commands::receipt::run(last, &ctx),
         Some(Commands::Explain { path }) => commands::explain::run(&path, &ctx),
         Some(Commands::Doctor { need }) => commands::doctor::run(need, grant_ref, &ctx),

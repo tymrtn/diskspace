@@ -13,6 +13,24 @@ use super::rules::Rule;
 use super::series::{ObsKey, Observation, Source};
 use crate::profile;
 
+/// Cap on how many of the largest directories we persist into `scan.json`. This
+/// keeps the cache small (top-N only) while giving `hunt` enough big-directory
+/// totals to find — and adaptively drill into — the genuinely unruled bytes
+/// without re-walking $HOME. 400 comfortably covers every multi-GB directory on
+/// a real $HOME tree while adding only a few KB to the cache.
+pub const LARGEST_DIRS_TOP_N: usize = 400;
+
+/// One directory's TOTAL on-disk byte size (its own files plus every descendant),
+/// as computed during the walk. This is the TOTAL size, NOT just the rule-matched
+/// portion — `hunt` subtracts matched entries from it to find the truly-unruled
+/// remainder, glob-aware for free. Persisted (top-N only) so `hunt` can be
+/// sub-second instead of re-walking $HOME on every invocation.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DirTotal {
+    pub path: PathBuf,
+    pub total_bytes: u64,
+}
+
 /// Cached scan result written to ~/.diskspace/scan.json
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ScanResult {
@@ -43,6 +61,38 @@ pub struct ScanResult {
     /// so legacy scan.json still deserializes. ADVISORY ONLY.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metrics: Option<crate::core::metrics::Metrics>,
+    /// The TOP-N largest directories by TOTAL on-disk bytes (own files plus every
+    /// descendant), computed from the `dir_sizes` map already built during the
+    /// walk. These are TOTAL sizes, NOT just rule-matched bytes — `hunt` reads
+    /// them and subtracts the rule-matched entries underneath to surface the
+    /// genuinely-unruled remainder (glob-aware for free) without re-walking $HOME.
+    /// Sorted by `total_bytes` descending, capped at [`LARGEST_DIRS_TOP_N`] to
+    /// keep the cache small. Additive + serde-default so legacy scan.json (no
+    /// `largest_dirs`) still deserializes to an empty Vec.
+    #[serde(default)]
+    pub largest_dirs: Vec<DirTotal>,
+}
+
+/// Pick the top-N largest directories from the per-dir aggregate `dir_sizes` map,
+/// sorted by `total_bytes` descending (path as a stable tiebreaker), capped at N.
+/// Factored out so it can be unit-tested directly.
+fn top_largest_dirs(dir_sizes: &HashMap<PathBuf, u64>, n: usize) -> Vec<DirTotal> {
+    let mut dirs: Vec<DirTotal> = dir_sizes
+        .iter()
+        .filter(|(_, &bytes)| bytes > 0)
+        .map(|(path, &total_bytes)| DirTotal {
+            path: path.clone(),
+            total_bytes,
+        })
+        .collect();
+    // Largest first; tie-break on path for deterministic output across runs.
+    dirs.sort_by(|a, b| {
+        b.total_bytes
+            .cmp(&a.total_bytes)
+            .then_with(|| a.path.cmp(&b.path))
+    });
+    dirs.truncate(n);
+    dirs
 }
 
 /// Walk the filesystem in parallel, classify entries against rules.
@@ -189,6 +239,13 @@ pub fn scan(root: &Path, rules: &[Rule]) -> Result<ScanResult> {
         *category_totals.entry("unknown".to_string()).or_insert(0) += total_bytes - top_level_total;
     }
 
+    // Persist the TOP-N largest directories by TOTAL on-disk bytes, reusing the
+    // `dir_sizes` map already built during the walk. These TOTAL sizes (not just
+    // rule-matched bytes) let `hunt` find — and adaptively drill into — the
+    // genuinely-unruled remainder without re-walking $HOME. Top-N only so the
+    // cache stays small.
+    let largest_dirs = top_largest_dirs(&dir_sizes, LARGEST_DIRS_TOP_N);
+
     // Compute `scanned_at` once so the derived `scan_id` matches the stored
     // timestamp. The id is deterministic from (timestamp nanos, total_bytes) —
     // no random source, no extra deps.
@@ -213,6 +270,7 @@ pub fn scan(root: &Path, rules: &[Rule]) -> Result<ScanResult> {
         // The pure walk has no Profile; the `scan` command computes the single
         // whole-$HOME metric after the walk (see commands/scan.rs).
         metrics: None,
+        largest_dirs,
     })
 }
 
@@ -1183,6 +1241,7 @@ mod tests {
             schema: SERIES_SCHEMA,
             scan_id: "1700000000-9999".to_string(),
             metrics: None,
+            largest_dirs: Vec::new(),
         };
         let json = serde_json::to_string(&result).unwrap();
         let back: ScanResult = serde_json::from_str(&json).unwrap();
@@ -1206,6 +1265,101 @@ mod tests {
         assert_eq!(result.total_bytes, 500);
         assert_eq!(result.schema, 0, "missing schema defaults to 0");
         assert_eq!(result.scan_id, "", "missing scan_id defaults to empty");
+        assert!(
+            result.largest_dirs.is_empty(),
+            "missing largest_dirs defaults to an empty Vec (back-compat)"
+        );
+    }
+
+    /// `top_largest_dirs` keeps only the N biggest directories, sorted by
+    /// `total_bytes` descending, dropping zero-byte dirs and capping at N. This is
+    /// the pure selection logic `scan()` applies to its `dir_sizes` map.
+    #[test]
+    fn top_largest_dirs_sorts_desc_and_caps_at_n() {
+        let mut dir_sizes: HashMap<PathBuf, u64> = HashMap::new();
+        dir_sizes.insert(PathBuf::from("/a"), 100);
+        dir_sizes.insert(PathBuf::from("/b"), 300);
+        dir_sizes.insert(PathBuf::from("/c"), 200);
+        dir_sizes.insert(PathBuf::from("/d"), 50);
+        dir_sizes.insert(PathBuf::from("/zero"), 0); // dropped (no bytes)
+
+        let top = top_largest_dirs(&dir_sizes, 2);
+        assert_eq!(top.len(), 2, "capped at N=2");
+        assert_eq!(top[0].path, PathBuf::from("/b"));
+        assert_eq!(top[0].total_bytes, 300);
+        assert_eq!(top[1].path, PathBuf::from("/c"));
+        assert_eq!(top[1].total_bytes, 200);
+        // Descending order holds.
+        assert!(top[0].total_bytes >= top[1].total_bytes);
+
+        // With N >= count, the zero-byte dir is still excluded.
+        let all = top_largest_dirs(&dir_sizes, 100);
+        assert_eq!(all.len(), 4, "zero-byte dir excluded, rest kept");
+        assert!(
+            all.iter().all(|d| d.total_bytes > 0),
+            "no zero-byte dirs persisted"
+        );
+    }
+
+    /// Scanning a real tempdir tree persists `largest_dirs` with the correct TOTAL
+    /// on-disk sizes (own files PLUS every descendant), sorted descending. The
+    /// totals are TOTAL sizes, NOT just rule-matched bytes — there is no rule here
+    /// yet the directories still appear, which is exactly what `hunt` needs to find
+    /// unruled bytes.
+    #[cfg(unix)]
+    #[test]
+    fn scan_persists_largest_dirs_with_total_sizes() {
+        // tree/
+        //   big/       (one large file)
+        //     huge.bin
+        //   small/     (one small file)
+        //     tiny.bin
+        let mut root = std::env::temp_dir();
+        root.push(format!(
+            "diskspace-largest-dirs-test-{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        let big = root.join("big");
+        let small = root.join("small");
+        std::fs::create_dir_all(&big).unwrap();
+        std::fs::create_dir_all(&small).unwrap();
+        write_bytes(&big.join("huge.bin"), 64 * 1024);
+        write_bytes(&small.join("tiny.bin"), 4 * 1024);
+
+        // No rules at all: largest_dirs must STILL be populated (it tracks TOTAL
+        // sizes, independent of rule matching).
+        let result = scan(&root, &[]).unwrap();
+        assert!(result.entries.is_empty(), "no rules → no matched entries");
+
+        // Sorted descending by total_bytes.
+        for w in result.largest_dirs.windows(2) {
+            assert!(
+                w[0].total_bytes >= w[1].total_bytes,
+                "largest_dirs sorted by total_bytes descending"
+            );
+        }
+
+        let find = |p: &Path| {
+            result
+                .largest_dirs
+                .iter()
+                .find(|d| d.path == p)
+                .map(|d| d.total_bytes)
+        };
+        let big_total = find(&big).expect("big/ present in largest_dirs");
+        let small_total = find(&small).expect("small/ present in largest_dirs");
+        let root_total = find(&root).expect("root present in largest_dirs");
+
+        // big/ holds the larger file, so its total exceeds small/.
+        assert!(big_total > small_total, "big/ totals more than small/");
+        // The root aggregates ALL descendants, so it's >= big/ + small/.
+        assert!(
+            root_total >= big_total + small_total,
+            "root total includes every descendant"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// On unix, scanning a tempdir with a matching rule populates dev/ino on the
