@@ -74,6 +74,17 @@ fn append_inner(entry: &Entry) -> Result<()> {
     append_inner_to(&history_path(), entry)
 }
 
+/// Append one entry to `<base>/history.jsonl` (a base-dir seam, mirroring
+/// [`read_all_in_pub`]). Production callers that already know they want the real
+/// ledger pass [`profile::data_dir`]; the seam exists so a caller under test can
+/// redirect its receipt into a tempdir instead of polluting `~/.diskspace`.
+/// Best-effort like [`append`] — a write failure is logged, never propagated.
+pub(crate) fn append_to_base(base: &Path, entry: &Entry) {
+    if let Err(e) = append_inner_to(&base.join("history.jsonl"), entry) {
+        eprintln!("(history: failed to write entry: {})", e);
+    }
+}
+
 /// Append one entry to `path` under an exclusive lock. Path-parameterized so
 /// tests can target a tempdir without touching the real `~/.diskspace`.
 fn append_inner_to(path: &Path, entry: &Entry) -> Result<()> {

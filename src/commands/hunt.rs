@@ -23,9 +23,11 @@ use std::time::Duration;
 
 use crate::commands::scan::scan_cache_path;
 use crate::core::candidate::ScannedEntry;
+use crate::core::classify::{self, Signature, Strategy};
 use crate::core::rules;
 use crate::core::scanner::{expand_home, ScanResult};
 use crate::output::{self, Context};
+use crate::profile;
 
 /// How old `scan.json` may be before `hunt` treats it as stale and falls back to
 /// a fresh live walk. A day-old picture of the long tail is plenty fresh for
@@ -34,15 +36,26 @@ use crate::output::{self, Context};
 const CACHE_STALE_AFTER_HOURS: i64 = 24;
 
 #[derive(Debug, Clone, Serialize)]
-struct HuntCandidate {
-    path: PathBuf,
+pub struct HuntCandidate {
+    pub path: PathBuf,
     /// Genuinely-unruled bytes: total on-disk size minus the rule-matched bytes
     /// underneath. This is what `hunt` ranks and reports.
-    unruled_bytes: u64,
+    pub unruled_bytes: u64,
     /// Total on-disk size of the directory (own files plus every descendant).
     /// Carried for context so a row can show "X unruled of Y total".
-    total_bytes: u64,
-    depth: usize,
+    pub total_bytes: u64,
+    pub depth: usize,
+    /// The [`Signature`] the classifier inferred for this row, so the unruled hunt
+    /// becomes ACTIONABLE rather than just "here's a big opaque dir". Tagged by
+    /// [`tag_classifications`] AFTER the rows are chosen; additive + back-compat
+    /// (legacy JSON consumers ignore the new field). `None` only on the pre-tag
+    /// internal value (the cache-core tests build untagged rows).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<Signature>,
+    /// The SAFE-ACTION [`Strategy`] for the signature — what `diskspace classify`
+    /// would do. Paired with `signature`; same back-compat treatment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strategy: Option<Strategy>,
 }
 
 pub fn run(top: usize, min_size_mb: u64, fresh: bool, ctx: &Context) -> Result<()> {
@@ -52,7 +65,7 @@ pub fn run(top: usize, min_size_mb: u64, fresh: bool, ctx: &Context) -> Result<(
 
     // Fast path: read the scan cache and subtract rule-matched bytes. Falls back
     // to a live walk when the cache is missing, stale, or `--fresh` is requested.
-    let (chosen, from_cache) = if fresh {
+    let (mut chosen, from_cache) = if fresh {
         (
             hunt_fresh_walk(&home, &rule_list, min_size, top, ctx)?,
             false,
@@ -70,7 +83,52 @@ pub fn run(top: usize, min_size_mb: u64, fresh: bool, ctx: &Context) -> Result<(
         }
     };
 
+    // Tag each chosen row with its signature + safe-action strategy so the table
+    // and JSON are actionable. Done on the FINAL (truncated) rows only — at most
+    // `top` classifications, each a cheap path check or one bounded sample.
+    let prof = profile::load().unwrap_or_default();
+    tag_classifications(&mut chosen, &prof);
+
     render(&chosen, top, min_size_mb, from_cache, ctx)
+}
+
+/// Classify each chosen hunt row IN PLACE, attaching its [`Signature`] and the
+/// safe-action [`Strategy`]. Reuses the unruled byte total the hunt already
+/// computed (via [`classify::classify_with_size`]) instead of re-summing the dir,
+/// so tagging never re-walks the tree. Pure aside from the bounded per-row sample.
+fn tag_classifications(rows: &mut [HuntCandidate], prof: &profile::Profile) {
+    for row in rows.iter_mut() {
+        let c = classify::classify_with_size(&row.path, row.unruled_bytes, prof);
+        row.signature = Some(c.signature);
+        row.strategy = Some(c.strategy);
+    }
+}
+
+/// Reusable analysis entry point for `diskspace classify` (no path): return the
+/// top unruled hunt rows, already CLASSIFIED, using the SAME cache-first / live-walk
+/// path `hunt` itself uses. Read-only. `classify` renders these into its own table;
+/// `hunt` renders them into its long-tail view — one shared source of truth.
+pub fn analyze_unruled(
+    top: usize,
+    min_size_mb: u64,
+    fresh: bool,
+    ctx: &Context,
+) -> Result<Vec<HuntCandidate>> {
+    let home = dirs_home();
+    let rule_list = rules::load_builtin()?;
+    let min_size = min_size_mb * 1024 * 1024;
+
+    let mut chosen = if fresh {
+        hunt_fresh_walk(&home, &rule_list, min_size, top, ctx)?
+    } else {
+        match load_fresh_cache(Utc::now()) {
+            Some(scan) => hunt_from_cache(&scan, &home, min_size, top),
+            None => hunt_fresh_walk(&home, &rule_list, min_size, top, ctx)?,
+        }
+    };
+    let prof = profile::load().unwrap_or_default();
+    tag_classifications(&mut chosen, &prof);
+    Ok(chosen)
 }
 
 /// Load `scan.json` only if it exists, parses, and is fresh enough. Returns `None`
@@ -256,6 +314,10 @@ fn drill_dir(
             unruled_bytes: stat.unruled_bytes,
             total_bytes: stat.total_bytes,
             depth,
+            // Tagged in a SEPARATE pass ([`tag_classifications`]) after the rows are
+            // chosen, so the drill core stays pure (no I/O) and unit-testable.
+            signature: None,
+            strategy: None,
         });
         return;
     }
@@ -436,6 +498,10 @@ fn render(
                     "unruled_bytes": c.unruled_bytes,
                     "total_bytes": c.total_bytes,
                     "depth": c.depth,
+                    // New, additive: the classifier tag makes each row actionable.
+                    // Legacy consumers ignore the unknown fields.
+                    "signature": c.signature.map(|s| s.label()),
+                    "strategy": c.strategy.map(|s| s.label()),
                 })
             })
             .collect();
@@ -512,6 +578,18 @@ fn render(
             ctx.style(&c.path.display().to_string(), &dim),
             context,
         );
+        // The classifier tag turns the row from "opaque big dir" into an action:
+        // e.g. `git-pack → repack`, with the exact next command. Skip the empty
+        // line for Unknown/Review (no specific action to advertise yet).
+        if let (Some(sig), Some(strat)) = (c.signature, c.strategy) {
+            let hint = classify::action_hint(strat, &c.path);
+            println!(
+                "    {} {}  {}",
+                ctx.style("↳", &dim),
+                ctx.style(&format!("{sig} → {strat}"), &cyan),
+                ctx.style(&hint, &dim),
+            );
+        }
     }
 
     println!();
@@ -846,6 +924,79 @@ mod tests {
         assert_eq!(got.len(), 2, "top=2 keeps only the two biggest");
         assert_eq!(got[0].path, PathBuf::from("/home/u/a"));
         assert_eq!(got[1].path, PathBuf::from("/home/u/b"));
+    }
+
+    /// HUNT INTEGRATION: after the rows are chosen, `tag_classifications` attaches a
+    /// signature + safe-action strategy to EACH row — the additive tag that makes the
+    /// unruled hunt ACTIONABLE. A `.git/objects/pack` row tags as git-pack → repack;
+    /// a neutral, recent, mixed dir tags as Unknown → review. The tag is derived from
+    /// the row's PATH and reuses the unruled byte total (no re-walk). This drives the
+    /// real integration unit directly (no `$HOME` walk), so it's fast and isolated.
+    #[cfg(unix)]
+    #[test]
+    fn hunt_rows_carry_signature_and_strategy() {
+        use std::io::Write;
+
+        // A real on-disk tree under the OS temp dir (NOT $HOME) so classify's path
+        // checks / light sample see actual dirs. No env override needed: we call the
+        // tagging pass directly with absolute row paths.
+        let mut root = std::env::temp_dir();
+        root.push(format!(
+            "diskspace-hunt-tag-{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        let pack = root.join("Code/myrepo/.git/objects/pack");
+        let misc = root.join("Misc/fresh");
+        std::fs::create_dir_all(&pack).unwrap();
+        std::fs::create_dir_all(&misc).unwrap();
+        let write = |p: &Path, n: usize| {
+            let mut f = std::fs::File::create(p).unwrap();
+            f.write_all(&vec![0u8; n]).unwrap();
+            f.flush().unwrap();
+        };
+        write(&pack.join("pack-abc.pack"), 4 * 1024 * 1024);
+        // Mixed, non-dominant, recent content so the misc dir samples to Unknown
+        // (no extension family wins; .bin would falsely read as model weights).
+        write(&misc.join("notes.txt"), 1024 * 1024);
+        write(&misc.join("readme.md"), 512 * 1024);
+        write(&misc.join("pic.png"), 512 * 1024);
+
+        // The rows as the drill would produce them (untagged), then tag them.
+        let mut rows = vec![
+            HuntCandidate {
+                path: pack.clone(),
+                unruled_bytes: 4 * 1024 * 1024,
+                total_bytes: 4 * 1024 * 1024,
+                depth: 4,
+                signature: None,
+                strategy: None,
+            },
+            HuntCandidate {
+                path: misc.clone(),
+                unruled_bytes: 2 * 1024 * 1024,
+                total_bytes: 2 * 1024 * 1024,
+                depth: 2,
+                signature: None,
+                strategy: None,
+            },
+        ];
+        tag_classifications(&mut rows, &profile::Profile::default());
+
+        let pack_row = rows.iter().find(|r| r.path == pack).unwrap();
+        assert_eq!(
+            pack_row.signature,
+            Some(Signature::GitPack),
+            "a .git/objects/pack row tags as git-pack"
+        );
+        assert_eq!(pack_row.strategy, Some(Strategy::Repack));
+
+        let misc_row = rows.iter().find(|r| r.path == misc).unwrap();
+        // A neutral, recent, mixed dir → Unknown → Review (never a blind action).
+        assert_eq!(misc_row.signature, Some(Signature::Unknown));
+        assert_eq!(misc_row.strategy, Some(Strategy::Review));
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// Nested matched entries must not double-count: a top-level matched dir and a

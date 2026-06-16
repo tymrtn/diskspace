@@ -116,6 +116,19 @@ enum Commands {
         #[arg(long)]
         fresh: bool,
     },
+    /// Label a large unrule'd directory (git pack, VM disk, model, backup, …) and,
+    /// with --yes, take the SAFE ACTION for it (git-repack / reversible airlock /
+    /// recommend stow). No path → classify the top unrule'd dirs into a table.
+    Classify {
+        /// Directory to classify (~ expands to $HOME). Omit to classify the top
+        /// unrule'd dirs from the scan cache as a read-only table.
+        path: Option<String>,
+        /// Execute the safe action for the inferred strategy (git gc for a git pack,
+        /// reversible airlock for a VM disk, recommend stow for offloadable data).
+        /// Without it, classify only SUGGESTS. (The global `-y/--yes` works too.)
+        #[arg(long = "act")]
+        act: bool,
+    },
     /// Show recent action history (the receipts ledger)
     Receipt {
         /// Number of recent entries to show (default: 20)
@@ -342,6 +355,12 @@ fn main() -> Result<()> {
             min_size_mb,
             fresh,
         }) => commands::hunt::run(top, min_size_mb, fresh, &ctx),
+        Some(Commands::Classify { path, act }) => {
+            // Act on the safe action when EITHER the local `--act` or the global
+            // `-y/--yes` is set, so both `classify <p> --yes` and `classify <p>
+            // --act` execute (suggest-only otherwise).
+            commands::classify::run(path.as_deref(), act || ctx.yes, &ctx)
+        }
         Some(Commands::Receipt { last }) => commands::receipt::run(last, &ctx),
         Some(Commands::Explain { path }) => commands::explain::run(&path, &ctx),
         Some(Commands::Doctor { need }) => commands::doctor::run(need, grant_ref, &ctx),

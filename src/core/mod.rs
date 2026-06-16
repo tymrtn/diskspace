@@ -1,10 +1,12 @@
 pub mod airlock_store;
 pub mod bundle;
 pub mod candidate;
+pub mod classify;
 pub mod fsutil;
 pub mod grant;
 pub mod history;
 pub mod metrics;
+pub mod repack;
 pub mod rules;
 pub mod scanner;
 pub mod series;

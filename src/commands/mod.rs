@@ -2,6 +2,7 @@ pub mod agent_surface;
 pub mod airlock;
 pub mod apply;
 pub mod check;
+pub mod classify;
 pub mod detect;
 pub mod doctor;
 pub mod explain;
