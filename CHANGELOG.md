@@ -4,6 +4,24 @@ All notable changes to `diskspace` are recorded here. Dates are `YYYY-MM-DD`.
 
 ## [Unreleased]
 
+### Changed (agent-facing — `detect --json` schema)
+
+- **`diskspace detect --json` now emits an OBJECT envelope, not a bare array.**
+  The root is `{"meta": {...}, "candidates": [...]}` where `meta` carries
+  `schema_version` (currently `2`), `immediate_threshold`, and the FULL-set
+  `total_reclaimable_bytes` / `total_candidates`. The pre-P2 form was a bare
+  JSON array of candidates. **Migration:** a consumer that did `jq '.[]'` or
+  deserialized the root as `Vec<Candidate>` must switch to `jq '.candidates[]'`
+  (or read `.meta` first and branch on `meta.schema_version`). The PER-CANDIDATE
+  keys remain additive — every legacy candidate field is untouched, and each
+  candidate gains `recommended_command` and `recovery_class`.
+- **`recommended_command` (in both `detect --json` and `explain --json`) now
+  honors a candidate's EFFECTIVE confidence.** A recency-touched regenerable
+  candidate whose confidence was decayed below the 0.85 immediate threshold is
+  recommended via the reversible airlock, never `--immediate` — so the
+  serialized `confidence` and `recommended_command` can no longer contradict
+  each other.
+
 ### Added
 
 - **`diskspace grant keygen | issue | show`** — ed25519-signed capability tokens

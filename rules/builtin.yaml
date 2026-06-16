@@ -39,6 +39,11 @@
   base_confidence: 0.68
   reason: "Simulator device images — recreatable in Xcode"
   exclude_if_recent_access_days: 14
+  consequences:
+    recovery: recreate
+    rebuild_seconds: 120
+    impact: "Simulator devices are removed; Xcode recreates them on next use (no source data lost)"
+    recovery_cmd: "xcrun simctl create or recreate devices in Xcode > Settings > Platforms"
 
 - id: xcode-simulator-runtimes
   category: app-cache
@@ -205,6 +210,11 @@
   base_confidence: 0.85
   reason: "Nuxt.js build cache — rebuilt automatically"
   exclude_if_recent_access_days: 5
+  consequences:
+    recovery: rebuild
+    rebuild_seconds: 60
+    impact: "Next dev/build run regenerates the .nuxt cache (no source data lost)"
+    recovery_cmd: "npm run dev  # or: nuxt build"
 
 
 - id: turbo-cache
@@ -571,6 +581,11 @@
   base_confidence: 0.75
   reason: "Android emulator virtual devices — recreate in Android Studio"
   exclude_if_recent_access_days: 14
+  consequences:
+    recovery: recreate
+    rebuild_seconds: 300
+    impact: "Emulator AVDs are removed; recreate them in Android Studio's Device Manager (no app source lost)"
+    recovery_cmd: "avdmanager create avd  # or use Android Studio > Device Manager"
 
 - id: ios-simulator-logs
   category: vm-disk

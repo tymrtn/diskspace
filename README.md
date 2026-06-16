@@ -177,8 +177,10 @@ diskspace profile set domains.ios_development.active=false
 
 Every command supports `--json` output and `--yes` to skip confirmations. **The same binary humans use is what agents use** — no special mode. First-run wizard auto-skips in non-TTY contexts.
 
+`detect --json` returns an object envelope — `{"meta": {...}, "candidates": [...]}` — where `meta` carries `schema_version`, `immediate_threshold`, and the full-set `total_reclaimable_bytes`/`total_candidates`. Iterate `.candidates[]` (each candidate adds `recommended_command` + `recovery_class`); the bare-array form from earlier builds is gone (see the CHANGELOG schema note).
+
 ```bash
-# scan and get top candidates as JSON
+# scan and get top candidates as JSON (iterate .candidates[])
 diskspace scan && diskspace detect --json --top 10
 
 # pressure-test the top candidate
