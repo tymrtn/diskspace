@@ -81,7 +81,15 @@ pub fn enrich_candidate(c: &mut Candidate, rule: &Rule, prof: &Profile) {
         .as_ref()
         .map(|cons| contract_from_consequences(cons, &rule.id, rule.reference_url.as_deref()));
 
-    c.metrics = metrics::compute_metrics(&c.path, prof).ok();
+    // Attach metrics ONLY when there's an actual measurement signal. When no series
+    // exists yet, `compute_metrics` returns an all-`None` `Metrics` with
+    // `metric_confidence: 0.0` — emitting that would mislead an agent into reading a
+    // hard 0% as "measured and nil" rather than "no data". Dropping it to `None`
+    // (the field is `skip_serializing_if = "Option::is_none"`) makes the JSON OMIT
+    // `metrics` entirely, the honest "metrics_available: false" signal.
+    c.metrics = metrics::compute_metrics(&c.path, prof)
+        .ok()
+        .filter(|m| !m.has_no_signal());
     c.reference_url = Some(url);
 }
 
@@ -219,6 +227,54 @@ mod tests {
         // metrics is best-effort: Option, may be Some(default) or None — but the
         // call must not panic and must leave the field a valid Option.
         let _ = c.metrics; // presence is environment-dependent; no assertion on value
+    }
+
+    #[test]
+    fn enrich_emits_no_metrics_when_series_has_no_signal() {
+        // With NO series data for the path, enrichment must leave `metrics` as
+        // `None` (so the JSON OMITS it) rather than attaching a misleading all-None
+        // `Metrics` with `metric_confidence: 0.0`. This guards audit #9.
+        let prof = Profile::default();
+        // A path that has certainly never been observed in any series.
+        let mut c = candidate(
+            "/tmp/diskspace-no-series-ever-3f9a2c/never",
+            Some(cons("redownload")),
+        );
+        let rule = rule_with("rule", None, Some(cons("redownload")));
+
+        enrich_candidate(&mut c, &rule, &prof);
+
+        // The metrics field is omitted on serialize (skip_serializing_if = is_none),
+        // so the agent reads no `metrics` key — the honest "no data yet" signal.
+        let v = serde_json::to_value(&c).unwrap();
+        assert!(
+            v.get("metrics").is_none(),
+            "an all-None metrics (no series) must be DROPPED, not emitted as metric_confidence:0.0"
+        );
+    }
+
+    #[test]
+    fn metrics_has_no_signal_detects_empty_vs_populated() {
+        use crate::core::metrics::Metrics;
+        // Default = the all-None shape `compute_metrics` returns with no series.
+        assert!(
+            Metrics::default().has_no_signal(),
+            "the default (all-None, 0.0 confidence) carries no signal"
+        );
+        // Any single populated field flips it.
+        let m = Metrics {
+            staleness_days: Some(3),
+            ..Default::default()
+        };
+        assert!(!m.has_no_signal(), "a populated field is a real signal");
+        let m2 = Metrics {
+            metric_confidence: 0.6,
+            ..Default::default()
+        };
+        assert!(
+            !m2.has_no_signal(),
+            "a positive confidence means contributing samples exist"
+        );
     }
 
     #[test]

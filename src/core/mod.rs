@@ -2,6 +2,7 @@ pub mod airlock_store;
 pub mod bundle;
 pub mod candidate;
 pub mod classify;
+pub mod cloud;
 pub mod fsutil;
 pub mod grant;
 pub mod history;

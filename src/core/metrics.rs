@@ -174,6 +174,25 @@ pub struct Metrics {
     pub metric_confidence: f32,
 }
 
+impl Metrics {
+    /// `true` when NO measurement signal exists yet: every optional field is `None`
+    /// AND there are no contributing samples (`metric_confidence == 0.0`).
+    ///
+    /// This distinguishes "we have a series and it computed 0% confidence" (which
+    /// never happens — any contributing sample yields a positive weight) from "there
+    /// is no series for this path at all". Callers (agent-surface) use it to emit
+    /// NO `metrics` object rather than a misleading `metric_confidence: 0.0`, so an
+    /// agent reading the JSON sees the field is absent (no data) instead of reading a
+    /// hard zero as "measured, and it's nil".
+    pub fn has_no_signal(&self) -> bool {
+        self.burn_rate_bytes_per_day.is_none()
+            && self.days_to_full.is_none()
+            && self.regrowth_slope_bytes_per_day.is_none()
+            && self.staleness_days.is_none()
+            && self.metric_confidence == 0.0
+    }
+}
+
 /// Compute advisory metrics for `path`. **Pure**: reads `df_series`, `series`,
 /// and `history` only; performs no writes and makes no actuation decision.
 ///

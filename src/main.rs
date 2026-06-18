@@ -129,6 +129,22 @@ enum Commands {
         #[arg(long = "act")]
         act: bool,
     },
+    /// Offload cloud-synced data to free LOCAL space WITHOUT deleting it (reversible).
+    /// `stow <path>` detects the cloud provider and the safe offload mechanism: iCloud
+    /// → `brctl evict` (with --yes); classic Dropbox → advise the Finder online-only
+    /// steps (or `maestral excluded add` when Maestral is the active client).
+    /// No path → list the cloud-offload candidates + total reclaimable GB (read-only).
+    Stow {
+        /// Path to offload (~ expands to $HOME). Omit to list cloud-offload
+        /// candidates from the scan cache with the total reclaimable-without-deleting
+        /// GB (read-only).
+        path: Option<String>,
+        /// Actually perform the offload (iCloud `brctl evict` / Maestral `excluded
+        /// add`). Without it, stow only SUGGESTS the command. (The global `-y/--yes`
+        /// works too.) NEVER deletes a local file in ~/Dropbox.
+        #[arg(long = "act")]
+        act: bool,
+    },
     /// Show recent action history (the receipts ledger)
     Receipt {
         /// Number of recent entries to show (default: 20)
@@ -360,6 +376,11 @@ fn main() -> Result<()> {
             // `-y/--yes` is set, so both `classify <p> --yes` and `classify <p>
             // --act` execute (suggest-only otherwise).
             commands::classify::run(path.as_deref(), act || ctx.yes, &ctx)
+        }
+        Some(Commands::Stow { path, act }) => {
+            // Offload (brctl evict / maestral excluded) runs only when EITHER the
+            // local `--act` or the global `-y/--yes` is set; suggest-only otherwise.
+            commands::stow::run(path.as_deref(), act || ctx.yes, &ctx)
         }
         Some(Commands::Receipt { last }) => commands::receipt::run(last, &ctx),
         Some(Commands::Explain { path }) => commands::explain::run(&path, &ctx),

@@ -9,8 +9,9 @@
 //!   * [`Strategy::Repack`] → the in-place `git gc` safe action (loss-free).
 //!   * [`Strategy::Reclaim`] → the EXISTING reversible airlock, by path, behind the
 //!     SAME hard pressure-test gate every reclaim path uses.
-//!   * [`Strategy::Offload`] → RECOMMEND `diskspace stow <path>` (stow lands in the
-//!     next pass) — we print the command, we do NOT offload.
+//!   * [`Strategy::Offload`] → RECOMMEND `diskspace stow <path>` (the cloud-offload
+//!     command) — `classify` prints the command, it does NOT offload; `stow` owns the
+//!     provider-specific, reversible offload policy.
 //!   * [`Strategy::Review`] / [`Strategy::Keep`] → never act; inspect-first guidance.
 //!
 //! Two forms:
@@ -295,13 +296,23 @@ fn act_reclaim(
     Ok(())
 }
 
-/// Offload: stow lands in the NEXT pass. We RECOMMEND the command, we do NOT claim
-/// to offload. Honest accounting — nothing is moved here.
+/// Offload: hand off to `stow`, the cloud-OFFLOAD command. `classify` itself never
+/// offloads — offloading is provider-specific (iCloud evict vs. Dropbox Finder
+/// advice) and `stow` owns that policy. We RECOMMEND the real `diskspace stow`
+/// command (the next step), honest that the bytes are moved to the cloud (reversible),
+/// not deleted. Nothing is moved here.
 fn act_offload_suggest(path: &Path, c: &Classification, ctx: &Context) -> Result<()> {
     if ctx.json {
         println!(
             "{}",
-            classification_json(path, c, "suggest", Some("stow is not yet available"))
+            classification_json(
+                path,
+                c,
+                "suggest",
+                Some(
+                    "offload is reversible (data stays in the cloud) — run `diskspace stow <path>`"
+                )
+            )
         );
         return Ok(());
     }
@@ -316,7 +327,7 @@ fn act_offload_suggest(path: &Path, c: &Classification, ctx: &Context) -> Result
     println!(
         "     {}",
         ctx.style(
-            "(stow — cloud offload — lands in the next release; nothing offloaded yet)",
+            "(stow offloads cloud-synced data to free local space — reversible, never a deletion)",
             &dim
         )
     );

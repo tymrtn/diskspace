@@ -19,6 +19,10 @@ pub enum ActionKind {
     Purge,
     Restore,
     Doctor,
+    /// `stow` offloaded a cloud-synced path's LOCAL copy to the cloud (iCloud
+    /// `brctl evict` or Maestral `excluded add`). The bytes are freed locally but
+    /// the data remains in the cloud — fully reversible, NOT a deletion.
+    Offload,
 }
 
 impl std::fmt::Display for ActionKind {
@@ -29,6 +33,7 @@ impl std::fmt::Display for ActionKind {
             ActionKind::Purge => write!(f, "purge"),
             ActionKind::Restore => write!(f, "restore"),
             ActionKind::Doctor => write!(f, "doctor"),
+            ActionKind::Offload => write!(f, "offload"),
         }
     }
 }

@@ -18,6 +18,7 @@ pub mod restore;
 pub mod scan;
 pub mod selfcheck;
 pub mod status;
+pub mod stow;
 pub mod undo;
 pub mod watch;
 pub mod welcome;

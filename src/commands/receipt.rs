@@ -65,7 +65,9 @@ pub fn run(last: usize, ctx: &Context) -> Result<()> {
         let cmd_style = match e.command {
             history::ActionKind::Reclaim | history::ActionKind::Purge => &red,
             history::ActionKind::Airlock => &yellow,
-            history::ActionKind::Restore => &green,
+            // Offload is reversible (the data stays in the cloud) — render it green
+            // like Restore, not red like a deletion.
+            history::ActionKind::Restore | history::ActionKind::Offload => &green,
             history::ActionKind::Doctor => &yellow,
         };
 

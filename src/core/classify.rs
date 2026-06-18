@@ -586,12 +586,63 @@ fn profile_never_touch(path: &Path, profile: &Profile) -> bool {
     })
 }
 
-/// Directory on-disk byte total (own files plus descendants). Reuses the airlock
-/// store's recursive `dir_size`. Only called by [`classify_dir`]; the hunt path
-/// supplies its already-computed size via [`classify_with_size`], so this is NOT
-/// on the hot path.
+/// Directory ON-DISK byte total (own files plus descendants), counted by ALLOCATED
+/// blocks (`blocks * 512`), not logical length.
+///
+/// This is the source of the `est_savings` that flows into a [`Classification`].
+/// It MUST use real on-disk allocation, because the headline VmDisk case is a
+/// SPARSE image: OrbStack's `data.img` reports a logical `len()` of ~1.8 TB while
+/// occupying only tens of GB of real blocks. Sizing it by `len()` (the old
+/// `airlock_store::dir_size`) produced an absurd ~1853 GB `est savings`. Counting
+/// allocated blocks — exactly what the scanner's `file_on_disk_bytes` does — gives
+/// the honest reclaimable figure. The cloud-placeholder rule
+/// (`len > 4096 && blocks == 0` ⇒ 0) is mirrored so an online-only file never
+/// inflates the estimate either.
+///
+/// Only called by [`classify_dir`]; the hunt path supplies its already-computed
+/// (already on-disk) size via [`classify_with_size`], so this is NOT on the hot
+/// path. Non-recursive into symlinks; bounded only by tree size, like the scanner.
 fn dir_size_on_disk(path: &Path) -> u64 {
-    crate::core::airlock_store::dir_size(path)
+    let md = match std::fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(_) => return 0,
+    };
+    if md.file_type().is_symlink() {
+        return 0;
+    }
+    if md.is_file() {
+        return file_on_disk_bytes(&md);
+    }
+    if !md.is_dir() {
+        return 0;
+    }
+    let mut total = 0u64;
+    if let Ok(entries) = std::fs::read_dir(path) {
+        for entry in entries.flatten() {
+            total = total.saturating_add(dir_size_on_disk(&entry.path()));
+        }
+    }
+    total
+}
+
+/// On-disk bytes for a single file: `blocks * 512` on unix (matching the scanner's
+/// `file_on_disk_bytes` and the airlock pressure-test), with the cloud-placeholder
+/// rule applied (`len > 4096 && blocks == 0` ⇒ an online-only placeholder occupies
+/// no local space). On non-unix (no block count) we fall back to logical `len()`.
+fn file_on_disk_bytes(md: &std::fs::Metadata) -> u64 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        // Online-only cloud placeholder: reports size but allocates no blocks.
+        if md.len() > 4096 && md.blocks() == 0 {
+            return 0;
+        }
+        md.blocks() * 512
+    }
+    #[cfg(not(unix))]
+    {
+        md.len()
+    }
 }
 
 #[cfg(test)]
@@ -682,6 +733,47 @@ mod tests {
         let c = classify_dir(&b, &prof());
         assert_eq!(c.signature, Signature::VmDisk);
         assert_eq!(c.strategy, Strategy::Reclaim);
+    }
+
+    /// Pass-4 follow-up regression: a SPARSE VM disk image (OrbStack's `data.img`)
+    /// reports a huge LOGICAL `len()` but allocates only a few real blocks. The
+    /// `est_savings` must track ON-DISK allocation (`blocks*512`), never the logical
+    /// length — sizing by `len()` is what produced the absurd ~1853 GB estimate.
+    #[cfg(unix)]
+    #[test]
+    fn vmdisk_est_savings_uses_on_disk_blocks_not_logical_len() {
+        use std::os::unix::fs::MetadataExt;
+        let t = TempTree::new("sparse-vmdisk");
+        let data = t.dir("Group Containers/HUAQ24HBR6.dev.orbstack/data");
+        // Create a sparse file: seek far out and write ONE byte. Logical len is huge
+        // (~8 GiB); allocated blocks are tiny.
+        let img = data.join("data.img");
+        {
+            use std::io::{Seek, SeekFrom, Write};
+            let mut f = fs::File::create(&img).unwrap();
+            f.seek(SeekFrom::Start(8 * 1024 * 1024 * 1024)).unwrap();
+            f.write_all(&[0u8]).unwrap();
+            f.flush().unwrap();
+        }
+        let md = fs::metadata(&img).unwrap();
+        let logical = md.len();
+        let on_disk = md.blocks() * 512;
+        // Only meaningful if the filesystem actually made the file sparse.
+        if on_disk < logical {
+            let c = classify_dir(&data, &prof());
+            assert_eq!(c.signature, Signature::VmDisk);
+            let est = c.est_savings_bytes.expect("vm-disk has an est savings");
+            assert!(
+                est < logical,
+                "est_savings ({est}) must reflect on-disk blocks, not the {logical}-byte logical len"
+            );
+            // It should be in the neighborhood of the real allocation, not the
+            // multi-GB logical size: allow slack for dir entries / fs rounding.
+            assert!(
+                est <= on_disk + 4096,
+                "est_savings ({est}) tracks on-disk allocation ({on_disk}), not logical len ({logical})"
+            );
+        }
     }
 
     #[test]

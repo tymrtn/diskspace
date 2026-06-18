@@ -131,6 +131,27 @@ pub fn analyze_unruled(
     Ok(chosen)
 }
 
+/// Advisory analysis for `stow`: cache-ONLY and staleness-TOLERANT — it NEVER falls
+/// back to a live walk. A stale long-tail picture is perfectly fine for offload
+/// advice, and far better than blocking for minutes on a full `$HOME` walk (which is
+/// what `analyze_unruled` does on a stale cache). Returns `None` only when there is
+/// no usable cache at all (missing / parse error / legacy without `largest_dirs`),
+/// so the caller can advise running `diskspace scan` instead of hanging.
+pub fn analyze_unruled_cached(top: usize, min_size_mb: u64) -> Option<Vec<HuntCandidate>> {
+    let cache = scan_cache_path();
+    let content = std::fs::read_to_string(&cache).ok()?;
+    let scan: ScanResult = serde_json::from_str(&content).ok()?;
+    if scan.largest_dirs.is_empty() {
+        return None; // legacy cache — nothing to subtract against
+    }
+    let home = dirs_home();
+    let min_size = min_size_mb * 1024 * 1024;
+    let mut chosen = hunt_from_cache(&scan, &home, min_size, top);
+    let prof = profile::load().unwrap_or_default();
+    tag_classifications(&mut chosen, &prof);
+    Some(chosen)
+}
+
 /// Load `scan.json` only if it exists, parses, and is fresh enough. Returns `None`
 /// (triggering the live-walk fallback) on any of: missing file, parse error, an
 /// empty `largest_dirs` (a legacy cache from before Step A — it carries no
