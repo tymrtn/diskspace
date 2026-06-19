@@ -161,6 +161,12 @@ enum Commands {
         /// Free at least this much (e.g. 20G, 500M). Defaults to pressure threshold + 1 GB.
         #[arg(long)]
         need: Option<String>,
+        /// Minimum free % to ACUTE-stabilize the disk to when it is critically full
+        /// (e.g. 3 = 3%). Overrides the built-in default. The acute phase uses only
+        /// zero-data-loss regenerable reclaims from the existing scan cache and stops
+        /// the instant this floor is reached.
+        #[arg(long)]
+        min_free: Option<f64>,
     },
     /// Build a content-addressed recovery plan WITHOUT executing it (TOCTOU-safe phase 1)
     Plan {
@@ -384,7 +390,9 @@ fn main() -> Result<()> {
         }
         Some(Commands::Receipt { last }) => commands::receipt::run(last, &ctx),
         Some(Commands::Explain { path }) => commands::explain::run(&path, &ctx),
-        Some(Commands::Doctor { need }) => commands::doctor::run(need, grant_ref, &ctx),
+        Some(Commands::Doctor { need, min_free }) => {
+            commands::doctor::run(need, min_free, grant_ref, &ctx)
+        }
         Some(Commands::Plan { need, mode }) => commands::plan::run(&need, &mode, &ctx),
         Some(Commands::Apply { plan_hash }) => commands::apply::run(&plan_hash, grant_ref, &ctx),
         Some(Commands::Guard { exec, need }) => {
