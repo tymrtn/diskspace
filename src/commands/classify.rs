@@ -407,7 +407,7 @@ fn classify_top(ctx: &Context) -> Result<()> {
         println!(
             "  {}",
             ctx.style(
-                "Nothing large and unruled to classify. Run `diskspace scan` first if you expected results.",
+                "Nothing large and unruled to classify. Run `diskspace survey` first if you expected results.",
                 &dim,
             )
         );

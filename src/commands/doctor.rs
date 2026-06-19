@@ -275,7 +275,7 @@ pub fn run(
             );
         } else {
             println!(
-                "\n  {}  No candidates passed pressure tests. Nothing safe to recover automatically.\n  Run `diskspace hunt` to see what large dirs exist outside any rule.\n",
+                "\n  {}  No candidates passed pressure tests. Nothing safe to recover automatically.\n  Run `diskspace scan` to see what large dirs exist outside any rule.\n",
                 ctx.style("○", &Style::new().dim()),
             );
         }
@@ -698,12 +698,12 @@ fn acute_stabilize(
         None => {
             if ctx.json {
                 println!(
-                    r#"{{"phase":"acute","status":"no_cache","free_before":{},"free_target":{},"hint":"run `diskspace scan` once the disk is safe, then `diskspace doctor`"}}"#,
+                    r#"{{"phase":"acute","status":"no_cache","free_before":{},"free_target":{},"hint":"run `diskspace survey` once the disk is safe, then `diskspace doctor`"}}"#,
                     free, target
                 );
             } else {
                 println!(
-                    "  {}  No usable scan cache to stabilize from. Once you have freed even a little\n      space manually, run `diskspace scan` then `diskspace doctor`.\n",
+                    "  {}  No usable survey cache to stabilize from. Once you have freed even a little\n      space manually, run `diskspace survey` then `diskspace doctor`.\n",
                     ctx.style("○", &Style::new().dim()),
                 );
             }
@@ -1118,7 +1118,7 @@ fn render_unmet_acute_handoff(
             "rescan_skipped": true,
             "next": [
                 "free a little more space by hand",
-                "diskspace scan",
+                "diskspace survey",
                 "diskspace doctor --need <size>",
             ],
         });
@@ -1165,7 +1165,7 @@ fn render_unmet_acute_handoff(
     println!(
         "  {} {}   {}",
         ctx.style("·", &dim),
-        ctx.style("diskspace scan", &cyan),
+        ctx.style("diskspace survey", &cyan),
         ctx.style("refresh the cache (needs a little free space)", &dim),
     );
     println!(
@@ -1272,7 +1272,7 @@ fn render_acute_result(
         );
     } else {
         println!(
-            "  {}  Freed {} ({} → {}) but did not reach the {} target — the safe,\n      cache-known reclaims are exhausted. Free a little more by hand, then\n      `diskspace scan` and `diskspace doctor`.",
+            "  {}  Freed {} ({} → {}) but did not reach the {} target — the safe,\n      cache-known reclaims are exhausted. Free a little more by hand, then\n      `diskspace survey` and `diskspace doctor`.",
             ctx.style("⚠", &yellow),
             ctx.style(&output::format_bytes(freed), &bold),
             ctx.style(&output::format_bytes(free_before), &dim),

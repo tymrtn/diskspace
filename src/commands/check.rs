@@ -343,8 +343,8 @@ fn recency_check(path: &Path) -> CheckStep {
 
 fn bail_no_scan(ctx: &Context) {
     if ctx.json {
-        eprintln!(r#"{{"error":"no scan found","hint":"run diskspace scan first"}}"#);
+        eprintln!(r#"{{"error":"no scan found","hint":"run diskspace survey first"}}"#);
     } else {
-        eprintln!("  No scan found. Run `diskspace scan` first.");
+        eprintln!("  No survey found. Run `diskspace survey` first.");
     }
 }

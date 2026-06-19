@@ -45,27 +45,29 @@ Or download the universal Mac binary from the [latest release](https://github.co
 
 ```bash
 diskspace                         # crew briefing on first run, then welcome
-diskspace scan                    # survey your cargo hold
+diskspace survey                  # survey your cargo hold (the broad categorized walk)
 diskspace detect                  # rank candidates by yield × confidence
-diskspace explain <path>          # rule match + consequences + recommended command
+diskspace inspect <path>          # rule match + consequences + recommended command (was `explain`)
 diskspace check <id>              # pressure-test before venting
 diskspace airlock <id>            # stage cargo for safe disposal (reversible)
 diskspace restore <id>            # bring it back
 diskspace undo                    # reverse the last reversible action
 diskspace receipt                 # show the actions ledger
 diskspace doctor --need 20G       # emergency one-shot recovery
-diskspace hunt                    # find big directories no rule covers
+diskspace scan                    # sweep for big directories no rule covers (was `hunt`)
 diskspace reclaim                 # jettison high-confidence weight NOW (no airlock)
 diskspace purge                   # permanently delete airlock contents
 diskspace status                  # show what's in the airlock
 diskspace watch install           # background disk-pressure monitor (see below)
 ```
 
+> **Command rename (this release):** `scan` now means the long-tail sweep for big uncharted directories (formerly `hunt`); the broad categorized walk of `$HOME` is now `survey`. `inspect` replaces `explain`. The old names `hunt` and `explain` still work as aliases.
+
 ## How it works
 
-### 1. Scan
+### 1. Survey
 
-`diskspace scan` walks your filesystem in parallel, annotates entries by category, and caches the result. iCloud Drive evicted files and Dropbox Smart Sync online-only files are skipped — only locally-stored bytes count. Sparse files (VM disks like OrbStack's `data.img`) report actual on-disk allocation, not logical size.
+`diskspace survey` walks your filesystem in parallel, annotates entries by category, and caches the result. iCloud Drive evicted files and Dropbox Smart Sync online-only files are skipped — only locally-stored bytes count. Sparse files (VM disks like OrbStack's `data.img`) report actual on-disk allocation, not logical size.
 
 Categories: `dev-artifact`, `app-cache`, `download-entropy`, `vm-disk`.
 
@@ -80,9 +82,9 @@ Categories: `dev-artifact`, `app-cache`, `download-entropy`, `vm-disk`.
 | `download-entropy` | old DMGs, unzipped installers, files untouched > 12 months, `~/Downloads` screenshots |
 | `vm-disk` | Parallels `.pvm`, Android AVDs |
 
-### 3. Explain
+### 3. Inspect
 
-`diskspace explain <path>` is the trust front-door. Given any path, it shows:
+`diskspace inspect <path>` (was `explain`) is the trust front-door. Given any path, it shows:
 
 - The matching rule (or "no rule matches")
 - The consequences block: how recovery works, what you lose if you delete, the recovery command if any
@@ -180,8 +182,8 @@ Every command supports `--json` output and `--yes` to skip confirmations. **The 
 `detect --json` returns an object envelope — `{"meta": {...}, "candidates": [...]}` — where `meta` carries `schema_version`, `immediate_threshold`, and the full-set `total_reclaimable_bytes`/`total_candidates`. Iterate `.candidates[]` (each candidate adds `recommended_command` + `recovery_class`); the bare-array form from earlier builds is gone (see the CHANGELOG schema note).
 
 ```bash
-# scan and get top candidates as JSON (iterate .candidates[])
-diskspace scan && diskspace detect --json --top 10
+# survey and get top candidates as JSON (iterate .candidates[])
+diskspace survey && diskspace detect --json --top 10
 
 # pressure-test the top candidate
 diskspace check xcode-derived-data-001 --json
@@ -192,8 +194,8 @@ diskspace airlock xcode-derived-data-001 --yes --json
 # or one-shot emergency
 diskspace doctor --need 30G --yes --json
 
-# explain a path
-diskspace explain ~/Library/Caches/Google/Chrome --json
+# inspect a path
+diskspace inspect ~/Library/Caches/Google/Chrome --json
 
 # update profile
 diskspace profile set domains.ios_development.active=false

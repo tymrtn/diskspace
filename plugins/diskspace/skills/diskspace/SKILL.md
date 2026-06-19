@@ -37,7 +37,7 @@ command -v diskspace >/dev/null || cargo install diskspace-cli   # installs the 
 
 ## The agent-facing JSON contract
 
-`detect`, `check`, and `explain` enrich every item with three additive blocks (all back-compat; absent on legacy data). `scan --json` attaches one whole-`$HOME` `metrics` block.
+`detect`, `check`, and `inspect` (alias: `explain`) enrich every item with three additive blocks (all back-compat; absent on legacy data). `survey --json` attaches one whole-`$HOME` `metrics` block.
 
 - **`consequence_contract`** — `{ recovery_class, recovery_cost_seconds, impact, recovery_cmd, reference_url }`
   - `recovery_class` ∈ `auto | redownload | rebuild | recreate | manual | irreversible`
@@ -86,7 +86,7 @@ Read the contract, then decide:
 ## Golden path (headless / agent-safe)
 
 ```bash
-diskspace scan                          # snapshot -> ~/.diskspace/scan.json (+ whole-$HOME metrics in --json)
+diskspace survey                        # snapshot -> ~/.diskspace/scan.json (+ whole-$HOME metrics in --json); was `scan`
 diskspace detect --json --top 10        # ranked candidates w/ consequence_contract + metrics; note ids
 diskspace check <candidate_id> --json   # pressure-test ONE candidate; read its contract before acting
 diskspace airlock <candidate_id> --yes --json   # reversibly stage it (NOT a permanent delete)
@@ -111,7 +111,7 @@ In an **`actuation` build**, `guard` is inherently headless, so it **requires a 
 ### `plan` → hash, then `apply <hash>` — TOCTOU-safe two-phase recovery
 
 ```bash
-diskspace plan --need 20G --json        # SELECTION ONLY: scan→pressure-test→pick. Touches nothing.
+diskspace plan --need 20G --json        # SELECTION ONLY: survey→pressure-test→pick. Touches nothing.
 # → prints plan_hash + "apply_cmd": "diskspace apply <hash>"
 diskspace apply <hash> --json           # RE-VALIDATES live, then acts
 ```
@@ -146,7 +146,7 @@ diskspace grant show --json                              # {present, valid, gran
 diskspace doctor --need 20G --yes --json
 ```
 
-`doctor` runs scan → detect → pressure-test → execute to hit the target (reversible-then-purge when there's headroom, immediate only when critical). `--need` defaults to the pressure threshold + 1 GB. Read JSON `actually_freed`, not the requested target.
+`doctor` runs survey → detect → pressure-test → execute to hit the target (reversible-then-purge when there's headroom, immediate only when critical). `--need` defaults to the pressure threshold + 1 GB. Read JSON `actually_freed`, not the requested target.
 
 ## Decision guide
 
@@ -155,19 +155,19 @@ diskspace doctor --need 20G --yes --json
 | Build died on ENOSPC; want auto-recover + retry | `diskspace guard --exec "<cmd>" --need 20G` |
 | Build died; want a reviewable plan before acting | `diskspace plan --need 20G` → review → `diskspace apply <hash>` |
 | Need space NOW, no review | `diskspace doctor --need 20G --yes --json` |
-| Routine, careful cleanup | `scan` → `detect` → `check <id>` → `airlock <id>` |
-| "Is it safe to delete this path?" | `diskspace explain <path> --json` (rule + consequence_contract + metrics + live test + recommended cmd) |
-| Disk full but nothing matches a rule | `diskspace hunt --top 15` (largest uncovered dirs) |
+| Routine, careful cleanup | `survey` → `detect` → `check <id>` → `airlock <id>` |
+| "Is it safe to delete this path?" | `diskspace inspect <path> --json` (alias: `explain`) (rule + consequence_contract + metrics + live test + recommended cmd) |
+| Disk full but nothing matches a rule | `diskspace scan --top 15` (alias: `hunt`) (sweep for largest uncovered dirs; needs a prior `survey`) |
 | Free the airlock for real | `diskspace purge` (irreversible) |
 
-Note: `check` and `apply` take ids/hashes; `explain` takes a **path**. `airlock <target>` also accepts a raw path.
+Note: `check` and `apply` take ids/hashes; `inspect` (alias: `explain`) takes a **path**. `airlock <target>` also accepts a raw path.
 
 ## Exit codes — react correctly
 
 | Code | Meaning | What to do |
 |------|---------|-----------|
 | `0` | success | proceed; report `actually_freed` from JSON |
-| `1` | no candidates / plan refused (stale, missing, size drift, parse) | nothing safe here, or the plan no longer matches disk — re-`plan`; consider `hunt` |
+| `1` | no candidates / plan refused (stale, missing, size drift, parse) | nothing safe here, or the plan no longer matches disk — re-`plan`; consider `scan` (alias: `hunt`) |
 | `2` | **pressure-test failed (the boundary)**, OR a present-but-invalid grant (`{"error":"invalid_grant"}`) | **STOP.** Path is live/in-use/protected, or `apply` found it now-unsafe, or the grant signature/expiry/schema failed. Do NOT force. Re-issue a valid grant or pick another candidate. |
 | `3` | profile policy blocked, OR grant denied this item (`{"error":"grant_denied"}` on `airlock`/`reclaim`) | path is in `never_touch` / an active domain, or it fell outside the grant's ceiling/floor/budget/scope — respect it; do not override |
 | `4` | **no grant** under `actuation` (`{"error":"no_grant"}`) | a non-interactive `doctor`/`apply` or any `guard` needs a signed grant — issue one with `diskspace grant issue …`, or run interactively for human consent |
@@ -203,4 +203,4 @@ diskspace watch uninstall
 - Don't bypass or retry past a pressure-test failure, and don't `--force` (it doesn't exist).
 - Don't trust `metrics` as authoritative — `metric_confidence < 0.5` means fall back to rule confidence.
 - Don't try to mint a grant on the actor box — `grant keygen`/`issue` need the PRIVATE key, which lives OFF-BOX with the user. The actor only ever VERIFIES (`grant show`). A grant never overrides the pressure-test or `never_touch`; it only narrows what may act.
-- Don't assume a command exists beyond: `scan`, `detect`, `check`, `explain`, `airlock`, `restore`, `purge`, `reclaim`, `hunt`, `receipt`, `doctor`, `guard`, `plan`, `apply`, `grant`, `undo`, `status`, `watch`, `profile`. Run `diskspace --help` if unsure.
+- Don't assume a command exists beyond: `survey` (was `scan`), `detect`, `check`, `inspect` (alias `explain`), `airlock`, `restore`, `purge`, `reclaim`, `scan` (the uncharted-dir sweep, alias `hunt`), `receipt`, `doctor`, `guard`, `plan`, `apply`, `grant`, `undo`, `status`, `watch`, `profile`. Note `scan` now means the uncharted-dir sweep (was `hunt`); the full categorized walk is `survey`. Run `diskspace --help` if unsure.

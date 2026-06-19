@@ -1,6 +1,6 @@
-//! `diskspace explain <path>` — given any path, find the matching rule (or report
-//! none), show consequences, run the pressure test live, and recommend a command.
-//! The trust front-door: users audit before they delete.
+//! `diskspace inspect <path>` (was `explain`) — given any path, find the matching
+//! rule (or report none), show consequences, run the pressure test live, and
+//! recommend a command. The trust front-door: users audit before they delete.
 
 use anyhow::Result;
 use console::Style;
@@ -107,7 +107,7 @@ fn render_human(
     let cyan = Style::new().cyan().bold();
 
     println!();
-    println!("  {}", ctx.style(&output::rule("explain", 60), &dim));
+    println!("  {}", ctx.style(&output::rule("inspect", 60), &dim));
     println!();
     println!(
         "  {}  {}",
@@ -268,7 +268,7 @@ pub fn recommended_command_for(
 ) -> String {
     if !pressure.safe {
         return format!(
-            "Do not delete — pressure test failed. See `diskspace explain {}` for the failing check.",
+            "Do not delete — pressure test failed. See `diskspace inspect {}` for the failing check.",
             path.display()
         );
     }

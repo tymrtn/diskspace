@@ -448,12 +448,12 @@ fn stow_advisor(ctx: &Context) -> Result<()> {
                         "candidates": [],
                         "reclaimable_without_deleting_bytes": 0,
                         "count": 0,
-                        "note": "No scan cache — run `diskspace scan` first, then `diskspace stow`.",
+                        "note": "No survey cache — run `diskspace survey` first, then `diskspace stow`.",
                     })
                 );
             } else {
                 println!(
-                    "\n  No scan cache yet — run `diskspace scan` first, then `diskspace stow`.\n"
+                    "\n  No survey cache yet — run `diskspace survey` first, then `diskspace stow`.\n"
                 );
             }
             return Ok(());
@@ -534,7 +534,7 @@ fn stow_advisor(ctx: &Context) -> Result<()> {
         println!(
             "  {}",
             ctx.style(
-                "No cloud-synced offload candidates found. Run `diskspace scan` first, or your large data is local (try `diskspace classify`).",
+                "No cloud-synced offload candidates found. Run `diskspace survey` first, or your large data is local (try `diskspace classify`).",
                 &dim,
             )
         );

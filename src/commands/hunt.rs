@@ -1,5 +1,7 @@
-//! `diskspace hunt` — surfaces the largest directories that no rule covers.
-//! The long-tail finder. Use this when `detect` looks empty but the disk is full.
+//! `diskspace scan` (was `hunt`) — surfaces the largest directories that no rule
+//! covers. The long-tail sweep for uncharted dirs. Use this when `detect` looks
+//! empty but the disk is full. It reads the `survey` cache (`scan.json`); when
+//! that cache is missing it advises running `diskspace survey` first.
 //!
 //! The fast path reads the existing `scan.json` cache (sub-second) instead of
 //! re-walking $HOME on every invocation (the old behavior — minutes on a large
@@ -136,7 +138,7 @@ pub fn analyze_unruled(
 /// advice, and far better than blocking for minutes on a full `$HOME` walk (which is
 /// what `analyze_unruled` does on a stale cache). Returns `None` only when there is
 /// no usable cache at all (missing / parse error / legacy without `largest_dirs`),
-/// so the caller can advise running `diskspace scan` instead of hanging.
+/// so the caller can advise running `diskspace survey` instead of hanging.
 pub fn analyze_unruled_cached(top: usize, min_size_mb: u64) -> Option<Vec<HuntCandidate>> {
     let cache = scan_cache_path();
     let content = std::fs::read_to_string(&cache).ok()?;
@@ -404,7 +406,7 @@ fn hunt_fresh_walk(
                 .unwrap(),
         );
         pb.set_message(format!(
-            "Hunting in {} (no fresh scan cache)…",
+            "Sweeping {} live (no fresh cache — run `diskspace survey` first for a sub-second scan)…",
             home.display()
         ));
         pb.enable_steady_tick(Duration::from_millis(80));
@@ -539,7 +541,7 @@ fn render(
     println!();
     println!(
         "  {}",
-        ctx.style(&output::rule("hunt  ·  unrule'd large dirs", 60), &dim)
+        ctx.style(&output::rule("scan  ·  unrule'd large dirs", 60), &dim)
     );
     println!();
 

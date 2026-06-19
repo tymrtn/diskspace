@@ -18,9 +18,9 @@ pub fn run(show_all: bool, top: usize, ctx: &Context) -> Result<()> {
     let cache = scan_cache_path();
     if !cache.exists() {
         if ctx.json {
-            eprintln!(r#"{{"error":"no scan found","hint":"run diskspace scan first"}}"#);
+            eprintln!(r#"{{"error":"no scan found","hint":"run diskspace survey first"}}"#);
         } else {
-            eprintln!("  No scan found. Run `diskspace scan` first.");
+            eprintln!("  No survey found. Run `diskspace survey` first.");
         }
         std::process::exit(1);
     }

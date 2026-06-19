@@ -30,9 +30,9 @@ pub fn run(
     let cache = scan_cache_path();
     if !cache.exists() {
         if ctx.json {
-            eprintln!(r#"{{"error":"no scan found","hint":"run diskspace scan first"}}"#);
+            eprintln!(r#"{{"error":"no scan found","hint":"run diskspace survey first"}}"#);
         } else {
-            eprintln!("\n  No scan found. Run `diskspace scan` first.\n");
+            eprintln!("\n  No survey found. Run `diskspace survey` first.\n");
         }
         std::process::exit(1);
     }

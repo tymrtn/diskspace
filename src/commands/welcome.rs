@@ -114,7 +114,7 @@ pub fn run(ctx: &Context) -> Result<()> {
         check(scan_exists),
         match &scan_age {
             Some(age) => ctx.style(age, &bold),
-            None => ctx.style("not run    →  diskspace scan", &dim),
+            None => ctx.style("not run    →  diskspace survey", &dim),
         }
     );
     println!();
@@ -124,11 +124,18 @@ pub fn run(ctx: &Context) -> Result<()> {
     println!();
 
     let steps: &[(&str, &str)] = &[
-        ("diskspace scan", "survey your cargo hold"),
+        (
+            "diskspace survey",
+            "survey your cargo hold (the broad categorized walk)",
+        ),
         ("diskspace detect", "find dead weight, ranked by yield"),
         ("diskspace check <id>", "pressure-test before venting"),
         ("diskspace airlock <id>", "stage cargo for safe disposal"),
         ("diskspace reclaim", "jettison high-confidence weight NOW"),
+        (
+            "diskspace scan",
+            "sweep for the largest uncharted dirs (was `hunt`)",
+        ),
     ];
 
     for (cmd, desc) in steps {
@@ -139,6 +146,17 @@ pub fn run(ctx: &Context) -> Result<()> {
         );
     }
 
+    println!();
+    // Transition hint: `scan` changed meaning this release. The full categorized
+    // walk of $HOME is now `survey`; `scan` sweeps for the large uncharted dirs no
+    // rule covers (the command formerly called `hunt`).
+    println!(
+        "  {}",
+        ctx.style(
+            "Note: the full categorized walk is now `diskspace survey`; `diskspace scan` sweeps for uncharted dirs.",
+            &dim
+        )
+    );
     println!();
     println!("  {}", ctx.style(&output::rule("", 54), &dim));
     println!();

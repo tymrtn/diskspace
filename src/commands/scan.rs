@@ -35,7 +35,7 @@ pub fn run(path: Option<PathBuf>, ctx: &Context) -> Result<()> {
                 .template("{spinner:.cyan} {msg}")
                 .unwrap(),
         );
-        pb.set_message(format!("Scanning {}…", root.display()));
+        pb.set_message(format!("Surveying {}…", root.display()));
         pb.enable_steady_tick(Duration::from_millis(80));
         Some(pb)
     } else {
@@ -75,7 +75,7 @@ pub fn run(path: Option<PathBuf>, ctx: &Context) -> Result<()> {
     let scanned_at = result.scanned_at.format("%H:%M:%S").to_string();
 
     println!();
-    let (top, bot) = output::box_line(&format!("scan  ·  {}  ·  {}", total, root.display()), 60);
+    let (top, bot) = output::box_line(&format!("survey  ·  {}  ·  {}", total, root.display()), 60);
     println!("  {}", ctx.style(&top, &dim));
     println!();
 
@@ -123,7 +123,7 @@ pub fn run(path: Option<PathBuf>, ctx: &Context) -> Result<()> {
     println!(
         "  {} {}    {}",
         ctx.style("✓", &Style::new().green().bold()),
-        ctx.style(&format!("scan complete  ·  {}", scanned_at), &dim),
+        ctx.style(&format!("survey complete  ·  {}", scanned_at), &dim),
         ctx.style("run diskspace detect →", &cyan),
     );
     println!();

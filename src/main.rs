@@ -11,7 +11,7 @@ use std::path::PathBuf;
 #[command(name = "diskspace")]
 #[command(about = "Find and safely reclaim your disk's lowest-hanging fruit")]
 #[command(version)]
-#[command(after_help = "Run without arguments to get started, or try `diskspace scan` to begin.")]
+#[command(after_help = "Run without arguments to get started, or try `diskspace survey` to begin.")]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
@@ -47,9 +47,9 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Scan a directory and annotate what's there
-    Scan {
-        /// Path to scan (default: $HOME)
+    /// Survey a directory and annotate what's there (the broad categorized walk)
+    Survey {
+        /// Path to survey (default: $HOME)
         path: Option<PathBuf>,
     },
     /// Detect cleanup candidates ranked by yield × confidence
@@ -103,8 +103,10 @@ enum Commands {
         #[arg(long)]
         unsafe_confidence: bool,
     },
-    /// Hunt for the largest directories that no rule covers — find the long tail
-    Hunt {
+    /// Scan for the largest directories that no rule covers — sweep the long tail
+    /// of uncharted dirs. (Was `hunt`; `hunt` still works as an alias.)
+    #[command(visible_alias = "hunt")]
+    Scan {
         /// Max results to show (default: 15)
         #[arg(long, default_value = "15")]
         top: usize,
@@ -151,8 +153,10 @@ enum Commands {
         #[arg(long, default_value = "20")]
         last: usize,
     },
-    /// Explain a path: matching rule, consequences, live pressure-test, recommended command
-    Explain {
+    /// Inspect a path: matching rule, consequences, live pressure-test, recommended command.
+    /// (Was `explain`; `explain` still works as an alias.)
+    #[command(visible_alias = "explain")]
+    Inspect {
         /// Path to inspect (~ expands to $HOME)
         path: String,
     },
@@ -353,7 +357,7 @@ fn main() -> Result<()> {
 
     match cli.command {
         None => commands::welcome::run(&ctx),
-        Some(Commands::Scan { path }) => commands::scan::run(path, &ctx),
+        Some(Commands::Survey { path }) => commands::scan::run(path, &ctx),
         Some(Commands::Detect { all, top }) => commands::detect::run(all, top, &ctx),
         Some(Commands::Check { candidate_id }) => commands::check::run(&candidate_id, &ctx),
         Some(Commands::Airlock {
@@ -372,7 +376,7 @@ fn main() -> Result<()> {
             top,
             unsafe_confidence,
         }) => commands::reclaim::run(top, unsafe_confidence, grant_ref, &ctx),
-        Some(Commands::Hunt {
+        Some(Commands::Scan {
             top,
             min_size_mb,
             fresh,
@@ -389,7 +393,7 @@ fn main() -> Result<()> {
             commands::stow::run(path.as_deref(), act || ctx.yes, &ctx)
         }
         Some(Commands::Receipt { last }) => commands::receipt::run(last, &ctx),
-        Some(Commands::Explain { path }) => commands::explain::run(&path, &ctx),
+        Some(Commands::Inspect { path }) => commands::explain::run(&path, &ctx),
         Some(Commands::Doctor { need, min_free }) => {
             commands::doctor::run(need, min_free, grant_ref, &ctx)
         }
