@@ -5,6 +5,7 @@ use std::path::Path;
 use crate::commands::detect::build_candidates_pub;
 use crate::commands::scan::scan_cache_path;
 use crate::core::candidate::{CheckResult, CheckStep};
+use crate::core::safety;
 use crate::core::scanner::ScanResult;
 use crate::output::{self, Context};
 use crate::profile;
@@ -76,6 +77,7 @@ pub fn pressure_test(
     let steps: Vec<CheckStep> = vec![
         restat_check(path),
         liveness_check(path),
+        data_safety_check(path),
         policy_check(path, prof),
         recency_check(path),
     ];
@@ -264,9 +266,78 @@ fn walk_recent_mtime(path: &Path, threshold: chrono::Duration) -> bool {
     false
 }
 
+/// Built-in data-safety floor: refuse to auto-delete a database — the candidate
+/// itself, or any database nested beneath it. Runs BEFORE any grant logic: a
+/// `pressure_test` failure sets `safe = false`, and a grant only relaxes consent
+/// AFTER `safe == true`, so the floor is fail-closed and not grant-overridable.
+///
+/// A path whose every matching rule is wholesale-regenerable (auto / redownload /
+/// rebuild / recreate) is exempt — the curator vouched the tree rebuilds from a
+/// source, so any db inside it is regenerable too, and scanning a giant cache
+/// would falsely refuse it. Everything else (manual/irreversible rules such as
+/// git worktrees, plus unruled/heuristic paths) is scanned. A wildcard-free rule
+/// naming the EXACT db file (e.g. screenpipe's recording db) keeps that one db
+/// deletable; a directory rule never vouches for a db merely nested beneath it.
+fn data_safety_check(path: &Path) -> CheckStep {
+    let name = "data safety";
+    let pass = |note: &str| CheckStep {
+        name: name.into(),
+        passed: true,
+        note: note.into(),
+    };
+    let fail = |note: String| CheckStep {
+        name: name.into(),
+        passed: false,
+        note,
+    };
+
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/".into());
+    let home_path = Path::new(&home);
+    // `load_builtin` parses the compile-time-embedded YAML; on the (impossible)
+    // parse failure, default to NO rules → nothing is vouched → the floor scans
+    // and protects everything, which is the safe direction.
+    let rules = crate::core::rules::load_builtin().unwrap_or_default();
+
+    // (1) Wholesale-regenerable: exempt (and skip scanning a huge cache).
+    if safety::is_regenerable_vouched(path, &rules, home_path) {
+        return pass("regenerable build artifact (rule-vouched)");
+    }
+
+    // (2) Scan everything else for a database at or beneath the candidate.
+    match safety::database_scan(path, safety::DB_SCAN_CAP) {
+        safety::DbScan::Clean => pass("no database files"),
+        safety::DbScan::Inconclusive => {
+            fail("too large to verify database-free — refused (fail-closed)".into())
+        }
+        safety::DbScan::Found(db) => {
+            if db == path && safety::rule_names_exact_path(path, &rules, home_path) {
+                pass("rule names this exact database (curated)")
+            } else {
+                fail(format!(
+                    "contains a database ({}) — never auto-deleted",
+                    db.display()
+                ))
+            }
+        }
+    }
+}
+
 fn policy_check(path: &Path, prof: &profile::Profile) -> CheckStep {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/".into());
     let home_path = Path::new(&home);
+
+    // Built-in absolute floor: credential / key / secret stores. Never
+    // regenerable, never rule-targeted, never overridable by profile or grant.
+    for prefix in safety::builtin_never_touch() {
+        let expanded = crate::core::scanner::expand_home(prefix, home_path);
+        if path.starts_with(&expanded) {
+            return CheckStep {
+                name: "profile policy".into(),
+                passed: false,
+                note: format!("built-in never_touch (secret store): {}", prefix),
+            };
+        }
+    }
 
     for pattern in &prof.paths.never_touch {
         let expanded = crate::core::scanner::expand_home(pattern, home_path);
@@ -346,5 +417,153 @@ fn bail_no_scan(ctx: &Context) {
         eprintln!(r#"{{"error":"no scan found","hint":"run diskspace survey first"}}"#);
     } else {
         eprintln!("  No survey found. Run `diskspace survey` first.");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static SEQ: AtomicUsize = AtomicUsize::new(0);
+
+    fn tmp() -> std::path::PathBuf {
+        let n = SEQ.fetch_add(1, Ordering::SeqCst);
+        let p = std::env::temp_dir().join(format!("diskspace-gate-{}-{}", std::process::id(), n));
+        let _ = fs::remove_dir_all(&p);
+        fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    /// The core guarantee: an UNRULED candidate directory that contains a database
+    /// fails the data-safety step — so `pressure_test` returns `safe == false` and
+    /// no actuation (grant-driven or otherwise) can ever delete it.
+    #[test]
+    fn data_safety_vetoes_unruled_directory_containing_a_database() {
+        let d = tmp();
+        let app = d.join("SomeApp/state");
+        fs::create_dir_all(&app).unwrap();
+        fs::write(app.join("codex-dev.db"), b"x").unwrap();
+
+        let step = data_safety_check(&d);
+        assert!(!step.passed, "a dir holding a database must NOT pass");
+        assert!(
+            step.note.contains("database"),
+            "note names the cause: {}",
+            step.note
+        );
+
+        // End-to-end: the whole gate reports unsafe.
+        let result = pressure_test("t", &d, &profile::Profile::default()).unwrap();
+        assert!(
+            !result.safe,
+            "pressure_test must be unsafe for a db-bearing dir"
+        );
+        assert!(
+            result
+                .steps
+                .iter()
+                .any(|s| s.name == "data safety" && !s.passed),
+            "the data-safety step is the (a) failing gate"
+        );
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// A wildcard-free rule naming the EXACT db file (screenpipe's regenerable
+    /// recording db, recovery class irreversible) keeps that one database
+    /// deletable. The candidate IS the db file, so `database_scan` returns
+    /// Found(self) and the exact-name override applies. Needs the file to exist
+    /// for the scan, so create it in a tempdir and point the rule check at a real
+    /// builtin rule via $HOME.
+    #[test]
+    fn data_safety_allows_exact_file_database_rule() {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/".into());
+        let path = std::path::Path::new(&home)
+            .join(".screenpipe")
+            .join("db.sqlite");
+        // `database_scan` short-circuits on is_database_file (name only, no fs),
+        // so the file need not exist for Found(self); the exact-name override is a
+        // pure path+rule check.
+        let step = data_safety_check(&path);
+        assert!(
+            step.passed,
+            "the curated exact-file screenpipe db rule stays deletable: {}",
+            step.note
+        );
+        assert!(step.note.contains("exact database"), "note: {}", step.note);
+    }
+
+    /// The built-in credential floor blocks a secret store even with an empty
+    /// profile. Pure path check (no fs touch of the real `~/.ssh`).
+    #[test]
+    fn policy_blocks_builtin_secret_store() {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/".into());
+        let path = std::path::Path::new(&home).join(".ssh").join("id_ed25519");
+        let step = policy_check(&path, &profile::Profile::default());
+        assert!(!step.passed, "~/.ssh must be blocked by the built-in floor");
+        assert!(step.note.contains("secret store"), "note: {}", step.note);
+    }
+
+    /// A plain build cache (no database, not a secret store) still passes both new
+    /// checks — the floor must not break legitimate cleanup.
+    #[test]
+    fn plain_build_cache_still_passes_data_safety() {
+        let d = tmp();
+        let nm = d.join("node_modules/pkg");
+        fs::create_dir_all(&nm).unwrap();
+        fs::write(nm.join("index.js"), b"x").unwrap();
+        assert!(
+            data_safety_check(&d).passed,
+            "a db-free cache passes data-safety"
+        );
+        assert!(
+            policy_check(&d, &profile::Profile::default()).passed,
+            "a temp build cache is not a secret store"
+        );
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// Findings #1/#3 regression: a candidate matched by a DIRECTORY rule that is
+    /// NOT wholesale-regenerable (here the real `**/stale/*` rule, recovery class
+    /// `manual`) must STILL be scanned, and a database nested beneath it must veto
+    /// the deletion. Before the fix, any rule match short-circuited the scan.
+    #[test]
+    fn data_safety_vetoes_ruled_directory_with_nested_database() {
+        let d = tmp();
+        let proj = d.join("stale").join("proj");
+        fs::create_dir_all(&proj).unwrap();
+        fs::write(proj.join("app.sqlite"), b"x").unwrap();
+        // candidate path = .../stale/proj, matched by the builtin `**/stale/*`
+        // (manual) rule — a directory rule, so it must not vouch for the nested db.
+        let step = data_safety_check(&proj);
+        assert!(
+            !step.passed,
+            "a manual-class directory rule must not let a nested db through: {}",
+            step.note
+        );
+        assert!(step.note.contains("database"), "note: {}", step.note);
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// Use-case preservation: a candidate matched by a wholesale-regenerable rule
+    /// (the real `**/node_modules`, recovery `redownload`) is EXEMPT from the scan
+    /// — even when a db is nested inside — so large node_modules cleanup keeps
+    /// working and never trips the Inconclusive fail-closed path.
+    #[test]
+    fn data_safety_exempts_regenerable_node_modules_even_with_nested_db() {
+        let d = tmp();
+        let nm = d.join("node_modules");
+        let pkg = nm.join("some-pkg");
+        fs::create_dir_all(&pkg).unwrap();
+        fs::write(pkg.join("fixture.db"), b"x").unwrap();
+        let step = data_safety_check(&nm);
+        assert!(
+            step.passed,
+            "node_modules (redownload) is rule-vouched regenerable: {}",
+            step.note
+        );
+        assert!(step.note.contains("regenerable"), "note: {}", step.note);
+        let _ = fs::remove_dir_all(&d);
     }
 }

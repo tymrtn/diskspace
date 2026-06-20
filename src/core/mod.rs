@@ -9,6 +9,7 @@ pub mod history;
 pub mod metrics;
 pub mod repack;
 pub mod rules;
+pub mod safety;
 pub mod scanner;
 pub mod series;
 
