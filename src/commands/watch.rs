@@ -28,6 +28,7 @@ use crate::core::metrics::{self, DfSample};
 use crate::core::rules;
 use crate::core::scanner;
 use crate::output::Context;
+use crate::profile;
 
 const PLIST_LABEL: &str = "com.tymrtn.diskspace.watch";
 const CHECK_INTERVAL_SECONDS: u32 = 300; // 5 min
@@ -37,6 +38,36 @@ const SOFT_PCT_FREE: f32 = 10.0;
 
 /// Urgent threshold: doctor-worthy.
 const URGENT_PCT_FREE: f32 = 5.0;
+
+/// Re-notify cadence while the level is UNCHANGED. The original monitor only
+/// pinged on a level *transition*, so a disk that slid from 5% → 0.1% over days
+/// while staying "urgent" sent exactly ONE notification at the crossing and then
+/// went silent — the whole point of an urgent alert defeated. We now re-nag on a
+/// timer (and, for urgent, immediately on any meaningful further drop) so a
+/// sustained slide keeps escalating instead of falling quiet.
+const URGENT_RENOTIFY_SECS: i64 = 900; // 15 min
+const SOFT_RENOTIFY_SECS: i64 = 3600; // 1 h
+
+/// While already urgent, re-notify immediately (ignoring the timer) if free space
+/// has fallen this many percentage points since the last notification. Catches a
+/// fast slide between timer ticks.
+const RENOTIFY_PCT_DROP: f32 = 0.5;
+
+/// Minimum gap between autonomous reclaims so an urgent disk that stays urgent
+/// doesn't thrash the reclaim path every 5-minute tick.
+const AUTORECLAIM_MIN_INTERVAL_SECS: i64 = 1800; // 30 min
+
+/// Confidence floor for autonomous reclaim — matches the manual `reclaim`
+/// command's floor. Below this, nothing is auto-deleted.
+const AUTORECLAIM_MIN_CONFIDENCE: f32 = 0.85;
+
+/// Recovery classes safe for autonomous reclaim. These come back on their own
+/// (`auto`) or on next use with no project-breaking step (`redownload`,
+/// `rebuild`). We deliberately EXCLUDE `recreate` (venvs / node_modules — a
+/// project won't run until manually reinstalled), plus `manual` and
+/// `irreversible`. The data-safety floor still independently blocks databases and
+/// secret stores regardless of this list.
+const AUTORECLAIM_SAFE_RECOVERY: &[&str] = &["auto", "redownload", "rebuild"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -53,6 +84,93 @@ struct WatchState {
     last_pct_free: Option<f32>,
     last_free_bytes: Option<u64>,
     last_total_bytes: Option<u64>,
+    /// When we last actually delivered a notification, and the pct_free at that
+    /// moment. Drives the re-notify cadence (timer + drop threshold) so a
+    /// sustained slide keeps alerting instead of going silent after the first
+    /// crossing. serde-default so legacy state files still parse.
+    #[serde(default)]
+    last_notified_ts: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(default)]
+    last_notified_pct: Option<f32>,
+    /// When we last ran an autonomous reclaim, for rate-limiting. serde-default.
+    #[serde(default)]
+    last_autoreclaim_ts: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Pure notify decision: should this tick deliver a notification?
+///
+/// Fixes the "silent slide" bug. Rules, given the current `level`, the `prior`
+/// state, the current `pct_free`, and `now`:
+///   * `Ok`     — notify once, only as a recovery ping when the prior level was
+///                worse (Soft/Urgent). Never re-nag while healthy.
+///   * `Soft`   — notify on entry, then re-nag every `SOFT_RENOTIFY_SECS`.
+///   * `Urgent` — notify on entry, then re-nag every `URGENT_RENOTIFY_SECS` OR
+///                immediately if free space dropped ≥ `RENOTIFY_PCT_DROP` points
+///                since the last notification.
+///
+/// Kept as a free function of `(&WatchState, Level, f32, now)` so it is unit
+/// testable without touching disk or the clock.
+fn decide_notify(
+    prior: &WatchState,
+    level: Level,
+    pct_free: f32,
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    let entered = prior.last_level != Some(level);
+    let secs_since_notify = prior
+        .last_notified_ts
+        .map(|t| (now - t).num_seconds())
+        .unwrap_or(i64::MAX);
+    match level {
+        Level::Ok => {
+            // Recovery ping: only when we were previously in a worse state.
+            prior.last_level.is_some() && prior.last_level != Some(Level::Ok)
+        }
+        Level::Soft => entered || secs_since_notify >= SOFT_RENOTIFY_SECS,
+        Level::Urgent => {
+            if entered || secs_since_notify >= URGENT_RENOTIFY_SECS {
+                return true;
+            }
+            // Fast further slide between timer ticks.
+            match prior.last_notified_pct {
+                Some(prev) => (prev - pct_free) >= RENOTIFY_PCT_DROP,
+                None => true,
+            }
+        }
+    }
+}
+
+/// Pure gate for autonomous reclaim. Returns true only when the standing opt-in
+/// is on, the disk is urgent, and enough time has elapsed since the last
+/// autonomous reclaim (rate-limit). All authority to delete flows from the
+/// `enabled` flag — the user's durable `preferences.watch_autoreclaim` consent.
+fn should_autoreclaim(
+    enabled: bool,
+    level: Level,
+    last_autoreclaim_ts: Option<chrono::DateTime<chrono::Utc>>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    if !enabled || level != Level::Urgent {
+        return false;
+    }
+    match last_autoreclaim_ts {
+        Some(t) => (now - t).num_seconds() >= AUTORECLAIM_MIN_INTERVAL_SECS,
+        None => true,
+    }
+}
+
+/// Pure safe-subset filter for autonomous reclaim. A candidate is eligible only
+/// if it clears the confidence floor AND its recovery class is in
+/// [`AUTORECLAIM_SAFE_RECOVERY`]. A candidate with no consequence metadata is
+/// NOT eligible (fail-closed — we never auto-delete something whose recovery
+/// semantics we can't read). The data-safety floor and the per-item pressure
+/// test are enforced separately and independently downstream.
+fn is_autoreclaim_safe(
+    confidence: f32,
+    recovery: Option<&str>,
+) -> bool {
+    confidence >= AUTORECLAIM_MIN_CONFIDENCE
+        && matches!(recovery, Some(r) if AUTORECLAIM_SAFE_RECOVERY.contains(&r))
 }
 
 pub fn install(ctx: &Context) -> Result<()> {
@@ -329,22 +447,51 @@ pub fn run(ctx: &Context) -> Result<()> {
     };
 
     let prior = load_state().unwrap_or_default();
-    let prior_level = prior.last_level;
+    let now = chrono::Utc::now();
+
+    let should_notify = decide_notify(&prior, level, pct_free, now);
+
+    // Carry the notification bookkeeping forward: only advance it on a tick that
+    // actually notifies, so the re-nag timer/drop measure from the LAST real
+    // notification (not from every silent tick).
+    let (last_notified_ts, last_notified_pct) = if should_notify {
+        (Some(now), Some(pct_free))
+    } else {
+        (prior.last_notified_ts, prior.last_notified_pct)
+    };
+
+    // --- Autonomous reclaim (gated) ----------------------------------------
+    // Only when the user has turned on the standing opt-in AND we are urgent AND
+    // the rate-limit has elapsed. Self-contained and best-effort: a reclaim error
+    // must never crash the tick. Advances `last_autoreclaim_ts` only on an attempt
+    // so the rate-limit holds regardless of how many bytes came back.
+    let autoreclaim = if should_autoreclaim(
+        prof_watch_autoreclaim(),
+        level,
+        prior.last_autoreclaim_ts,
+        now,
+    ) {
+        Some(auto_reclaim(&home))
+    } else {
+        None
+    };
+    let last_autoreclaim_ts = if autoreclaim.is_some() {
+        Some(now)
+    } else {
+        prior.last_autoreclaim_ts
+    };
 
     let new_state = WatchState {
         last_level: Some(level),
-        last_ts: Some(chrono::Utc::now()),
+        last_ts: Some(now),
         last_pct_free: Some(pct_free),
         last_free_bytes: Some(free_bytes),
         last_total_bytes: Some(total_bytes),
+        last_notified_ts,
+        last_notified_pct,
+        last_autoreclaim_ts,
     };
     save_state(&new_state).ok();
-
-    let should_notify = prior_level != Some(level)
-        && match level {
-            Level::Ok => prior_level.is_some() && prior_level != Some(Level::Ok),
-            _ => true,
-        };
 
     if should_notify {
         notify(level, free_bytes, pct_free);
@@ -360,6 +507,7 @@ pub fn run(ctx: &Context) -> Result<()> {
                 "total_bytes": total_bytes,
                 "notified": should_notify,
                 "advisory": advisory,
+                "autoreclaim": autoreclaim,
             }))?
         );
     } else if !ctx.quiet {
@@ -379,8 +527,131 @@ pub fn run(ctx: &Context) -> Result<()> {
         if let Some(note) = &advisory {
             println!("  {}", ctx.style(note, &dim));
         }
+        if let Some(ar) = &autoreclaim {
+            println!(
+                "  {}",
+                ctx.style(
+                    &format!(
+                        "auto-reclaim: freed {} across {} item(s)",
+                        crate::output::format_bytes(ar.bytes_freed),
+                        ar.items
+                    ),
+                    &dim
+                )
+            );
+        }
     }
     Ok(())
+}
+
+/// Read the standing `watch_autoreclaim` opt-in from the profile. Best-effort: a
+/// missing/garbage profile means the feature is OFF (fail-closed to notify-only).
+fn prof_watch_autoreclaim() -> bool {
+    profile::load()
+        .map(|p| p.preferences.watch_autoreclaim)
+        .unwrap_or(false)
+}
+
+/// Outcome of one autonomous reclaim pass, surfaced in output and recorded to the
+/// receipts ledger (via `reclaim`'s own history append inside `auto_reclaim`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AutoReclaimOutcome {
+    bytes_freed: u64,
+    items: usize,
+}
+
+/// Perform one gated, autonomous reclaim of SAFE regenerable caches. Called only
+/// when [`should_autoreclaim`] returned true (opt-in on, urgent, rate-limit
+/// elapsed). Best-effort: any failure returns a zero-outcome rather than
+/// propagating, so the watch tick never crashes.
+///
+/// Selection is deliberately conservative and defense-in-depth:
+///   1. Fresh scan of `$HOME`, build candidates the same way `detect`/`reclaim` do.
+///   2. Keep only [`is_autoreclaim_safe`] items (confidence floor + recovery class
+///      in {auto, redownload, rebuild} — never `recreate`/`manual`/`irreversible`).
+///   3. Pressure-test each survivor (the same check `reclaim` runs); the test
+///      independently blocks databases, secret stores, and in-use paths.
+///   4. Delete survivors, appending each to the receipts ledger with an
+///      `auto: true` context marker so the action is auditable.
+fn auto_reclaim(home: &Path) -> AutoReclaimOutcome {
+    use crate::commands::check;
+    use crate::commands::detect::build_candidates_pub;
+    use crate::core::history::{self, ActionKind, Entry as HistEntry};
+
+    let zero = AutoReclaimOutcome {
+        bytes_freed: 0,
+        items: 0,
+    };
+
+    let rules = match rules::load_builtin() {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("(watch: auto-reclaim skipped — failed to load rules: {})", e);
+            return zero;
+        }
+    };
+    let scan = match scanner::scan(home, &rules) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("(watch: auto-reclaim skipped — scan failed: {})", e);
+            return zero;
+        }
+    };
+    let prof = profile::load().unwrap_or_default();
+    let home_str = home.to_string_lossy().to_string();
+    let candidates = build_candidates_pub(&scan, &rules, &prof, &home_str);
+
+    let safe: Vec<_> = candidates
+        .into_iter()
+        .filter(|c| {
+            is_autoreclaim_safe(
+                c.confidence,
+                c.consequences.as_ref().map(|q| q.recovery.as_str()),
+            )
+        })
+        .collect();
+
+    let mut bytes_freed = 0u64;
+    let mut items = 0usize;
+    for c in &safe {
+        // Independent pressure test — blocks databases, secret stores, in-use paths.
+        match check::pressure_test(&c.id, &c.path, &prof) {
+            Ok(r) if r.safe => {}
+            _ => continue,
+        }
+        let del = if c.path.is_dir() {
+            fs::remove_dir_all(&c.path)
+        } else {
+            fs::remove_file(&c.path)
+        };
+        if del.is_ok() {
+            bytes_freed += c.size_bytes;
+            items += 1;
+            let mut context = serde_json::Map::new();
+            context.insert("auto".into(), serde_json::Value::Bool(true));
+            context.insert(
+                "trigger".into(),
+                serde_json::Value::String("watch-urgent".into()),
+            );
+            history::append(&HistEntry {
+                ts: chrono::Utc::now(),
+                command: ActionKind::Reclaim,
+                candidate_id: Some(c.id.clone()),
+                rule_id: Some(c.rule_id.clone()),
+                path: c.path.clone(),
+                size_bytes: c.size_bytes,
+                df_before: None,
+                df_after: None,
+                actually_freed: None,
+                reversible: false,
+                undo_cmd: None,
+                rule_confidence: Some(c.confidence),
+                context,
+            });
+        }
+    }
+
+    AutoReclaimOutcome { bytes_freed, items }
 }
 
 /// Record this watch tick into the P1 measurement layer. Returns the tick's
@@ -441,7 +712,13 @@ fn record_tick(home: &Path, free_bytes: u64, total_bytes: u64) -> Option<String>
 fn notify(level: Level, free_bytes: u64, pct_free: f32) {
     let (title, body) = match level {
         Level::Urgent => (
-            "diskspace — disk is full".to_string(),
+            // Escalate the wording as free space craters, so a sustained slide
+            // reads as more alarming each re-nag instead of a flat repeat.
+            if pct_free < 2.0 {
+                "diskspace — disk CRITICALLY full".to_string()
+            } else {
+                "diskspace — disk is full".to_string()
+            },
             format!(
                 "Only {:.1}% free ({}). Run `diskspace doctor` to free space safely.",
                 pct_free,
@@ -605,7 +882,182 @@ mod tests {
             last_pct_free: Some(7.5),
             last_free_bytes: Some(1234),
             last_total_bytes: Some(98765),
+            last_notified_ts: None,
+            last_notified_pct: None,
+            last_autoreclaim_ts: None,
         }
+    }
+
+    // ---- decide_notify: the "silent slide" regression -----------------------
+
+    /// Entering urgent from a lesser level always notifies.
+    #[test]
+    fn notify_on_entering_urgent() {
+        let prior = WatchState {
+            last_level: Some(Level::Soft),
+            ..Default::default()
+        };
+        assert!(decide_notify(&prior, Level::Urgent, 4.0, chrono::Utc::now()));
+    }
+
+    /// THE BUG: a disk that stays urgent while sliding must keep re-notifying.
+    /// Under the old transition-only logic this returned false; now, once the
+    /// re-nag timer has elapsed, it must be true even though the level is
+    /// unchanged.
+    #[test]
+    fn notify_renags_while_urgent_after_timer() {
+        let now = chrono::Utc::now();
+        let prior = WatchState {
+            last_level: Some(Level::Urgent),
+            last_notified_ts: Some(now - chrono::Duration::seconds(URGENT_RENOTIFY_SECS + 1)),
+            last_notified_pct: Some(4.0),
+            ..Default::default()
+        };
+        assert!(
+            decide_notify(&prior, Level::Urgent, 3.9, now),
+            "urgent must re-nag once the timer elapses, not go silent"
+        );
+    }
+
+    /// Still urgent, timer NOT elapsed, no meaningful further drop → stay quiet
+    /// (don't spam every 5-minute tick).
+    #[test]
+    fn notify_quiet_while_urgent_within_timer_no_drop() {
+        let now = chrono::Utc::now();
+        let prior = WatchState {
+            last_level: Some(Level::Urgent),
+            last_notified_ts: Some(now - chrono::Duration::seconds(60)),
+            last_notified_pct: Some(4.0),
+            ..Default::default()
+        };
+        assert!(!decide_notify(&prior, Level::Urgent, 3.9, now));
+    }
+
+    /// Still urgent, within timer, but a fast further drop ≥ threshold → notify
+    /// immediately (don't wait for the timer while the disk craters).
+    #[test]
+    fn notify_on_fast_drop_within_timer() {
+        let now = chrono::Utc::now();
+        let prior = WatchState {
+            last_level: Some(Level::Urgent),
+            last_notified_ts: Some(now - chrono::Duration::seconds(60)),
+            last_notified_pct: Some(4.0),
+            ..Default::default()
+        };
+        assert!(decide_notify(&prior, Level::Urgent, 4.0 - RENOTIFY_PCT_DROP, now));
+    }
+
+    /// Recovery to Ok notifies once (was in a worse state); staying Ok is silent.
+    #[test]
+    fn notify_recovery_once_then_silent() {
+        let now = chrono::Utc::now();
+        let recovering = WatchState {
+            last_level: Some(Level::Urgent),
+            ..Default::default()
+        };
+        assert!(decide_notify(&recovering, Level::Ok, 20.0, now));
+
+        let healthy = WatchState {
+            last_level: Some(Level::Ok),
+            ..Default::default()
+        };
+        assert!(!decide_notify(&healthy, Level::Ok, 20.0, now));
+    }
+
+    /// Soft re-nags on the (longer) soft timer.
+    #[test]
+    fn notify_soft_renags_on_timer() {
+        let now = chrono::Utc::now();
+        let fresh = WatchState {
+            last_level: Some(Level::Soft),
+            last_notified_ts: Some(now - chrono::Duration::seconds(60)),
+            last_notified_pct: Some(8.0),
+            ..Default::default()
+        };
+        assert!(!decide_notify(&fresh, Level::Soft, 8.0, now));
+
+        let stale = WatchState {
+            last_level: Some(Level::Soft),
+            last_notified_ts: Some(now - chrono::Duration::seconds(SOFT_RENOTIFY_SECS + 1)),
+            last_notified_pct: Some(8.0),
+            ..Default::default()
+        };
+        assert!(decide_notify(&stale, Level::Soft, 8.0, now));
+    }
+
+    // ---- should_autoreclaim gate --------------------------------------------
+
+    #[test]
+    fn autoreclaim_off_by_default() {
+        // Opt-in false → never, even when urgent.
+        assert!(!should_autoreclaim(false, Level::Urgent, None, chrono::Utc::now()));
+    }
+
+    #[test]
+    fn autoreclaim_only_when_urgent() {
+        let now = chrono::Utc::now();
+        assert!(!should_autoreclaim(true, Level::Ok, None, now));
+        assert!(!should_autoreclaim(true, Level::Soft, None, now));
+        assert!(should_autoreclaim(true, Level::Urgent, None, now));
+    }
+
+    #[test]
+    fn autoreclaim_rate_limited() {
+        let now = chrono::Utc::now();
+        // Just ran → blocked.
+        assert!(!should_autoreclaim(
+            true,
+            Level::Urgent,
+            Some(now - chrono::Duration::seconds(60)),
+            now
+        ));
+        // Long enough ago → allowed again.
+        assert!(should_autoreclaim(
+            true,
+            Level::Urgent,
+            Some(now - chrono::Duration::seconds(AUTORECLAIM_MIN_INTERVAL_SECS + 1)),
+            now
+        ));
+    }
+
+    // ---- is_autoreclaim_safe subset filter ----------------------------------
+
+    #[test]
+    fn autoreclaim_safe_recovery_classes() {
+        // Safe, regenerable caches at/above the floor.
+        assert!(is_autoreclaim_safe(0.90, Some("auto")));
+        assert!(is_autoreclaim_safe(0.85, Some("redownload")));
+        assert!(is_autoreclaim_safe(0.88, Some("rebuild")));
+    }
+
+    #[test]
+    fn autoreclaim_excludes_project_envs_and_low_confidence() {
+        // `recreate` = venvs / node_modules — a project won't run until reinstalled.
+        assert!(!is_autoreclaim_safe(0.99, Some("recreate")));
+        assert!(!is_autoreclaim_safe(0.99, Some("manual")));
+        assert!(!is_autoreclaim_safe(0.99, Some("irreversible")));
+        // Below the confidence floor, even a safe class is excluded.
+        assert!(!is_autoreclaim_safe(0.50, Some("auto")));
+        // Fail-closed: no recovery metadata → not eligible.
+        assert!(!is_autoreclaim_safe(0.99, None));
+    }
+
+    /// Extended state round-trips including the new fields, and a LEGACY state
+    /// file (without them) still parses (serde defaults).
+    #[test]
+    fn legacy_state_without_new_fields_parses() {
+        let base = TempBase::new("legacy");
+        let path = base.state_file();
+        // A pre-fix state file: only the original five fields.
+        fs::write(
+            &path,
+            r#"{"last_level":"urgent","last_ts":"2026-07-04T00:00:00Z","last_pct_free":1.0,"last_free_bytes":100,"last_total_bytes":1000}"#,
+        )
+        .unwrap();
+        let loaded = load_state_from(&path).unwrap();
+        assert_eq!(loaded.last_level, Some(Level::Urgent));
+        assert_eq!(loaded.last_notified_ts, None);
+        assert_eq!(loaded.last_autoreclaim_ts, None);
     }
 
     #[test]

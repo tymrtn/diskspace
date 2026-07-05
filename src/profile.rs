@@ -55,6 +55,16 @@ pub struct Preferences {
     /// Additive + serde-default so legacy profiles still parse.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub grant_path: Option<String>,
+    /// Standing opt-in for `watch` to autonomously reclaim SAFE regenerable caches
+    /// (recovery ∈ {auto, redownload, rebuild}) when disk pressure hits the urgent
+    /// threshold. This is the user's durable consent — the background monitor has
+    /// no authority to delete anything unless this is `true`. Defaults to `false`
+    /// (notify-only), so legacy profiles and fresh installs stay alert-only until
+    /// the user explicitly turns self-healing on. Never touches project envs
+    /// (recovery == "recreate"), databases, or secret stores — the safety floor and
+    /// the recovery-class filter both exclude them.
+    #[serde(default)]
+    pub watch_autoreclaim: bool,
 }
 
 fn default_pressure_threshold_gb() -> f32 {
@@ -69,6 +79,7 @@ impl Default for Preferences {
             confirm_before_airlock: true,
             disk_pressure_threshold_gb: 5.0,
             grant_path: None,
+            watch_autoreclaim: false,
         }
     }
 }
