@@ -25,6 +25,7 @@ use crate::core::candidate::{Candidate, ConsequenceContract};
 use crate::core::metrics;
 use crate::core::rules::{Consequences, Rule};
 use crate::profile::Profile;
+use std::path::Path;
 
 /// Build the agent-facing [`ConsequenceContract`] from a rule's [`Consequences`].
 ///
@@ -74,6 +75,15 @@ pub fn reference_url(rule_id: &str, rule_url: Option<&str>) -> String {
 /// For the candidate set (tens, not the 589k-entry scan cache) this is
 /// acceptable; we keep it best-effort and swallow errors with `.ok()`.
 pub fn enrich_candidate(c: &mut Candidate, rule: &Rule, prof: &Profile) {
+    enrich_candidate_in(c, rule, prof, &crate::profile::data_dir());
+}
+
+/// Base-dir seam for [`enrich_candidate`] so tests can run enrichment against a
+/// hermetic tempdir. The real data dir carries whole-volume df samples (written
+/// by every watch tick), and burn-rate is path-independent — so an unseamed
+/// "path with no series has no signal" test goes red on any machine where the
+/// watch agent has ever run.
+pub(crate) fn enrich_candidate_in(c: &mut Candidate, rule: &Rule, prof: &Profile, base: &Path) {
     let url = reference_url(&rule.id, rule.reference_url.as_deref());
 
     c.consequence_contract = c
@@ -87,7 +97,7 @@ pub fn enrich_candidate(c: &mut Candidate, rule: &Rule, prof: &Profile) {
     // hard 0% as "measured and nil" rather than "no data". Dropping it to `None`
     // (the field is `skip_serializing_if = "Option::is_none"`) makes the JSON OMIT
     // `metrics` entirely, the honest "metrics_available: false" signal.
-    c.metrics = metrics::compute_metrics(&c.path, prof)
+    c.metrics = metrics::compute_metrics_in(base, &c.path, prof, chrono::Utc::now())
         .ok()
         .filter(|m| !m.has_no_signal());
     c.reference_url = Some(url);
@@ -231,9 +241,18 @@ mod tests {
 
     #[test]
     fn enrich_emits_no_metrics_when_series_has_no_signal() {
-        // With NO series data for the path, enrichment must leave `metrics` as
-        // `None` (so the JSON OMITS it) rather than attaching a misleading all-None
-        // `Metrics` with `metric_confidence: 0.0`. This guards audit #9.
+        // With NO series data AT ALL (hermetic empty base — the real
+        // `~/.diskspace` carries whole-volume df samples from watch ticks, and
+        // burn-rate is path-independent, so it would leak signal in here),
+        // enrichment must leave `metrics` as `None` (so the JSON OMITS it)
+        // rather than attaching a misleading all-None `Metrics` with
+        // `metric_confidence: 0.0`. This guards audit #9.
+        let base = std::env::temp_dir().join(format!(
+            "diskspace-agent-surface-test-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&base).unwrap();
         let prof = Profile::default();
         // A path that has certainly never been observed in any series.
         let mut c = candidate(
@@ -242,7 +261,8 @@ mod tests {
         );
         let rule = rule_with("rule", None, Some(cons("redownload")));
 
-        enrich_candidate(&mut c, &rule, &prof);
+        enrich_candidate_in(&mut c, &rule, &prof, &base);
+        let _ = std::fs::remove_dir_all(&base);
 
         // The metrics field is omitted on serialize (skip_serializing_if = is_none),
         // so the agent reads no `metrics` key — the honest "no data yet" signal.

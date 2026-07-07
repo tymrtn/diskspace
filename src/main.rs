@@ -203,6 +203,16 @@ enum Commands {
         #[command(subcommand)]
         action: WatchAction,
     },
+    /// Where is the disk headed? Burn rate, days-to-full projection, and the
+    /// top-growing paths over a trailing window (read-only, advisory).
+    Trend {
+        /// Trailing window in days for the burn-rate fit and growth ranking
+        #[arg(long, default_value = "7")]
+        window_days: f64,
+        /// Max growing paths to show (default: 10)
+        #[arg(long, default_value = "10")]
+        top: usize,
+    },
     /// Show airlock state and pending purges
     Status,
     /// Verify the P1 measurement layer's invariants hold at runtime (read-only)
@@ -409,6 +419,7 @@ fn main() -> Result<()> {
             WatchAction::Status => commands::watch::status(&ctx),
             WatchAction::Run => commands::watch::run(&ctx),
         },
+        Some(Commands::Trend { window_days, top }) => commands::trend::run(window_days, top, &ctx),
         Some(Commands::Status) => commands::status::run(&ctx),
         Some(Commands::Selfcheck { measurement }) => commands::selfcheck::run(measurement, &ctx),
         Some(Commands::Profile { action }) => match action {

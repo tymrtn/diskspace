@@ -10,7 +10,9 @@
 //!   * Read free / total bytes for $HOME's filesystem.
 //!   * If pct_free <  5%  → urgent  notification, recommend `diskspace doctor`.
 //!   * If pct_free < 10% → soft    notification, recommend `diskspace detect`.
-//!   * Otherwise → ok.
+//!   * Otherwise → ok. Even at ok, a trailing-window burn-rate fit projects
+//!     days-to-full; a projection under 30 days sends a once-a-day forecast
+//!     alert (the slow-slide early warning), recommending `diskspace trend`.
 //!
 //! Notification dedup: state file at `~/.diskspace/watch_state.json` tracks
 //! the last-notified level. We re-notify only when the level changes (so the
@@ -69,6 +71,21 @@ const AUTORECLAIM_MIN_CONFIDENCE: f32 = 0.85;
 /// secret stores regardless of this list.
 const AUTORECLAIM_SAFE_RECOVERY: &[&str] = &["auto", "redownload", "rebuild"];
 
+/// Trend early-warning: alert when the trailing-window burn rate projects the
+/// volume FULL within this many days, even while free space is still above the
+/// Ok threshold. This is the fix for the slow slide the threshold alerts can't
+/// see — the 2026-07 incident declined for ~40 days of ticks before crossing
+/// 5%, when a rate projection would have flagged it with ~40% still free.
+const TREND_ALERT_DAYS_TO_FULL: u32 = 30;
+
+/// Window the burn-rate fit to the trailing week so an old crisis + recovery in
+/// the df history can't pollute today's slope.
+const TREND_WINDOW_DAYS: f64 = 7.0;
+
+/// Trend alerts are a forecast, so they re-nag slowly: once a day while the
+/// projection stays under the threshold. (Threshold alerts own the fast cadence.)
+const TREND_RENOTIFY_SECS: i64 = 86_400; // 24 h
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 enum Level {
@@ -95,6 +112,11 @@ struct WatchState {
     /// When we last ran an autonomous reclaim, for rate-limiting. serde-default.
     #[serde(default)]
     last_autoreclaim_ts: Option<chrono::DateTime<chrono::Utc>>,
+    /// When we last delivered a TREND (days-to-full forecast) alert, for the
+    /// once-a-day cadence. Independent of the threshold-alert bookkeeping so a
+    /// forecast ping never resets the urgent re-nag timer. serde-default.
+    #[serde(default)]
+    last_trend_notified_ts: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// Pure notify decision: should this tick deliver a notification?
@@ -140,6 +162,34 @@ fn decide_notify(
     }
 }
 
+/// Pure trend-alert decision: should this tick deliver a days-to-full forecast
+/// notification?
+///
+/// Fires only while the level is `Ok` — below the Ok thresholds the threshold
+/// alerts already own the channel and a forecast would be noise on top of them.
+/// Requires a real projection (`Some(days)`) at or under
+/// [`TREND_ALERT_DAYS_TO_FULL`], then re-nags at most once per
+/// [`TREND_RENOTIFY_SECS`]. Advisory only — the forecast never feeds actuation
+/// (auto-reclaim keys off `level`, never off a projection).
+fn decide_trend_notify(
+    level: Level,
+    days_to_full: Option<u32>,
+    last_trend_notified_ts: Option<chrono::DateTime<chrono::Utc>>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    if level != Level::Ok {
+        return false;
+    }
+    let projected_soon = matches!(days_to_full, Some(d) if d <= TREND_ALERT_DAYS_TO_FULL);
+    if !projected_soon {
+        return false;
+    }
+    match last_trend_notified_ts {
+        Some(t) => (now - t).num_seconds() >= TREND_RENOTIFY_SECS,
+        None => true,
+    }
+}
+
 /// Pure gate for autonomous reclaim. Returns true only when the standing opt-in
 /// is on, the disk is urgent, and enough time has elapsed since the last
 /// autonomous reclaim (rate-limit). All authority to delete flows from the
@@ -165,10 +215,7 @@ fn should_autoreclaim(
 /// NOT eligible (fail-closed — we never auto-delete something whose recovery
 /// semantics we can't read). The data-safety floor and the per-item pressure
 /// test are enforced separately and independently downstream.
-fn is_autoreclaim_safe(
-    confidence: f32,
-    recovery: Option<&str>,
-) -> bool {
+fn is_autoreclaim_safe(confidence: f32, recovery: Option<&str>) -> bool {
     confidence >= AUTORECLAIM_MIN_CONFIDENCE
         && matches!(recovery, Some(r) if AUTORECLAIM_SAFE_RECOVERY.contains(&r))
 }
@@ -438,6 +485,10 @@ pub fn run(ctx: &Context) -> Result<()> {
     // never acted upon — df can never widen a scan (locked invariant).
     let advisory = record_tick(&home, free_bytes, total_bytes);
 
+    // Trailing-window burn trend (reads only the small df_series log — cheap
+    // enough for every tick). Advisory: it can notify below, never actuate.
+    let trend = metrics::burn_trend(TREND_WINDOW_DAYS).unwrap_or_default();
+
     let level = if pct_free < URGENT_PCT_FREE {
         Level::Urgent
     } else if pct_free < SOFT_PCT_FREE {
@@ -458,6 +509,18 @@ pub fn run(ctx: &Context) -> Result<()> {
         (Some(now), Some(pct_free))
     } else {
         (prior.last_notified_ts, prior.last_notified_pct)
+    };
+
+    // Forecast alert: the disk is still Ok but the trailing burn rate projects
+    // it full within TREND_ALERT_DAYS_TO_FULL. Separate bookkeeping from the
+    // threshold alerts so the once-a-day forecast cadence never interacts with
+    // the urgent re-nag timers.
+    let should_trend_notify =
+        decide_trend_notify(level, trend.days_to_full, prior.last_trend_notified_ts, now);
+    let last_trend_notified_ts = if should_trend_notify {
+        Some(now)
+    } else {
+        prior.last_trend_notified_ts
     };
 
     // --- Autonomous reclaim (gated) ----------------------------------------
@@ -490,11 +553,15 @@ pub fn run(ctx: &Context) -> Result<()> {
         last_notified_ts,
         last_notified_pct,
         last_autoreclaim_ts,
+        last_trend_notified_ts,
     };
     save_state(&new_state).ok();
 
     if should_notify {
         notify(level, free_bytes, pct_free);
+    }
+    if should_trend_notify {
+        notify_trend(&trend, free_bytes);
     }
 
     if ctx.json {
@@ -508,6 +575,8 @@ pub fn run(ctx: &Context) -> Result<()> {
                 "notified": should_notify,
                 "advisory": advisory,
                 "autoreclaim": autoreclaim,
+                "trend": trend,
+                "trend_notified": should_trend_notify,
             }))?
         );
     } else if !ctx.quiet {
@@ -526,6 +595,26 @@ pub fn run(ctx: &Context) -> Result<()> {
         );
         if let Some(note) = &advisory {
             println!("  {}", ctx.style(note, &dim));
+        }
+        if let (Some(rate), Some(days)) = (trend.burn_rate_bytes_per_day, trend.days_to_full) {
+            if rate > 0.0 {
+                println!(
+                    "  {}",
+                    ctx.style(
+                        &format!(
+                            "trend: filling at {}/day — full in ~{} day(s) at this rate{}",
+                            crate::output::format_bytes(rate as u64),
+                            days,
+                            if should_trend_notify {
+                                "  · notified"
+                            } else {
+                                ""
+                            }
+                        ),
+                        &dim
+                    )
+                );
+            }
         }
         if let Some(ar) = &autoreclaim {
             println!(
@@ -586,7 +675,10 @@ fn auto_reclaim(home: &Path) -> AutoReclaimOutcome {
     let rules = match rules::load_builtin() {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("(watch: auto-reclaim skipped — failed to load rules: {})", e);
+            eprintln!(
+                "(watch: auto-reclaim skipped — failed to load rules: {})",
+                e
+            );
             return zero;
         }
     };
@@ -746,6 +838,38 @@ fn notify(level: Level, free_bytes: u64, pct_free: f32) {
     deliver_notification(&title, &body);
 }
 
+/// Forecast notification: the disk is still Ok but the trailing burn rate
+/// projects it full within the alert horizon. Enriched with the top grower so
+/// the alert names a probable CAUSE, not just a date — reading the per-entry
+/// series is acceptable here because this fires at most once a day.
+fn notify_trend(trend: &metrics::BurnTrend, free_bytes: u64) {
+    let days = match trend.days_to_full {
+        Some(d) => d,
+        None => return,
+    };
+    let rate = trend.burn_rate_bytes_per_day.unwrap_or(0.0).max(0.0);
+    let grower = metrics::top_growers(TREND_WINDOW_DAYS, 1)
+        .ok()
+        .and_then(|g| g.into_iter().next())
+        .map(|g| {
+            format!(
+                " Top grower: {} (+{} this week).",
+                g.path.display(),
+                crate::output::format_bytes(g.delta_bytes)
+            )
+        })
+        .unwrap_or_default();
+    let title = "diskspace — disk filling up".to_string();
+    let body = format!(
+        "At the current rate ({}/day), the disk is full in ~{} day(s) ({} free now).{} Run `diskspace trend`.",
+        crate::output::format_bytes(rate as u64),
+        days,
+        crate::output::format_bytes(free_bytes),
+        grower
+    );
+    deliver_notification(&title, &body);
+}
+
 /// Deliver a desktop notification. macOS uses `osascript display notification`.
 /// On every other OS (Linux is the portable target) this is a graceful no-op:
 /// the watch tick still runs, records its measurement, and prints/JSON-emits its
@@ -885,6 +1009,7 @@ mod tests {
             last_notified_ts: None,
             last_notified_pct: None,
             last_autoreclaim_ts: None,
+            last_trend_notified_ts: None,
         }
     }
 
@@ -897,7 +1022,12 @@ mod tests {
             last_level: Some(Level::Soft),
             ..Default::default()
         };
-        assert!(decide_notify(&prior, Level::Urgent, 4.0, chrono::Utc::now()));
+        assert!(decide_notify(
+            &prior,
+            Level::Urgent,
+            4.0,
+            chrono::Utc::now()
+        ));
     }
 
     /// THE BUG: a disk that stays urgent while sliding must keep re-notifying.
@@ -944,7 +1074,12 @@ mod tests {
             last_notified_pct: Some(4.0),
             ..Default::default()
         };
-        assert!(decide_notify(&prior, Level::Urgent, 4.0 - RENOTIFY_PCT_DROP, now));
+        assert!(decide_notify(
+            &prior,
+            Level::Urgent,
+            4.0 - RENOTIFY_PCT_DROP,
+            now
+        ));
     }
 
     /// Recovery to Ok notifies once (was in a worse state); staying Ok is silent.
@@ -985,12 +1120,65 @@ mod tests {
         assert!(decide_notify(&stale, Level::Soft, 8.0, now));
     }
 
+    // ---- decide_trend_notify: the slow-slide early warning -------------------
+
+    /// THE GAP the 2026-07 incident exposed: a disk declining steadily while
+    /// still above the Ok threshold produced zero signal. A sub-30-day
+    /// projection must alert even at Ok.
+    #[test]
+    fn trend_notifies_when_projection_under_horizon_at_ok() {
+        let now = chrono::Utc::now();
+        assert!(decide_trend_notify(
+            Level::Ok,
+            Some(TREND_ALERT_DAYS_TO_FULL),
+            None,
+            now
+        ));
+        assert!(decide_trend_notify(Level::Ok, Some(3), None, now));
+    }
+
+    /// No projection, or a comfortable one, stays silent.
+    #[test]
+    fn trend_quiet_without_scary_projection() {
+        let now = chrono::Utc::now();
+        assert!(!decide_trend_notify(Level::Ok, None, None, now));
+        assert!(!decide_trend_notify(
+            Level::Ok,
+            Some(TREND_ALERT_DAYS_TO_FULL + 1),
+            None,
+            now
+        ));
+    }
+
+    /// Below Ok the threshold alerts own the channel — no forecast on top.
+    #[test]
+    fn trend_defers_to_threshold_alerts_below_ok() {
+        let now = chrono::Utc::now();
+        assert!(!decide_trend_notify(Level::Soft, Some(3), None, now));
+        assert!(!decide_trend_notify(Level::Urgent, Some(3), None, now));
+    }
+
+    /// Once-a-day cadence: quiet inside 24 h of the last forecast, re-nag after.
+    #[test]
+    fn trend_renags_daily_not_per_tick() {
+        let now = chrono::Utc::now();
+        let fresh = Some(now - chrono::Duration::seconds(TREND_RENOTIFY_SECS - 60));
+        assert!(!decide_trend_notify(Level::Ok, Some(5), fresh, now));
+        let stale = Some(now - chrono::Duration::seconds(TREND_RENOTIFY_SECS + 60));
+        assert!(decide_trend_notify(Level::Ok, Some(5), stale, now));
+    }
+
     // ---- should_autoreclaim gate --------------------------------------------
 
     #[test]
     fn autoreclaim_off_by_default() {
         // Opt-in false → never, even when urgent.
-        assert!(!should_autoreclaim(false, Level::Urgent, None, chrono::Utc::now()));
+        assert!(!should_autoreclaim(
+            false,
+            Level::Urgent,
+            None,
+            chrono::Utc::now()
+        ));
     }
 
     #[test]

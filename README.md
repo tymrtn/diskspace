@@ -58,6 +58,7 @@ diskspace scan                    # sweep for big directories no rule covers (wa
 diskspace reclaim                 # jettison high-confidence weight NOW (no airlock)
 diskspace purge                   # permanently delete airlock contents
 diskspace status                  # show what's in the airlock
+diskspace trend                   # burn rate, days-to-full projection, top-growing paths
 diskspace watch install           # background disk-pressure monitor (see below)
 ```
 
@@ -137,6 +138,8 @@ diskspace watch uninstall    # remove it
 Checks `df` every 5 minutes. **10% free** fires a soft macOS notification suggesting `diskspace detect`. **5% free** flips to urgent and recommends `doctor`. The agent ships as a Developer-ID-signed `.app` bundle (`DiskspaceWatch.app`) so System Settings → Login Items shows a real icon and identity, not a blank tile.
 
 Notifications are deduped via a state file — you don't get pinged every 5 minutes once you've already been told.
+
+The watch also fits a trailing-week burn rate from its own tick history. When the projection says the disk fills within **30 days** — even with free space still comfortably above the thresholds — it sends a once-a-day forecast alert naming the top-growing path. Threshold alerts catch the cliff; the forecast catches the slow slide that arrives at the cliff. `diskspace trend` shows the full picture on demand: burn rate, days-to-full, and which paths grew most over the window. All of it is advisory — trend signals never trigger a deletion.
 
 ### 9. Receipts ledger
 
@@ -253,6 +256,7 @@ Rules live in [`rules/builtin.yaml`](rules/builtin.yaml). Currently **75 of 91**
 - **M8** — scan.json cache fix, sparse-file accounting, expanded rule library ✓
 - **M9** — typed-consent override, honest accounting, `explain`, `doctor`, receipts ledger ✓
 - **M10** — `undo`, `watch` daemon with launchd + `.app` bundle, consequence backfill (32 rules), Chromium on-device AI model rules ✓
+- **Velocity layer** — `diskspace trend` (burn rate, days-to-full, top growers) + slow-slide forecast alerts in `watch` ✓
 - **M11** — Time Machine local snapshots, per-version Xcode, Dropbox/iCloud advisor (suggestion-only), domain-specialized profiles
 
 See the [latest release](https://github.com/tymrtn/diskspace/releases/latest) for what's new, and [CHANGELOG.md](https://github.com/tymrtn/diskspace/releases) (releases page) for full history.

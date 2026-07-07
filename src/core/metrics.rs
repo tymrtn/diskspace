@@ -203,8 +203,11 @@ pub fn compute_metrics(path: &Path, prof: &profile::Profile) -> Result<Metrics> 
 }
 
 /// Test/seam entry point: base dir + clock injected so tests use a tempdir and a
-/// fixed `now` and never touch the real `~/.diskspace`.
-fn compute_metrics_in(
+/// fixed `now` and never touch the real `~/.diskspace`. `pub(crate)` so
+/// `agent_surface` can seam its enrichment tests against a hermetic base (a
+/// whole-volume df sample on the REAL data dir would otherwise leak burn-rate
+/// signal into a "no series for this path" test).
+pub(crate) fn compute_metrics_in(
     base: &Path,
     path: &Path,
     _prof: &profile::Profile,
@@ -339,6 +342,129 @@ fn burn_rate_and_days_to_full(df: &[DfSample]) -> (Option<f64>, Option<u32>) {
     };
 
     (Some(burn_rate), days)
+}
+
+// ---------------------------------------------------------------------------
+// Trend — windowed burn rate + subtree growth attribution (advisory)
+// ---------------------------------------------------------------------------
+
+/// Trailing-window whole-volume trend. Unlike [`Metrics`] (which fits the FULL
+/// df history), this restricts the fit to the last `window_days` so an old
+/// crisis-and-recovery doesn't pollute today's slope. Reads `df_series.jsonl`
+/// only — never the (much larger) per-entry series — so it is cheap enough to
+/// run on every watch tick. Advisory like everything in this module: it may
+/// notify, never actuate.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct BurnTrend {
+    /// Positive = filling, negative = reclaiming. `None` until the window holds
+    /// enough samples over a non-degenerate span (see `stable_ols_slope`).
+    pub burn_rate_bytes_per_day: Option<f64>,
+    /// `current_free / burn_rate`, only when filling. Never negative.
+    pub days_to_full: Option<u32>,
+    /// How many df samples contributed to the fit.
+    pub samples: usize,
+    /// The window requested, in days.
+    pub window_days: f64,
+}
+
+/// Compute the trailing-window burn trend from `df_series.jsonl`.
+pub fn burn_trend(window_days: f64) -> Result<BurnTrend> {
+    burn_trend_in(&profile::data_dir(), window_days, Utc::now())
+}
+
+fn burn_trend_in(base: &Path, window_days: f64, now: DateTime<Utc>) -> Result<BurnTrend> {
+    let cutoff = now - chrono::Duration::milliseconds((window_days * 86_400_000.0) as i64);
+    let df: Vec<DfSample> = read_df_series_in(base)?
+        .into_iter()
+        .filter(|s| s.ts >= cutoff)
+        .collect();
+    let (burn_rate, days_to_full) = burn_rate_and_days_to_full(&df);
+    Ok(BurnTrend {
+        burn_rate_bytes_per_day: burn_rate,
+        days_to_full,
+        samples: df.len(),
+        window_days,
+    })
+}
+
+/// One growing entry: how much a tracked path grew inside the window.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Grower {
+    /// Display path — the entry's most recently observed path (rename-stable
+    /// identity comes from the series key).
+    pub path: PathBuf,
+    /// Bytes at the first and last observation inside the window.
+    pub first_bytes: u64,
+    pub last_bytes: u64,
+    /// `last - first`. Always positive here (shrinking entries are dropped).
+    pub delta_bytes: u64,
+    /// Growth rate over the entry's observed span within the window.
+    pub per_day_bytes: f64,
+}
+
+/// Rank tracked entries by how much they GREW inside the trailing window.
+///
+/// For each series identity (inode-or-path key), take the earliest and latest
+/// observation with `ts >= now - window`; the delta is the growth. Tombstones
+/// count as 0 bytes, so an entry deleted mid-window reads as shrinking and is
+/// dropped (we attribute growth, not churn). Entries observed only once in the
+/// window carry no delta and are skipped. Reads the full per-entry series, so
+/// callers should treat this as an occasional query (a `trend` command, a
+/// once-a-day alert), not a per-tick one.
+pub fn top_growers(window_days: f64, limit: usize) -> Result<Vec<Grower>> {
+    top_growers_in(&profile::data_dir(), window_days, limit, Utc::now())
+}
+
+fn top_growers_in(
+    base: &Path,
+    window_days: f64,
+    limit: usize,
+    now: DateTime<Utc>,
+) -> Result<Vec<Grower>> {
+    let cutoff = now - chrono::Duration::milliseconds((window_days * 86_400_000.0) as i64);
+    let series = series::read_all_in_pub(base)?;
+
+    // Per identity: (first_ts, first_bytes, last_ts, last_bytes, last_path).
+    // File order is append order, but sort by ts to be safe against merged logs.
+    let mut per_key: std::collections::HashMap<
+        crate::core::series::ObsKey,
+        (DateTime<Utc>, u64, DateTime<Utc>, u64, PathBuf),
+    > = std::collections::HashMap::new();
+    for o in series.iter().filter(|o| o.ts >= cutoff) {
+        per_key
+            .entry(o.key.clone())
+            .and_modify(|(fts, fb, lts, lb, lp)| {
+                if o.ts < *fts {
+                    *fts = o.ts;
+                    *fb = o.bytes;
+                }
+                if o.ts >= *lts {
+                    *lts = o.ts;
+                    *lb = o.bytes;
+                    *lp = o.path.clone();
+                }
+            })
+            .or_insert((o.ts, o.bytes, o.ts, o.bytes, o.path.clone()));
+    }
+
+    let mut growers: Vec<Grower> = per_key
+        .into_values()
+        .filter(|(fts, fb, lts, lb, _)| lts > fts && lb > fb)
+        .map(|(fts, fb, lts, lb, lp)| {
+            let span_days = ((lts - fts).num_milliseconds() as f64 / 86_400_000.0).max(1.0 / 24.0);
+            let delta = lb - fb;
+            Grower {
+                path: lp,
+                first_bytes: fb,
+                last_bytes: lb,
+                delta_bytes: delta,
+                per_day_bytes: delta as f64 / span_days,
+            }
+        })
+        .collect();
+    growers.sort_by(|a, b| b.delta_bytes.cmp(&a.delta_bytes));
+    growers.truncate(limit);
+    Ok(growers)
 }
 
 // ---------------------------------------------------------------------------
@@ -998,5 +1124,120 @@ mod tests {
              Ranking MUST NOT depend on advisory metrics — scoring stays \
              measurement-blind (size * confidence only)."
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Trend: windowed burn rate + growth attribution
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn burn_trend_windows_out_old_crisis_samples() {
+        let base = TempBase::new("trend-window");
+        let now = ts(2026, 7, 10);
+        let gb = 1_000_000_000u64;
+        let total = 1000 * gb;
+
+        // 30 days ago: a crisis + recovery that would wreck a full-history fit
+        // (free crashed to ~0 then jumped back up).
+        append_df_sample_in(base.path(), &df(now - Duration::days(30), 500 * gb, total)).unwrap();
+        append_df_sample_in(base.path(), &df(now - Duration::days(29), 1 * gb, total)).unwrap();
+        append_df_sample_in(base.path(), &df(now - Duration::days(28), 400 * gb, total)).unwrap();
+
+        // Last 6 days: a clean, steady slide of 10 GB/day: 160 → 100 GB free.
+        for i in 0..=6u64 {
+            append_df_sample_in(
+                base.path(),
+                &df(
+                    now - Duration::days(6 - i as i64),
+                    (160 - 10 * i) * gb,
+                    total,
+                ),
+            )
+            .unwrap();
+        }
+
+        let trend = burn_trend_in(base.path(), 7.0, now).unwrap();
+        assert_eq!(trend.samples, 7, "only the in-window samples contribute");
+        let rate = trend
+            .burn_rate_bytes_per_day
+            .expect("steady in-window slide yields a burn rate");
+        assert!(
+            (rate - 10.0 * gb as f64).abs() < 0.5 * gb as f64,
+            "windowed fit sees ~10 GB/day, got {rate}"
+        );
+        // 100 GB free at 10 GB/day → ~10 days to full.
+        assert_eq!(trend.days_to_full, Some(10));
+    }
+
+    #[test]
+    fn burn_trend_empty_or_sparse_window_yields_none() {
+        let base = TempBase::new("trend-sparse");
+        let now = ts(2026, 7, 10);
+        // No file at all.
+        let t = burn_trend_in(base.path(), 7.0, now).unwrap();
+        assert_eq!(t.burn_rate_bytes_per_day, None);
+        assert_eq!(t.days_to_full, None);
+        assert_eq!(t.samples, 0);
+
+        // Two samples (< MIN_SAMPLES) → still None.
+        append_df_sample_in(base.path(), &df(now - Duration::days(2), 100, 1000)).unwrap();
+        append_df_sample_in(base.path(), &df(now - Duration::days(1), 90, 1000)).unwrap();
+        let t = burn_trend_in(base.path(), 7.0, now).unwrap();
+        assert_eq!(t.burn_rate_bytes_per_day, None, "below MIN_SAMPLES");
+    }
+
+    #[test]
+    fn top_growers_ranks_by_delta_and_drops_shrinkers() {
+        let base = TempBase::new("growers");
+        let now = ts(2026, 7, 10);
+        let d = |days: i64| now - Duration::days(days);
+
+        let batch = vec![
+            // /big grows 100 → 900 over 5 days (+800).
+            series_obs("/big", 100, d(5), Source::Full),
+            series_obs("/big", 900, d(0), Source::Full),
+            // /small grows 10 → 60 (+50).
+            series_obs("/small", 10, d(5), Source::Full),
+            series_obs("/small", 60, d(0), Source::Full),
+            // /shrinker declines 500 → 100 — must NOT appear.
+            series_obs("/shrinker", 500, d(5), Source::Full),
+            series_obs("/shrinker", 100, d(0), Source::Full),
+            // /once observed a single time — no delta, skipped.
+            series_obs("/once", 999, d(3), Source::Full),
+            // /ancient grew, but entirely OUTSIDE the window — skipped.
+            series_obs("/ancient", 1, d(40), Source::Full),
+            series_obs("/ancient", 100_000, d(30), Source::Full),
+        ];
+        crate::core::series::append_batch_in_pub(base.path(), &batch).unwrap();
+
+        let growers = top_growers_in(base.path(), 7.0, 10, now).unwrap();
+        let paths: Vec<&str> = growers.iter().map(|g| g.path.to_str().unwrap()).collect();
+        assert_eq!(
+            paths,
+            vec!["/big", "/small"],
+            "ranked by delta, growth only"
+        );
+        assert_eq!(growers[0].delta_bytes, 800);
+        // 800 bytes over 5 days = 160 bytes/day.
+        assert!((growers[0].per_day_bytes - 160.0).abs() < 1.0);
+
+        // limit is honored.
+        let top1 = top_growers_in(base.path(), 7.0, 1, now).unwrap();
+        assert_eq!(top1.len(), 1);
+        assert_eq!(top1[0].path, PathBuf::from("/big"));
+    }
+
+    #[test]
+    fn top_growers_tombstone_reads_as_shrink_not_growth() {
+        let base = TempBase::new("growers-tombstone");
+        let now = ts(2026, 7, 10);
+        let batch = vec![
+            series_obs("/deleted", 5_000, now - Duration::days(3), Source::Full),
+            // Tombstone carries bytes=0 — the entry shrank, so it must not rank.
+            series_obs("/deleted", 0, now - Duration::days(1), Source::Tombstone),
+        ];
+        crate::core::series::append_batch_in_pub(base.path(), &batch).unwrap();
+        let growers = top_growers_in(base.path(), 7.0, 10, now).unwrap();
+        assert!(growers.is_empty(), "a deleted entry is churn, not growth");
     }
 }
