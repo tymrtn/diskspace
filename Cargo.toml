@@ -1,6 +1,6 @@
 [package]
 name = "diskspace-cli"
-version = "0.11.3"
+version = "0.12.0"
 edition = "2021"
 description = "Find the dead weight in your cargo hold — a personalized, reversible disk-cleanup CLI"
 license-file = "LICENSE"
@@ -71,6 +71,8 @@ sha2 = "0.10"
 shell-words = "1"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 rand = "0.8"
+ratatui = "0.29"
+crossterm = "0.28"
 
 [profile.release]
 opt-level = 3

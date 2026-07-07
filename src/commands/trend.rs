@@ -17,6 +17,14 @@ use crate::output::{self, Context};
 pub fn run(window_days: f64, top: usize, ctx: &Context) -> Result<()> {
     let trend = metrics::burn_trend(window_days)?;
     let growers = metrics::top_growers(window_days, top)?;
+    // Free-space history for the sparkline — same window as the fit.
+    let cutoff =
+        chrono::Utc::now() - chrono::Duration::milliseconds((window_days * 86_400_000.0) as i64);
+    let free_series: Vec<f64> = metrics::read_df_series()?
+        .into_iter()
+        .filter(|s| s.ts >= cutoff)
+        .map(|s| s.free_bytes as f64)
+        .collect();
 
     if ctx.json {
         println!(
@@ -44,6 +52,34 @@ pub fn run(window_days: f64, top: usize, ctx: &Context) -> Result<()> {
         )
     );
     println!();
+
+    if free_series.len() >= 2 {
+        let min = free_series.iter().cloned().fold(f64::INFINITY, f64::min);
+        let max = free_series
+            .iter()
+            .cloned()
+            .fold(f64::NEG_INFINITY, f64::max);
+        let now_free = *free_series.last().unwrap();
+        println!(
+            "  free space   {}   {} now",
+            ctx.style(&output::sparkline(&free_series, 36), &bold),
+            ctx.style(&output::format_bytes(now_free as u64), &bold),
+        );
+        println!(
+            "  {}",
+            ctx.style(
+                &format!(
+                    "{:width$}low {} · high {}",
+                    "",
+                    output::format_bytes(min as u64),
+                    output::format_bytes(max as u64),
+                    width = 13
+                ),
+                &dim
+            )
+        );
+        println!();
+    }
 
     match (trend.burn_rate_bytes_per_day, trend.days_to_full) {
         (Some(rate), Some(days)) if rate > 0.0 => {
@@ -90,11 +126,13 @@ pub fn run(window_days: f64, top: usize, ctx: &Context) -> Result<()> {
             ctx.style("→", &yellow)
         );
         println!();
+        let max_delta = growers.iter().map(|g| g.delta_bytes).max().unwrap_or(0);
         for g in &growers {
             println!(
-                "  {}  {:>10}  {:>12}  {}",
+                "  {}  {:>10}  {}  {:>12}  {}",
                 ctx.style("◆", &yellow),
                 ctx.style(&format!("+{}", output::format_bytes(g.delta_bytes)), &bold),
+                ctx.style(&output::size_bar(g.delta_bytes, max_delta, 12), &yellow),
                 ctx.style(
                     &format!("{}/day", output::format_bytes(g.per_day_bytes as u64)),
                     &dim

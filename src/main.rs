@@ -213,6 +213,16 @@ enum Commands {
         #[arg(long, default_value = "10")]
         top: usize,
     },
+    /// Live TUI dashboard: free-space chart, burn rate, top growers (read-only).
+    /// Interactive sibling of `trend` — agents should use `--json trend` instead.
+    Top {
+        /// Trailing window in days for the chart and growth ranking
+        #[arg(long, default_value = "7")]
+        window_days: f64,
+        /// Max growing paths to show (default: 15)
+        #[arg(long, default_value = "15")]
+        top: usize,
+    },
     /// Show airlock state and pending purges
     Status,
     /// Verify the P1 measurement layer's invariants hold at runtime (read-only)
@@ -420,6 +430,7 @@ fn main() -> Result<()> {
             WatchAction::Run => commands::watch::run(&ctx),
         },
         Some(Commands::Trend { window_days, top }) => commands::trend::run(window_days, top, &ctx),
+        Some(Commands::Top { window_days, top }) => commands::top::run(window_days, top),
         Some(Commands::Status) => commands::status::run(&ctx),
         Some(Commands::Selfcheck { measurement }) => commands::selfcheck::run(measurement, &ctx),
         Some(Commands::Profile { action }) => match action {

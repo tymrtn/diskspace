@@ -107,6 +107,44 @@ pub fn size_bar(bytes: u64, max_bytes: u64, width: usize) -> String {
     format!("{}{}", bar, "░".repeat(empty))
 }
 
+/// Unicode sparkline: bucket `values` into `width` buckets (mean per bucket)
+/// and render each with the ▁▂▃▄▅▆▇█ gradient, scaled to the series' own
+/// min..max. Fewer values than buckets renders one char per value. An empty
+/// series yields an empty string; a flat series renders mid-height so it reads
+/// as "signal present, no movement" rather than a floor.
+pub fn sparkline(values: &[f64], width: usize) -> String {
+    const LEVELS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+    if values.is_empty() || width == 0 {
+        return String::new();
+    }
+    // Mean-per-bucket downsample so a 2000-sample week fits any width.
+    let buckets: Vec<f64> = if values.len() <= width {
+        values.to_vec()
+    } else {
+        (0..width)
+            .map(|i| {
+                let lo = i * values.len() / width;
+                let hi = (((i + 1) * values.len()) / width).max(lo + 1);
+                values[lo..hi].iter().sum::<f64>() / (hi - lo) as f64
+            })
+            .collect()
+    };
+    let min = buckets.iter().cloned().fold(f64::INFINITY, f64::min);
+    let max = buckets.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    let span = max - min;
+    buckets
+        .iter()
+        .map(|v| {
+            if span <= f64::EPSILON {
+                LEVELS[3] // flat series → mid-height
+            } else {
+                let idx = ((v - min) / span * (LEVELS.len() - 1) as f64).round() as usize;
+                LEVELS[idx.min(LEVELS.len() - 1)]
+            }
+        })
+        .collect()
+}
+
 /// Icon for a category (plain ASCII-art style, no emoji)
 pub fn category_icon(category: &str) -> &'static str {
     match category {

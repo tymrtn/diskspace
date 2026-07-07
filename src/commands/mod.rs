@@ -19,6 +19,7 @@ pub mod scan;
 pub mod selfcheck;
 pub mod status;
 pub mod stow;
+pub mod top;
 pub mod trend;
 pub mod undo;
 pub mod watch;

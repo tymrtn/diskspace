@@ -59,6 +59,7 @@ diskspace reclaim                 # jettison high-confidence weight NOW (no airl
 diskspace purge                   # permanently delete airlock contents
 diskspace status                  # show what's in the airlock
 diskspace trend                   # burn rate, days-to-full projection, top-growing paths
+diskspace top                     # live TUI dashboard of the same (q to quit)
 diskspace watch install           # background disk-pressure monitor (see below)
 ```
 
@@ -139,7 +140,9 @@ Checks `df` every 5 minutes. **10% free** fires a soft macOS notification sugges
 
 Notifications are deduped via a state file — you don't get pinged every 5 minutes once you've already been told.
 
-The watch also fits a trailing-week burn rate from its own tick history. When the projection says the disk fills within **30 days** — even with free space still comfortably above the thresholds — it sends a once-a-day forecast alert naming the top-growing path. Threshold alerts catch the cliff; the forecast catches the slow slide that arrives at the cliff. `diskspace trend` shows the full picture on demand: burn rate, days-to-full, and which paths grew most over the window. All of it is advisory — trend signals never trigger a deletion.
+The watch also fits a trailing-week burn rate from its own tick history. When the projection says the disk fills within **30 days** — even with free space still comfortably above the thresholds — it sends a once-a-day forecast alert naming the top-growing path. Threshold alerts catch the cliff; the forecast catches the slow slide that arrives at the cliff. `diskspace trend` shows the full picture on demand: a free-space sparkline, burn rate, days-to-full, and which paths grew most over the window. `diskspace top` is the same view as a live TUI dashboard. All of it is advisory — trend signals never trigger a deletion.
+
+**Menu bar:** [`contrib/swiftbar/diskspace.5m.sh`](contrib/swiftbar/diskspace.5m.sh) is a [SwiftBar](https://github.com/swiftbar/SwiftBar)/xbar plugin that puts the free %, trend, days-to-full, and top growers in the macOS menu bar — it reads `diskspace --json trend`, so it needs no extra daemon.
 
 ### 9. Receipts ledger
 
