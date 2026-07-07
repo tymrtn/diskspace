@@ -123,7 +123,7 @@ fn find_developer_id_identity() -> Option<String> {
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
     // Each line looks like:
-    //   `  1) <HASH> "Developer ID Application: Xoder PR LLC (RST67A4A6S)"`
+    //   `  1) <HASH> "Developer ID Application: Example Corp (TEAM123456)"`
     // We want the quoted string for the first line containing
     // "Developer ID Application:".
     for line in stdout.lines() {

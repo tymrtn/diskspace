@@ -702,7 +702,7 @@ mod tests {
     #[test]
     fn gitpack_by_path_is_repack() {
         let t = TempTree::new("gitpack");
-        let pack = t.dir("Clef/.git/objects/pack");
+        let pack = t.dir("AssetVault/.git/objects/pack");
         t.file(&pack, "pack-abc.pack", 64 * 1024);
         let c = classify_dir(&pack, &prof());
         assert_eq!(c.signature, Signature::GitPack);
@@ -973,14 +973,14 @@ mod tests {
     #[test]
     fn never_touch_path_is_keep() {
         let t = TempTree::new("keep");
-        let pack = t.dir("Clef/.git/objects/pack");
+        let pack = t.dir("AssetVault/.git/objects/pack");
         t.file(&pack, "pack-abc.pack", 64 * 1024);
 
         let mut p = prof();
-        // Never-touch the whole Clef tree via an absolute prefix.
+        // Never-touch the whole AssetVault tree via an absolute prefix.
         p.paths
             .never_touch
-            .push(t.root.join("Clef").to_string_lossy().into_owned());
+            .push(t.root.join("AssetVault").to_string_lossy().into_owned());
 
         let c = classify_dir(&pack, &p);
         assert_eq!(

@@ -595,7 +595,7 @@ mod tests {
     #[test]
     fn classifies_gitpack_to_repack_with_action() {
         let t = TempTree::new("gitpack");
-        let pack = t.dir("Clef/.git/objects/pack");
+        let pack = t.dir("AssetVault/.git/objects/pack");
         t.file(&pack, "pack-abc.pack", 64 * 1024);
         let c = classify::classify_dir(&pack, &prof());
         assert_eq!(c.signature, Signature::GitPack);

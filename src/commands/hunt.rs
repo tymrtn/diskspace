@@ -215,7 +215,7 @@ impl DirUniverse {
 /// [`drill_dir`]: when a directory's unruled bytes are concentrated in a FEW large
 /// children, we descend and surface each big child as its own row instead of
 /// reporting the coarse parent blob — turning a "397 GB Dropbox" parent into its
-/// real "138 GB Clef + 60 GB BMI" unruled children.
+/// real "138 GB AssetVault + 60 GB BMI" unruled children.
 fn hunt_from_cache(
     scan: &ScanResult,
     home: &Path,
@@ -298,10 +298,10 @@ fn collect_landings(
 ///
 /// At each level we collect EVERY immediate child whose UNRULED bytes clear
 /// `min_size` in ABSOLUTE terms — NOT as a fraction of the parent. That relative
-/// gate was the bug (finding 1): `~/Dropbox/Clef` is only ~35% of a 397 GB Dropbox
+/// gate was the bug (finding 1): `~/Dropbox/AssetVault` is only ~35% of a 397 GB Dropbox
 /// yet is plainly the row worth showing. When a directory has such big children we
 /// recurse into EACH of them, dropping the coarse parent row, so a single
-/// `~/Dropbox` parent surfaces BOTH `Clef` (138 GB) AND `BMI` (60 GB) as their own
+/// `~/Dropbox` parent surfaces BOTH `AssetVault` (138 GB) AND `BMI` (60 GB) as their own
 /// rows (finding 2) — and the descent is unbounded in depth, so it reaches
 /// `Dropbox/Code/repo` when concentration holds all the way down. A directory is
 /// kept as its OWN row only when it has NO child clearing the floor: its unruled
@@ -760,11 +760,11 @@ mod tests {
     fn drills_to_concentrated_unruled_child() {
         let home = PathBuf::from("/home/u");
         let gb = 1024 * 1024 * 1024;
-        // ~/Dropbox = 200 GB total, all unruled: 138 GB in Clef, 10 GB in misc.
+        // ~/Dropbox = 200 GB total, all unruled: 138 GB in AssetVault, 10 GB in misc.
         let scan = scan_with(
             vec![
                 dir("/home/u/Dropbox", 200 * gb),
-                dir("/home/u/Dropbox/Clef", 138 * gb),
+                dir("/home/u/Dropbox/AssetVault", 138 * gb),
                 dir("/home/u/Dropbox/misc", 10 * gb),
             ],
             vec![], // nothing rule-matched
@@ -778,8 +778,8 @@ mod tests {
         );
         let clef = got
             .iter()
-            .find(|c| c.path == Path::new("/home/u/Dropbox/Clef"))
-            .expect("Clef surfaced as its own row");
+            .find(|c| c.path == Path::new("/home/u/Dropbox/AssetVault"))
+            .expect("AssetVault surfaced as its own row");
         assert_eq!(clef.unruled_bytes, 138 * gb);
         assert!(
             got.iter()
@@ -789,10 +789,10 @@ mod tests {
     }
 
     /// THE REAL HEADLINE CASE (finding 1 + 2 regression): ~/Dropbox = 397 GB
-    /// unruled, with Clef = 138 GB and BMI = 60 GB as two distinct big children and
-    /// ~199 GB more spread thin. Clef is only 138/397 ≈ 35% of the parent — the old
+    /// unruled, with AssetVault = 138 GB and BMI = 60 GB as two distinct big children and
+    /// ~199 GB more spread thin. AssetVault is only 138/397 ≈ 35% of the parent — the old
     /// 60%-of-parent gate broke immediately and reported the coarse 397 GB blob.
-    /// The new absolute-floor drill must surface BOTH Clef AND BMI as their own
+    /// The new absolute-floor drill must surface BOTH AssetVault AND BMI as their own
     /// rows and NEVER the 397 GB parent.
     #[test]
     fn drills_real_dropbox_surfaces_clef_and_bmi() {
@@ -801,7 +801,7 @@ mod tests {
         let scan = scan_with(
             vec![
                 dir("/home/u/Dropbox", 397 * gb),
-                dir("/home/u/Dropbox/Clef", 138 * gb),
+                dir("/home/u/Dropbox/AssetVault", 138 * gb),
                 dir("/home/u/Dropbox/BMI", 60 * gb),
             ],
             vec![], // all unruled
@@ -814,8 +814,8 @@ mod tests {
         );
         let clef = got
             .iter()
-            .find(|c| c.path == Path::new("/home/u/Dropbox/Clef"))
-            .expect("Clef (138 GB) surfaced as its own row");
+            .find(|c| c.path == Path::new("/home/u/Dropbox/AssetVault"))
+            .expect("AssetVault (138 GB) surfaced as its own row");
         assert_eq!(clef.unruled_bytes, 138 * gb);
         let bmi = got
             .iter()
@@ -1262,7 +1262,7 @@ mod tests {
 
     /// FINDING 3 PARITY: the fresh walk feeds its per-dir totals through the SAME
     /// drill as the cache path, so `hunt --fresh` surfaces the concentrated unruled
-    /// child (Clef + BMI), NOT the coarse parent — and is not hard-capped at depth
+    /// child (AssetVault + BMI), NOT the coarse parent — and is not hard-capped at depth
     /// 2. This mirrors `drills_real_dropbox_surfaces_clef_and_bmi` on a real tree.
     #[cfg(unix)]
     #[test]
@@ -1275,7 +1275,7 @@ mod tests {
             .unwrap_or_else(|e| e.into_inner());
 
         // tree (acts as $HOME):
-        //   Dropbox/Clef/clef.bin   (4 MB, unruled)
+        //   Dropbox/AssetVault/clef.bin   (4 MB, unruled)
         //   Dropbox/BMI/bmi.bin     (2 MB, unruled)
         //   Dropbox/scatter/x.bin   (256 KB, below floor — stays in the residual)
         let mut home = std::env::temp_dir();
@@ -1284,7 +1284,7 @@ mod tests {
             std::process::id(),
             Utc::now().timestamp_nanos_opt().unwrap_or(0)
         ));
-        let clef = home.join("Dropbox/Clef");
+        let clef = home.join("Dropbox/AssetVault");
         let bmi = home.join("Dropbox/BMI");
         let scatter = home.join("Dropbox/scatter");
         std::fs::create_dir_all(&clef).unwrap();
@@ -1309,7 +1309,7 @@ mod tests {
             verbose: false,
             quiet: true,
         };
-        // 1 MB floor: Clef (4 MB) and BMI (2 MB) clear it; scatter (256 KB) does not.
+        // 1 MB floor: AssetVault (4 MB) and BMI (2 MB) clear it; scatter (256 KB) does not.
         let got = hunt_fresh_walk(&home, &rules, 1024 * 1024, 15, &ctx).unwrap();
 
         // The coarse Dropbox parent must NOT be reported; both big children are.
@@ -1320,7 +1320,7 @@ mod tests {
         );
         assert!(
             got.iter().any(|c| c.path == clef),
-            "Clef surfaced by the fresh-walk drill"
+            "AssetVault surfaced by the fresh-walk drill"
         );
         assert!(
             got.iter().any(|c| c.path == bmi),
