@@ -109,9 +109,30 @@ pub fn run(window_days: f64, top: usize, ctx: &Context) -> Result<()> {
             );
         }
     }
+    if let (Some(since), Some(step)) = (trend.since, trend.step_bytes) {
+        let ago = chrono::Utc::now() - since;
+        let ago_str = if ago.num_days() > 0 {
+            format!("{}d ago", ago.num_days())
+        } else {
+            format!("{}h ago", ago.num_hours().max(1))
+        };
+        println!(
+            "  {}",
+            ctx.style(
+                &format!(
+                    "rate measured since {} — a one-time {} of {} reset the trend \
+                     (older samples would fake the rate)",
+                    ago_str,
+                    if step > 0 { "reclaim" } else { "landing" },
+                    output::format_bytes(step.unsigned_abs()),
+                ),
+                &dim
+            )
+        );
+    }
     println!(
         "  {}",
-        ctx.style(&format!("{} df sample(s) in window", trend.samples), &dim)
+        ctx.style(&format!("{} df sample(s) in fit", trend.samples), &dim)
     );
     println!();
 
@@ -147,6 +168,13 @@ pub fn run(window_days: f64, top: usize, ctx: &Context) -> Result<()> {
         "  {}",
         ctx.style(
             "Advisory only — nothing here triggers a deletion. `diskspace detect` to act.",
+            &dim
+        )
+    );
+    println!(
+        "  {}",
+        ctx.style(
+            "Live view: `diskspace top`  ·  agents: `diskspace --json trend`",
             &dim
         )
     );

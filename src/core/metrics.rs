@@ -348,23 +348,53 @@ fn burn_rate_and_days_to_full(df: &[DfSample]) -> (Option<f64>, Option<u32>) {
 // Trend — windowed burn rate + subtree growth attribution (advisory)
 // ---------------------------------------------------------------------------
 
+/// A step discontinuity is a free-space delta at least this large between two
+/// nearby samples: a reclaim, a huge delete, or a big install/download landing
+/// at once. Normal tick-to-tick churn on this codebase's own telemetry runs a
+/// few hundred MB, so 2 GB in one short interval is never organic drift.
+pub(crate) const STEP_MIN_BYTES: u64 = 2_000_000_000;
+
+/// A big delta only counts as a STEP when its implied rate is beyond anything
+/// organic: at least this many bytes/day if the change had been gradual.
+/// Across a long gap (laptop asleep overnight, agent unloaded) several GB of
+/// perfectly normal use can accumulate between samples — that is trend, not a
+/// regime change, and its implied rate stays low, so it must not reset the
+/// fit. A 2 GB jump between 5-minute ticks implies ~576 GB/day; a 100 GB
+/// reclaim over a 90-minute crisis gap implies ~1.6 TB/day; 3 GB over an
+/// 8-hour sleep implies 9 GB/day. The floor cleanly separates them.
+pub(crate) const STEP_MIN_RATE_BYTES_PER_DAY: f64 = 100_000_000_000.0; // 100 GB/day
+
 /// Trailing-window whole-volume trend. Unlike [`Metrics`] (which fits the FULL
-/// df history), this restricts the fit to the last `window_days` so an old
-/// crisis-and-recovery doesn't pollute today's slope. Reads `df_series.jsonl`
-/// only — never the (much larger) per-entry series — so it is cheap enough to
-/// run on every watch tick. Advisory like everything in this module: it may
-/// notify, never actuate.
+/// df history), this restricts the fit to the last `window_days` AND to the
+/// samples since the most recent step discontinuity, so a one-time event (a
+/// 100 GB reclaim, a huge download) can't masquerade as an ongoing daily rate.
+/// A slope fitted across a step answers "what happened this week"; the user
+/// reads it as "what is happening now" — segmenting reconciles the two. Reads
+/// `df_series.jsonl` only — never the (much larger) per-entry series — so it is
+/// cheap enough to run on every watch tick. Advisory like everything in this
+/// module: it may notify, never actuate.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct BurnTrend {
-    /// Positive = filling, negative = reclaiming. `None` until the window holds
-    /// enough samples over a non-degenerate span (see `stable_ols_slope`).
+    /// Positive = filling, negative = reclaiming. `None` until the fitted
+    /// segment holds enough samples over a non-degenerate span (see
+    /// `stable_ols_slope`) — including right after a big step, when the honest
+    /// answer is "stabilizing, no rate yet" rather than the step's artifact.
     pub burn_rate_bytes_per_day: Option<f64>,
     /// `current_free / burn_rate`, only when filling. Never negative.
     pub days_to_full: Option<u32>,
-    /// How many df samples contributed to the fit.
+    /// How many df samples contributed to the fit (the segment, not the window).
     pub samples: usize,
     /// The window requested, in days.
     pub window_days: f64,
+    /// When the fitted segment starts, IF a step discontinuity trimmed the
+    /// window. `None` means the whole window was fitted. serde-default so
+    /// pre-segmentation JSON consumers keep parsing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since: Option<DateTime<Utc>>,
+    /// Size (bytes) and sign of the step that reset the fit: positive = free
+    /// space jumped up (a reclaim), negative = dropped (a big landing).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step_bytes: Option<i64>,
 }
 
 /// Compute the trailing-window burn trend from `df_series.jsonl`.
@@ -378,13 +408,45 @@ fn burn_trend_in(base: &Path, window_days: f64, now: DateTime<Utc>) -> Result<Bu
         .into_iter()
         .filter(|s| s.ts >= cutoff)
         .collect();
-    let (burn_rate, days_to_full) = burn_rate_and_days_to_full(&df);
+
+    // Fit only the samples after the most recent step discontinuity.
+    let (start, step_bytes) = last_step_boundary(&df);
+    let segment = &df[start..];
+    let since = if start > 0 {
+        segment.first().map(|s| s.ts)
+    } else {
+        None
+    };
+
+    let (burn_rate, days_to_full) = burn_rate_and_days_to_full(segment);
     Ok(BurnTrend {
         burn_rate_bytes_per_day: burn_rate,
         days_to_full,
-        samples: df.len(),
+        samples: segment.len(),
         window_days,
+        since,
+        step_bytes,
     })
+}
+
+/// Find the most recent step discontinuity in `df` (time-ordered): the last
+/// adjacent pair whose free-space delta is at least [`STEP_MIN_BYTES`] AND
+/// whose implied rate (delta over the sample gap) is at least
+/// [`STEP_MIN_RATE_BYTES_PER_DAY`]. Returns `(segment_start_index, step_bytes)`
+/// where the segment starts at the sample AFTER the step — `(0, None)` when the
+/// series has no step.
+fn last_step_boundary(df: &[DfSample]) -> (usize, Option<i64>) {
+    for i in (1..df.len()).rev() {
+        let gap_days = (df[i].ts - df[i - 1].ts).num_milliseconds() as f64 / 86_400_000.0;
+        let delta = df[i].free_bytes as i64 - df[i - 1].free_bytes as i64;
+        if delta.unsigned_abs() >= STEP_MIN_BYTES
+            && gap_days > 0.0
+            && delta.unsigned_abs() as f64 / gap_days >= STEP_MIN_RATE_BYTES_PER_DAY
+        {
+            return (i, Some(delta));
+        }
+    }
+    (0, None)
 }
 
 /// One growing entry: how much a tracked path grew inside the window.
@@ -1184,6 +1246,74 @@ mod tests {
         append_df_sample_in(base.path(), &df(now - Duration::days(1), 90, 1000)).unwrap();
         let t = burn_trend_in(base.path(), 7.0, now).unwrap();
         assert_eq!(t.burn_rate_bytes_per_day, None, "below MIN_SAMPLES");
+    }
+
+    #[test]
+    fn burn_trend_fits_only_since_last_step() {
+        // THE ARTIFACT: a slide to near-zero, a huge one-time reclaim, then a
+        // gentle 2 GB/day fill. An unsegmented fit reports "reclaiming ~20
+        // GB/day" — a rate that is not happening. The segmented fit must
+        // report the post-reclaim fill only.
+        let base = TempBase::new("trend-step");
+        let now = ts(2026, 7, 10);
+        let gb = 1_000_000_000u64;
+        let total = 1000 * gb;
+        let h = |hours: i64| now - Duration::hours(hours);
+
+        // Days 6..4 ago: slide 40 → 5 GB free.
+        for (i, free) in [(144i64, 40u64), (120, 30), (96, 5)] {
+            append_df_sample_in(base.path(), &df(h(i), free * gb, total)).unwrap();
+        }
+        // 95h ago: the rescue — 5 GB → 150 GB in one hour (implied ~3.5 TB/day).
+        append_df_sample_in(base.path(), &df(h(95), 150 * gb, total)).unwrap();
+        // Since then: steady 2 GB/day fill, hourly samples up to now.
+        for i in 0..95i64 {
+            let free = 150.0 * gb as f64 - 2.0 * gb as f64 * ((i + 1) as f64 / 24.0);
+            append_df_sample_in(base.path(), &df(h(94 - i), free as u64, total)).unwrap();
+        }
+
+        let trend = burn_trend_in(base.path(), 7.0, now).unwrap();
+        assert!(trend.since.is_some(), "the rescue step must trim the fit");
+        assert_eq!(
+            trend.step_bytes.map(|b| b > 0),
+            Some(true),
+            "step sign records that free space jumped UP"
+        );
+        let rate = trend
+            .burn_rate_bytes_per_day
+            .expect("post-step segment spans ~4 days — plenty for a fit");
+        assert!(
+            rate > 0.0,
+            "post-reclaim regime is FILLING; unsegmented fit would say reclaiming (got {rate})"
+        );
+        assert!(
+            (rate - 2.0 * gb as f64).abs() < 0.3 * gb as f64,
+            "segmented rate is the true ~2 GB/day fill, got {rate}"
+        );
+    }
+
+    #[test]
+    fn step_boundary_ignores_gradual_change_across_long_gap() {
+        // 3 GB of organic use across an 8-hour sleep gap: big delta, low
+        // implied rate (~9 GB/day) — NOT a step, must not reset the fit.
+        let now = ts(2026, 7, 10);
+        let gb = 1_000_000_000u64;
+        let samples = vec![
+            df(now - Duration::hours(20), 100 * gb, 1000 * gb),
+            df(now - Duration::hours(12), 97 * gb, 1000 * gb), // -3 GB over 8 h
+            df(now - Duration::hours(11), 96 * gb, 1000 * gb),
+        ];
+        assert_eq!(last_step_boundary(&samples), (0, None));
+
+        // Same 3 GB inside five minutes (~864 GB/day implied): a step.
+        let stepped = vec![
+            df(now - Duration::minutes(15), 100 * gb, 1000 * gb),
+            df(now - Duration::minutes(10), 97 * gb, 1000 * gb),
+            df(now - Duration::minutes(5), 96 * gb, 1000 * gb),
+        ];
+        let (idx, step) = last_step_boundary(&stepped);
+        assert_eq!(idx, 1, "segment starts after the sharp drop");
+        assert_eq!(step, Some(-(3 * gb as i64)), "negative = big landing");
     }
 
     #[test]

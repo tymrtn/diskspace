@@ -148,12 +148,28 @@ fn draw(area: Rect, f: &mut ratatui::Frame, snap: &Snapshot, window_days: f64) {
             Style::default().fg(Color::DarkGray),
         ),
     };
+    let since_span = match snap.trend.since {
+        Some(since) => {
+            let ago = chrono::Utc::now() - since;
+            let ago_str = if ago.num_days() > 0 {
+                format!("{}d", ago.num_days())
+            } else {
+                format!("{}h", ago.num_hours().max(1))
+            };
+            Span::styled(
+                format!("  · since last big shift ({} ago)", ago_str),
+                Style::default().fg(Color::DarkGray),
+            )
+        }
+        None => Span::raw(""),
+    };
     let header = Paragraph::new(Line::from(vec![
         Span::styled(
             format!(" {} free ({:.1}%)  ", format_bytes(snap.free_now), pct),
             Style::default().add_modifier(Modifier::BOLD),
         ),
         trend_span,
+        since_span,
     ]))
     .block(
         Block::default()
