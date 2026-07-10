@@ -31,6 +31,8 @@ Every dev Mac accumulates hundreds of GB in DerivedData, node_modules, Docker vo
 brew install tymrtn/diskspace/diskspace
 ```
 
+> On Homebrew 6.0.9+, third-party taps require a one-time trust. If you see *"Refusing to load formula … from untrusted tap,"* run `brew trust tymrtn/diskspace` and re-run the install.
+
 Or with cargo:
 
 ```bash
@@ -225,6 +227,7 @@ The plugin ships one skill (a deterministic `doctor`/exit-code runbook over this
 Diskspace's whole pitch is that you can trust it without watching it. The structural pieces:
 
 - **Pressure tests are the safety boundary, not confidence.** Confidence is a sort key. Pressure-test failure blocks the action regardless of score.
+- **Data-safety floor.** A hard built-in guard the actuation gate cannot override: diskspace never autonomously deletes a database, secret store, or `recreate`-class path — even when a broader directory rule matches something nested beneath it. Cleanup removes build caches, never application state.
 - **Reversibility by default.** `airlock` is the recommended path for everything below 0.85 confidence. Reclaim and `--immediate` require typed consent above their thresholds.
 - **No global `--force` flag.** Bypassing safety must be per-target, requires retyping the candidate id verbatim.
 - **Honest accounting.** Same-volume moves don't pretend to free space.
@@ -249,7 +252,7 @@ The rule library is the main contribution surface. Adding a rule is a 10-line YA
     impact: "First indexer pass per project will take a bit longer"
 ```
 
-Rules live in [`rules/builtin.yaml`](rules/builtin.yaml). Currently **75 of 91** rules have consequence metadata — backfilling the remaining 16 is a great first PR. See [CONTRIBUTING.md](CONTRIBUTING.md) for confidence guidelines and review criteria.
+Rules live in [`rules/builtin.yaml`](rules/builtin.yaml). Currently **78 of 91** rules have consequence metadata — backfilling the remaining 13 is a great first PR. See [CONTRIBUTING.md](CONTRIBUTING.md) for confidence guidelines and review criteria.
 
 ## Roadmap
 
@@ -260,6 +263,7 @@ Rules live in [`rules/builtin.yaml`](rules/builtin.yaml). Currently **75 of 91**
 - **M9** — typed-consent override, honest accounting, `explain`, `doctor`, receipts ledger ✓
 - **M10** — `undo`, `watch` daemon with launchd + `.app` bundle, consequence backfill (32 rules), Chromium on-device AI model rules ✓
 - **Velocity layer** — `diskspace trend` (burn rate, days-to-full, top growers) + slow-slide forecast alerts in `watch` ✓
+- **v0.12.0** — `diskspace top` live TUI, SwiftBar menu-bar plugin, built-in data-safety floor, recon-pipeline rename (survey/scan/inspect), notarized universal binary ✓
 - **M11** — Time Machine local snapshots, per-version Xcode, Dropbox/iCloud advisor (suggestion-only), domain-specialized profiles
 
 See the [latest release](https://github.com/tymrtn/diskspace/releases/latest) for what's new, and [CHANGELOG.md](https://github.com/tymrtn/diskspace/releases) (releases page) for full history.
