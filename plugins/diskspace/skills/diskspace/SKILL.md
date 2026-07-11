@@ -30,7 +30,7 @@ The trust model — internalize it before acting:
 ## Install if missing
 
 ```bash
-command -v diskspace >/dev/null || brew install tymrtn/diskspace/diskspace
+command -v diskspace >/dev/null || brew install tymrtn/tap/diskspace
 # or, if brew is unavailable:
 command -v diskspace >/dev/null || cargo install diskspace-cli   # installs the `diskspace` binary
 ```

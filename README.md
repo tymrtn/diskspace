@@ -28,10 +28,10 @@ Every dev Mac accumulates hundreds of GB in DerivedData, node_modules, Docker vo
 ## Install
 
 ```bash
-brew install tymrtn/diskspace/diskspace
+brew install tymrtn/tap/diskspace
 ```
 
-> On Homebrew 6.0.9+, third-party taps require a one-time trust. If you see *"Refusing to load formula … from untrusted tap,"* run `brew trust tymrtn/diskspace` and re-run the install.
+> On Homebrew 6.0.9+, third-party taps require a one-time trust. If you see *"Refusing to load formula … from untrusted tap,"* run `brew trust tymrtn/tap` and re-run the install.
 
 Or with cargo:
 

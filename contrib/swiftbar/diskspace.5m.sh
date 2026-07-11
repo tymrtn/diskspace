@@ -25,7 +25,7 @@ if [ -z "$DISKSPACE" ]; then
   echo "⛁ ?"
   echo "---"
   echo "diskspace binary not found | color=red"
-  echo "brew install tymrtn/diskspace/diskspace | font=Menlo size=11"
+  echo "brew install tymrtn/tap/diskspace | font=Menlo size=11"
   exit 0
 fi
 
