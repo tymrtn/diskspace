@@ -665,6 +665,22 @@ fn tier_a_churn_walk(
     let dir_mtime = dir_mtime_secs(&root);
     let prior_for_root = prior.dir_mtimes.get(&root).copied();
 
+    // macOS Sequoia gates other apps' sandbox containers behind the "access data
+    // from other apps" TCC prompt. Active apps rewrite their container `Data`
+    // constantly, so those subtrees look "changed" every tick — descending into
+    // them from the 5-minute background watch tick trips that prompt on repeat,
+    // and TCC consent doesn't persist for the short-lived launchd process. Prune
+    // those roots from the churn walk. This is the watch/measurement path ONLY;
+    // interactive `scan()`/`detect` use a separate jwalk walk that still descends
+    // (a foreground run's consent persists via its terminal, and it needs
+    // candidates like the Docker VM store under `~/Library/Containers`).
+    let excludes: std::collections::HashSet<PathBuf> = [
+        root.join("Library").join("Containers"),
+        root.join("Library").join("Group Containers"),
+    ]
+    .into_iter()
+    .collect();
+
     // Recurse, collecting the subtree byte total AND the net delta of registered
     // inodes encountered anywhere in the (walked) subtree.
     let mut registered_delta: i64 = 0;
@@ -678,6 +694,7 @@ fn tier_a_churn_walk(
         next_dir_mtimes,
         observations,
         &mut registered_delta,
+        &excludes,
         scan_id,
         now,
     );
@@ -710,6 +727,7 @@ fn walk_subtree(
     next_dir_mtimes: &mut HashMap<PathBuf, (i64, u64)>,
     observations: &mut Vec<Observation>,
     registered_delta: &mut i64,
+    excludes: &std::collections::HashSet<PathBuf>,
     scan_id: &str,
     now: DateTime<Utc>,
 ) -> u64 {
@@ -742,6 +760,13 @@ fn walk_subtree(
 
     for child in read.flatten() {
         let child_path = child.path();
+        // Prune TCC-protected app-container roots before we ever read into them
+        // (see the `excludes` note in `tier_a_churn_walk`). Skipping here means
+        // the whole subtree contributes 0 to this tick's churn — consistent
+        // across ticks, so the root delta stays correct.
+        if excludes.contains(&child_path) {
+            continue;
+        }
         // `symlink_metadata` so we never follow a symlink (mirrors
         // follow_links=false) and a symlink is skipped entirely.
         let md = match std::fs::symlink_metadata(&child_path) {
@@ -765,6 +790,7 @@ fn walk_subtree(
                 next_dir_mtimes,
                 observations,
                 registered_delta,
+                excludes,
                 scan_id,
                 now,
             );
@@ -1936,6 +1962,69 @@ mod tests {
         assert_eq!(
             delta, file_bytes as i64,
             "a single nested change is accounted exactly once across all changed ancestors"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // The 5-minute watch churn walk must NOT descend into other apps' sandbox
+    // containers (~/Library/Containers, ~/Library/Group Containers) — reading
+    // them trips macOS Sequoia's "access data from other apps" TCC prompt on
+    // every tick, and the consent never persists for the short-lived launchd
+    // process. Interactive scan()/detect keep their own (jwalk) descent.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn churn_walk_prunes_protected_app_containers() {
+        let tmp = TickTmp::new("tccprune");
+        let root = tmp.tree();
+
+        // A file inside a protected container — must be pruned (never observed).
+        let container = root
+            .join("Library")
+            .join("Containers")
+            .join("com.example.app")
+            .join("Data");
+        std::fs::create_dir_all(&container).unwrap();
+        write_bytes(&container.join("db.sqlite"), 120 * 1024);
+
+        // A file OUTSIDE any container — must be counted.
+        let regular = root.join("Projects").join("build");
+        std::fs::create_dir_all(&regular).unwrap();
+        let normal = regular.join("artifact.bin");
+        write_bytes(&normal, 40 * 1024);
+        let normal_bytes = on_disk_bytes(&normal);
+
+        let now = Utc::now();
+        let prior = TickState {
+            schema: TICK_STATE_SCHEMA,
+            last_full_walk: now,
+            dir_mtimes: HashMap::new(),
+            registry: Vec::new(),
+            last_df_free: 0,
+        };
+        let registered: std::collections::HashSet<(u64, u64)> = std::collections::HashSet::new();
+        let mut next_dir_mtimes = prior.dir_mtimes.clone();
+        let mut obs = Vec::new();
+        let delta = tier_a_churn_walk(
+            &root,
+            &prior,
+            &registered,
+            &mut next_dir_mtimes,
+            &mut obs,
+            "scan-test",
+            now,
+        );
+
+        // Nothing under the protected container root may be observed.
+        let containers_root = root.join("Library").join("Containers");
+        assert!(
+            obs.iter().all(|o| !o.path.starts_with(&containers_root)),
+            "churn walk must not emit observations for paths inside ~/Library/Containers"
+        );
+
+        // The delta counts ONLY the non-container file (container bytes pruned).
+        assert_eq!(
+            delta, normal_bytes as i64,
+            "container bytes are pruned; only the regular file's bytes count"
         );
     }
 
