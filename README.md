@@ -264,7 +264,7 @@ Rules live in [`rules/builtin.yaml`](rules/builtin.yaml). Currently **78 of 91**
 - **M10** — `undo`, `watch` daemon with launchd + `.app` bundle, consequence backfill (32 rules), Chromium on-device AI model rules ✓
 - **Velocity layer** — `diskspace trend` (burn rate, days-to-full, top growers) + slow-slide forecast alerts in `watch` ✓
 - **v0.12.0** — `diskspace top` live TUI, SwiftBar menu-bar plugin, built-in data-safety floor, recon-pipeline rename (survey/scan/inspect), notarized universal binary ✓
-- **v0.12.1** — `watch` no longer trips macOS Sequoia's "access data from other apps" prompt: the 5-minute churn walk now prunes other apps' sandbox containers (`~/Library/Containers`, `~/Library/Group Containers`), which it never reclaims from anyway ✓
+- **v0.12.1–0.12.2** — `watch` no longer trips macOS Sequoia's "access data from other apps" prompt: **both** of its scan paths (the 5-minute churn walk *and* the urgent-threshold auto-reclaim scan) now prune other apps' sandbox containers (`~/Library/Containers`, `~/Library/Group Containers`), which it never reclaims from anyway. Interactive `detect`/`reclaim` still descend. ✓
 - **M11** — Time Machine local snapshots, per-version Xcode, Dropbox/iCloud advisor (suggestion-only), domain-specialized profiles
 
 See the [latest release](https://github.com/tymrtn/diskspace/releases/latest) for what's new, and [CHANGELOG.md](https://github.com/tymrtn/diskspace/releases) (releases page) for full history.

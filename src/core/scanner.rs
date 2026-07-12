@@ -101,6 +101,24 @@ fn top_largest_dirs(dir_sizes: &HashMap<PathBuf, u64>, n: usize) -> Vec<DirTotal
 /// during the walk so we can render the scan summary without holding every file path
 /// in memory or persisting them to disk.
 pub fn scan(root: &Path, rules: &[Rule]) -> Result<ScanResult> {
+    scan_impl(root, rules, &[])
+}
+
+/// Like [`scan`] but prunes macOS app sandbox containers
+/// (`~/Library/Containers`, `~/Library/Group Containers`) from the walk. The
+/// background `watch` uses this for its 5-minute auto-reclaim scan so it never
+/// reads into other apps' data and never trips Sequoia's "access data from
+/// other apps" TCC prompt. Interactive commands call [`scan`] (full descent),
+/// so they still surface candidates like the Docker VM store under Containers.
+pub fn scan_excluding_appdata(root: &Path, rules: &[Rule]) -> Result<ScanResult> {
+    let excludes = [
+        root.join("Library").join("Containers"),
+        root.join("Library").join("Group Containers"),
+    ];
+    scan_impl(root, rules, &excludes)
+}
+
+fn scan_impl(root: &Path, rules: &[Rule], excludes: &[PathBuf]) -> Result<ScanResult> {
     let home = dirs_home();
     let mut entries: Vec<ScannedEntry> = Vec::new();
     let mut total_bytes: u64 = 0;
@@ -119,9 +137,22 @@ pub fn scan(root: &Path, rules: &[Rule]) -> Result<ScanResult> {
         })
         .collect();
 
+    // Prune excluded roots (e.g. app sandbox containers) BEFORE jwalk descends —
+    // `process_read_dir` runs on the worker threads and removes matching children
+    // so their contents are never read (which is what trips the TCC prompt). An
+    // empty `excludes` set retains everything, so the interactive `scan()` path is
+    // unaffected.
+    let excl: std::collections::HashSet<PathBuf> = excludes.iter().cloned().collect();
     for entry in WalkDir::new(root)
         .skip_hidden(false)
         .follow_links(false)
+        .process_read_dir(move |_, _, _, children| {
+            children.retain(|der| {
+                der.as_ref()
+                    .map(|e| !excl.contains(&e.path()))
+                    .unwrap_or(true)
+            });
+        })
         .into_iter()
         .flatten()
     {
@@ -1448,6 +1479,53 @@ mod tests {
         // ScanResult carries the series schema + a non-empty scan_id.
         assert_eq!(result.schema, crate::core::series::SERIES_SCHEMA);
         assert!(!result.scan_id.is_empty(), "scan_id is generated");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `scan_excluding_appdata` (the watch's auto-reclaim scan) must NOT descend
+    /// into app sandbox containers — reading them trips Sequoia's "access data
+    /// from other apps" TCC prompt. Plain `scan()` still descends (interactive).
+    #[cfg(unix)]
+    #[test]
+    fn scan_excluding_appdata_prunes_containers() {
+        use std::io::Write;
+        let mut dir = std::env::temp_dir();
+        dir.push(format!(
+            "diskspace-tccscan-{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        // A file deep inside a protected app container, and one outside any.
+        let container = dir
+            .join("Library")
+            .join("Containers")
+            .join("com.example.app")
+            .join("Data");
+        std::fs::create_dir_all(&container).unwrap();
+        let outside = dir.join("Projects");
+        std::fs::create_dir_all(&outside).unwrap();
+        for p in [container.join("state.bin"), outside.join("artifact.bin")] {
+            let mut f = std::fs::File::create(&p).unwrap();
+            f.write_all(b"enough bytes to allocate at least one disk block!")
+                .unwrap();
+            f.flush().unwrap();
+        }
+
+        // Rule-independent: total_bytes accumulates every walked file.
+        let full = scan(&dir, &[]).unwrap();
+        let pruned = scan_excluding_appdata(&dir, &[]).unwrap();
+
+        assert!(
+            pruned.total_bytes > 0,
+            "non-container files are still counted by the pruned scan"
+        );
+        assert!(
+            pruned.total_bytes < full.total_bytes,
+            "container bytes are pruned: full={} pruned={}",
+            full.total_bytes,
+            pruned.total_bytes
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

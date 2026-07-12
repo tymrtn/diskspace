@@ -682,7 +682,11 @@ fn auto_reclaim(home: &Path) -> AutoReclaimOutcome {
             return zero;
         }
     };
-    let scan = match scanner::scan(home, &rules) {
+    // Prune app sandbox containers — the background auto-reclaim scan must never
+    // read into other apps' data (Sequoia's "access data from other apps" TCC
+    // prompt). Safe regenerable caches diskspace auto-reclaims live outside those
+    // containers, so nothing reclaimable is lost.
+    let scan = match scanner::scan_excluding_appdata(home, &rules) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("(watch: auto-reclaim skipped — scan failed: {})", e);
