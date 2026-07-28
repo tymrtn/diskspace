@@ -86,7 +86,7 @@ const TREND_WINDOW_DAYS: f64 = 7.0;
 const WATCH_SCAN_BUDGET_SECS: u64 = 5;
 /// Includes walk callbacks and post-processing checkpoints, so the number of
 /// retained paths is strictly lower than this cap.
-const WATCH_SCAN_MAX_WORK: u64 = 50_000;
+const WATCH_SCAN_MAX_WORK: u64 = 5_000;
 const TRUEUP_RETRY_BACKOFF_SECS: i64 = 6 * 60 * 60;
 
 /// Trend alerts are a forecast, so they re-nag slowly: once a day while the
