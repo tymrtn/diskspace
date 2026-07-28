@@ -590,6 +590,7 @@ mod tests {
             scan_id: String::new(),
             metrics: None,
             largest_dirs: Vec::new(),
+            dir_mtimes: Default::default(),
         }
     }
 

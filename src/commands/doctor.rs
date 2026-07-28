@@ -41,6 +41,7 @@ use crate::output::{self, Context};
 use crate::profile;
 
 const STALE_SCAN_SECS: i64 = 60 * 60; // 1 hour
+const DOCTOR_SCAN_BUDGET_SECS: u64 = 300;
 const IMMEDIATE_THRESHOLD: f32 = 0.85;
 
 /// Default MINIMUM FREE % the ACUTE STABILIZE phase escapes the danger zone to.
@@ -368,7 +369,9 @@ pub fn build_plan(
     let home = home_path.to_string_lossy().to_string();
 
     // Step 1: ensure scan cache is fresh.
-    let scan = ensure_fresh_scan(home_path, ctx)?;
+    let scan_budget =
+        scanner::ScanBudget::for_duration(std::time::Duration::from_secs(DOCTOR_SCAN_BUDGET_SECS));
+    let scan = ensure_fresh_scan_with_budget(home_path, ctx, &scan_budget)?;
 
     // Step 2: build candidates (detect).
     let rule_list = crate::core::rules::load_builtin()?;
@@ -1378,7 +1381,18 @@ fn execute_airlock(
     })
 }
 
+#[cfg(test)]
 fn ensure_fresh_scan(root: &Path, ctx: &Context) -> Result<ScanResult> {
+    let budget =
+        scanner::ScanBudget::for_duration(std::time::Duration::from_secs(DOCTOR_SCAN_BUDGET_SECS));
+    ensure_fresh_scan_with_budget(root, ctx, &budget)
+}
+
+fn ensure_fresh_scan_with_budget(
+    root: &Path,
+    ctx: &Context,
+    budget: &scanner::ScanBudget,
+) -> Result<ScanResult> {
     let cache = scan_cache_path();
     if cache.exists() {
         let metadata = std::fs::metadata(&cache)?;
@@ -1400,10 +1414,14 @@ fn ensure_fresh_scan(root: &Path, ctx: &Context) -> Result<ScanResult> {
         );
     }
     let rule_list = crate::core::rules::load_builtin()?;
-    let result = scanner::scan(root, &rule_list)?;
+    let result = scanner::scan_bounded(root, &rule_list, budget)
+        .context("doctor scan incomplete; refusing to build or execute a recovery plan")?;
     std::fs::create_dir_all(profile::data_dir())?;
     let json = serde_json::to_string_pretty(&result)?;
-    std::fs::write(scan_cache_path(), json)?;
+    let cache = scan_cache_path();
+    let tmp = cache.with_extension("json.tmp");
+    std::fs::write(&tmp, json)?;
+    std::fs::rename(tmp, cache)?;
     Ok(result)
 }
 
@@ -1577,6 +1595,27 @@ mod tests {
         assert!(scan_cache_path().exists());
     }
 
+    #[test]
+    fn doctor_budget_exhaustion_fails_closed_without_scan_cache() {
+        let _lock = HOME_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = TempHome::new("budget-exhaustion");
+        fs::create_dir_all(home.path.join("project/node_modules")).unwrap();
+        fs::write(
+            home.path.join("project/node_modules/artifact.bin"),
+            vec![b'x'; 8192],
+        )
+        .unwrap();
+        let budget = scanner::ScanBudget::for_work(0);
+
+        let started = std::time::Instant::now();
+        let err = ensure_fresh_scan_with_budget(&home.path, &quiet_ctx(), &budget).unwrap_err();
+
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        assert!(err.to_string().contains("doctor scan incomplete"));
+        assert!(!scan_cache_path().exists());
+        assert!(!scan_cache_path().with_extension("json.tmp").exists());
+    }
+
     /// A throwaway `$HOME` under the OS temp dir, cleaned on drop. While alive,
     /// `$HOME` points here so `profile::data_dir()` (scan cache, airlock,
     /// history) resolves under the tempdir and never touches the real
@@ -1633,6 +1672,7 @@ mod tests {
             scan_id: String::new(),
             metrics: None,
             largest_dirs: Vec::new(),
+            dir_mtimes: Default::default(),
         }
     }
 

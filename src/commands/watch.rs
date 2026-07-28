@@ -82,6 +82,10 @@ const TREND_ALERT_DAYS_TO_FULL: u32 = 30;
 /// the df history can't pollute today's slope.
 const TREND_WINDOW_DAYS: f64 = 7.0;
 
+/// One shared deadline covers every advisory/actuation scan in a watch run.
+const WATCH_SCAN_BUDGET_SECS: u64 = 30;
+const TRUEUP_RETRY_BACKOFF_SECS: i64 = 6 * 60 * 60;
+
 /// Trend alerts are a forecast, so they re-nag slowly: once a day while the
 /// projection stays under the threshold. (Threshold alerts own the fast cadence.)
 const TREND_RENOTIFY_SECS: i64 = 86_400; // 24 h
@@ -117,6 +121,10 @@ struct WatchState {
     /// forecast ping never resets the urgent re-nag timer. serde-default.
     #[serde(default)]
     last_trend_notified_ts: Option<chrono::DateTime<chrono::Utc>>,
+    /// Last failed daily true-up. Prevents a HOME that cannot finish inside the
+    /// bounded window from consuming 30 seconds on every five-minute tick.
+    #[serde(default)]
+    last_trueup_failure_ts: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// Pure notify decision: should this tick deliver a notification?
@@ -207,6 +215,15 @@ fn should_autoreclaim(
         Some(t) => (now - t).num_seconds() >= AUTORECLAIM_MIN_INTERVAL_SECS,
         None => true,
     }
+}
+
+fn trueup_retry_deferred(
+    last_failure: Option<chrono::DateTime<chrono::Utc>>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    last_failure.is_some_and(|failed_at| {
+        now.signed_duration_since(failed_at).num_seconds() < TRUEUP_RETRY_BACKOFF_SECS
+    })
 }
 
 /// Pure safe-subset filter for autonomous reclaim. A candidate is eligible only
@@ -461,6 +478,12 @@ pub fn status(ctx: &Context) -> Result<()> {
 }
 
 pub fn run(ctx: &Context) -> Result<()> {
+    let scan_budget =
+        scanner::ScanBudget::for_duration(std::time::Duration::from_secs(WATCH_SCAN_BUDGET_SECS));
+    run_with_scan_budget(ctx, &scan_budget)
+}
+
+fn run_with_scan_budget(ctx: &Context, scan_budget: &scanner::ScanBudget) -> Result<()> {
     let home = home_dir()?;
     let (free_bytes, total_bytes) = df_free_and_total(&home).context("reading df")?;
     let pct_free = if total_bytes > 0 {
@@ -469,21 +492,16 @@ pub fn run(ctx: &Context) -> Result<()> {
         100.0
     };
 
-    // --- Measurement recorder (additive, best-effort, advisory-only) --------
-    //
-    // After the df read we record this tick into the P1 measurement layer:
-    //   * scanner::tick — emits per-entry Observations (Incremental / Restat /
-    //     Tombstone, or a daily Full true-up) and the next TickState.
-    //   * series::append_batch — persists those observations under one lock.
-    //   * append one df sample to df_series.jsonl (whole-volume burn-rate signal).
-    //   * persist the next TickState atomically.
-    //
-    // This is strictly additive to the df-level/notify/save_state flow below and
-    // takes NO action. A scan or write error here must NEVER crash `watch run`
-    // (mirrors history's best-effort posture), so the whole thing is swallowed
-    // with a log line. The returned advisory (if any) is surfaced in output but
-    // never acted upon — df can never widen a scan (locked invariant).
-    let advisory = record_tick(&home, free_bytes, total_bytes);
+    // Record the cheap whole-volume signal independently of scanner success. A
+    // slow daily true-up must never create a blind spot in burn-rate history.
+    let df_sample = DfSample {
+        ts: chrono::Utc::now(),
+        free_bytes,
+        total_bytes,
+    };
+    if let Err(e) = metrics::append_df_sample(&df_sample) {
+        eprintln!("(watch: failed to append df sample: {})", e);
+    }
 
     // Trailing-window burn trend (reads only the small df_series log — cheap
     // enough for every tick). Advisory: it can notify below, never actuate.
@@ -526,22 +544,48 @@ pub fn run(ctx: &Context) -> Result<()> {
     // --- Autonomous reclaim (gated) ----------------------------------------
     // Only when the user has turned on the standing opt-in AND we are urgent AND
     // the rate-limit has elapsed. Self-contained and best-effort: a reclaim error
-    // must never crash the tick. Advances `last_autoreclaim_ts` only on an attempt
-    // so the rate-limit holds regardless of how many bytes came back.
+    // must never crash the tick. Advances `last_autoreclaim_ts` only after a
+    // complete scan, so a budget timeout remains immediately retryable.
     let autoreclaim = if should_autoreclaim(
         prof_watch_autoreclaim(),
         level,
         prior.last_autoreclaim_ts,
         now,
     ) {
-        Some(auto_reclaim(&home))
+        Some(auto_reclaim(&home, scan_budget))
     } else {
         None
     };
-    let last_autoreclaim_ts = if autoreclaim.is_some() {
+    let last_autoreclaim_ts = if autoreclaim
+        .as_ref()
+        .is_some_and(|outcome| outcome.scan_complete)
+    {
         Some(now)
     } else {
         prior.last_autoreclaim_ts
+    };
+
+    // Advisory measurement runs after urgent actuation has had first claim on the
+    // shared budget. Back off a failed daily true-up for six hours; otherwise a
+    // HOME that consistently needs >30s would spend 30s on every five-minute run.
+    let tick_state = scanner::load_tick_state();
+    let trueup_due =
+        now.signed_duration_since(tick_state.last_full_walk) >= chrono::Duration::hours(24);
+    let trueup_deferred = trueup_due && trueup_retry_deferred(prior.last_trueup_failure_ts, now);
+    let recorder = if trueup_deferred {
+        None
+    } else {
+        record_tick_with_budget(&home, scan_budget)
+    };
+    let advisory = recorder
+        .as_ref()
+        .and_then(|outcome| outcome.advisory.clone());
+    let last_trueup_failure_ts = if !trueup_due || recorder.is_some() {
+        None
+    } else if trueup_deferred {
+        prior.last_trueup_failure_ts
+    } else {
+        Some(now)
     };
 
     let new_state = WatchState {
@@ -554,6 +598,7 @@ pub fn run(ctx: &Context) -> Result<()> {
         last_notified_pct,
         last_autoreclaim_ts,
         last_trend_notified_ts,
+        last_trueup_failure_ts,
     };
     save_state(&new_state).ok();
 
@@ -647,6 +692,8 @@ fn prof_watch_autoreclaim() -> bool {
 struct AutoReclaimOutcome {
     bytes_freed: u64,
     items: usize,
+    #[serde(skip)]
+    scan_complete: bool,
 }
 
 /// Perform one gated, autonomous reclaim of SAFE regenerable caches. Called only
@@ -662,7 +709,7 @@ struct AutoReclaimOutcome {
 ///      independently blocks databases, secret stores, and in-use paths.
 ///   4. Delete survivors, appending each to the receipts ledger with an
 ///      `auto: true` context marker so the action is auditable.
-fn auto_reclaim(home: &Path) -> AutoReclaimOutcome {
+fn auto_reclaim(home: &Path, scan_budget: &scanner::ScanBudget) -> AutoReclaimOutcome {
     use crate::commands::check;
     use crate::commands::detect::build_candidates_pub;
     use crate::core::history::{self, ActionKind, Entry as HistEntry};
@@ -670,6 +717,7 @@ fn auto_reclaim(home: &Path) -> AutoReclaimOutcome {
     let zero = AutoReclaimOutcome {
         bytes_freed: 0,
         items: 0,
+        scan_complete: false,
     };
 
     let rules = match rules::load_builtin() {
@@ -686,7 +734,7 @@ fn auto_reclaim(home: &Path) -> AutoReclaimOutcome {
     // read into other apps' data (Sequoia's "access data from other apps" TCC
     // prompt). Safe regenerable caches diskspace auto-reclaims live outside those
     // containers, so nothing reclaimable is lost.
-    let scan = match scanner::scan_excluding_appdata(home, &rules) {
+    let scan = match scanner::scan_excluding_appdata_bounded(home, &rules, scan_budget) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("(watch: auto-reclaim skipped — scan failed: {})", e);
@@ -747,7 +795,11 @@ fn auto_reclaim(home: &Path) -> AutoReclaimOutcome {
         }
     }
 
-    AutoReclaimOutcome { bytes_freed, items }
+    AutoReclaimOutcome {
+        bytes_freed,
+        items,
+        scan_complete: true,
+    }
 }
 
 /// Record this watch tick into the P1 measurement layer. Returns the tick's
@@ -759,7 +811,27 @@ fn auto_reclaim(home: &Path) -> AutoReclaimOutcome {
 /// a measurement error can never crash `watch run`. Mirrors `history::append`'s
 /// posture. Production state lands under `~/.diskspace` via the `profile`-keyed
 /// helpers (which resolve from `$HOME`).
+#[cfg(test)]
 fn record_tick(home: &Path, free_bytes: u64, total_bytes: u64) -> Option<String> {
+    let budget =
+        scanner::ScanBudget::for_duration(std::time::Duration::from_secs(WATCH_SCAN_BUDGET_SECS));
+    let sample = DfSample {
+        ts: chrono::Utc::now(),
+        free_bytes,
+        total_bytes,
+    };
+    metrics::append_df_sample(&sample).ok();
+    record_tick_with_budget(home, &budget).and_then(|outcome| outcome.advisory)
+}
+
+struct RecorderOutcome {
+    advisory: Option<String>,
+}
+
+fn record_tick_with_budget(
+    home: &Path,
+    scan_budget: &scanner::ScanBudget,
+) -> Option<RecorderOutcome> {
     // Load the rule set the same way `scan` / `detect` do.
     let rules = match rules::load_builtin() {
         Ok(r) => r,
@@ -772,14 +844,10 @@ fn record_tick(home: &Path, free_bytes: u64, total_bytes: u64) -> Option<String>
     // Load prior tick state (default if absent → "due for a full walk").
     let state = scanner::load_tick_state();
 
-    // Run the incremental measurement step. NOTE: `tick` ALREADY appends its
-    // observations to `series.jsonl` internally, under one batch lock (see
-    // `scanner::tick_in` → `series_append_batch`). We therefore do NOT call
-    // `series::append_batch(&outcome.observations)` again here — that would
-    // double-write every observation and corrupt the burn-rate / regrowth
-    // analysis. The observations are returned only so callers/tests can inspect
-    // them; the durable write is owned by `tick`.
-    let outcome = match scanner::tick(home, &rules, &state) {
+    // Compute in an isolated worker with no durable writes. Only after a complete
+    // outcome reaches this caller do we append observations and advance state;
+    // a hard timeout therefore cannot publish half of a measurement tick.
+    let outcome = match scanner::measure_tick_bounded(home, &rules, &state, scan_budget) {
         Ok(o) => o,
         Err(e) => {
             eprintln!("(watch: recorder tick failed: {})", e);
@@ -787,14 +855,9 @@ fn record_tick(home: &Path, free_bytes: u64, total_bytes: u64) -> Option<String>
         }
     };
 
-    // Append one whole-volume df sample (burn-rate signal). Best-effort.
-    let sample = DfSample {
-        ts: chrono::Utc::now(),
-        free_bytes,
-        total_bytes,
-    };
-    if let Err(e) = metrics::append_df_sample(&sample) {
-        eprintln!("(watch: recorder failed to append df sample: {})", e);
+    if let Err(e) = scanner::persist_tick_observations(&outcome) {
+        eprintln!("(watch: recorder failed to persist observations: {})", e);
+        return None;
     }
 
     // Persist the next tick state atomically (temp + rename). Best-effort.
@@ -802,7 +865,9 @@ fn record_tick(home: &Path, free_bytes: u64, total_bytes: u64) -> Option<String>
         eprintln!("(watch: recorder failed to persist tick state: {})", e);
     }
 
-    outcome.advisory
+    Some(RecorderOutcome {
+        advisory: outcome.advisory,
+    })
 }
 
 fn notify(level: Level, free_bytes: u64, pct_free: f32) {
@@ -1014,6 +1079,7 @@ mod tests {
             last_notified_pct: None,
             last_autoreclaim_ts: None,
             last_trend_notified_ts: None,
+            last_trueup_failure_ts: None,
         }
     }
 
@@ -1212,6 +1278,20 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn failed_trueup_is_deferred_for_six_hours_then_retried() {
+        let now = chrono::Utc::now();
+        assert!(trueup_retry_deferred(
+            Some(now - chrono::Duration::hours(1)),
+            now
+        ));
+        assert!(!trueup_retry_deferred(
+            Some(now - chrono::Duration::hours(6)),
+            now
+        ));
+        assert!(!trueup_retry_deferred(None, now));
+    }
+
     // ---- is_autoreclaim_safe subset filter ----------------------------------
 
     #[test]
@@ -1363,6 +1443,44 @@ mod tests {
         let container = home.join("Library/Containers/com.example.app/Data/node_modules");
         fs::create_dir_all(&container).unwrap();
         fs::write(container.join("private.bin"), vec![b'x'; 8192]).unwrap();
+    }
+
+    #[test]
+    fn watch_returns_df_result_when_measurement_budget_is_exhausted() {
+        let base = TempBase::new("budget-exhaustion");
+        let home = base.path.clone();
+        seed_tree(&home);
+        let _guard = HomeGuard::set(&home);
+        let data_dir = crate::profile::data_dir();
+        fs::create_dir_all(&data_dir).unwrap();
+        let series = data_dir.join("series.jsonl");
+        let tick_state = data_dir.join("tick_state.json");
+        fs::write(&series, b"existing-series\n").unwrap();
+        fs::write(&tick_state, b"existing-tick-state\n").unwrap();
+        let budget = scanner::ScanBudget::for_work(0);
+        let ctx = Context {
+            json: false,
+            yes: false,
+            no_color: true,
+            verbose: false,
+            quiet: true,
+        };
+
+        let started = std::time::Instant::now();
+        run_with_scan_budget(&ctx, &budget).unwrap();
+
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        assert!(home.join(".diskspace/watch_state.json").exists());
+        assert_eq!(fs::read(&series).unwrap(), b"existing-series\n");
+        assert_eq!(fs::read(&tick_state).unwrap(), b"existing-tick-state\n");
+        assert_eq!(
+            fs::read_to_string(home.join(".diskspace/df_series.jsonl"))
+                .unwrap()
+                .lines()
+                .count(),
+            1,
+            "df history remains available even when the advisory scan is incomplete"
+        );
     }
 
     /// The recorder appends to `series.jsonl` + `df_series.jsonl` and writes

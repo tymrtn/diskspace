@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{bail, Result};
 use chrono::{DateTime, Duration, Utc};
 use jwalk::WalkDir;
 use serde::{Deserialize, Serialize};
@@ -6,7 +6,9 @@ use std::collections::{HashMap, HashSet};
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::{Duration as StdDuration, Instant, SystemTime};
 
 use super::candidate::{Category, ScannedEntry};
 use super::rules::Rule;
@@ -19,6 +21,94 @@ use crate::profile;
 /// without re-walking $HOME. 400 comfortably covers every multi-GB directory on
 /// a real $HOME tree while adding only a few KB to the cache.
 pub const LARGEST_DIRS_TOP_N: usize = 400;
+
+/// Cooperative wall-clock and filesystem-work bound shared by every phase of a
+/// scan. Clones share one deadline/counter, so callers cannot accidentally grant
+/// each scan phase a fresh timeout.
+#[derive(Clone, Debug)]
+pub struct ScanBudget {
+    inner: Arc<ScanBudgetInner>,
+}
+
+#[derive(Debug)]
+struct ScanBudgetInner {
+    deadline: Option<Instant>,
+    remaining_work: AtomicU64,
+    exhausted: AtomicBool,
+}
+
+impl ScanBudget {
+    pub fn for_duration(duration: StdDuration) -> Self {
+        Self {
+            inner: Arc::new(ScanBudgetInner {
+                deadline: Instant::now().checked_add(duration),
+                remaining_work: AtomicU64::new(u64::MAX),
+                exhausted: AtomicBool::new(false),
+            }),
+        }
+    }
+
+    fn unlimited() -> Self {
+        Self {
+            inner: Arc::new(ScanBudgetInner {
+                deadline: None,
+                remaining_work: AtomicU64::new(u64::MAX),
+                exhausted: AtomicBool::new(false),
+            }),
+        }
+    }
+
+    /// Deterministic test seam, independent of filesystem and machine speed.
+    #[cfg(test)]
+    pub(crate) fn for_work(max_work: u64) -> Self {
+        Self {
+            inner: Arc::new(ScanBudgetInner {
+                deadline: None,
+                remaining_work: AtomicU64::new(max_work),
+                exhausted: AtomicBool::new(false),
+            }),
+        }
+    }
+
+    fn checkpoint(&self) -> Result<()> {
+        if self.is_exhausted()
+            || self
+                .inner
+                .deadline
+                .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            self.inner.exhausted.store(true, Ordering::Relaxed);
+            bail!("scan budget exhausted before the filesystem scan completed");
+        }
+
+        if self
+            .inner
+            .remaining_work
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_err()
+        {
+            self.inner.exhausted.store(true, Ordering::Relaxed);
+            bail!("scan budget exhausted before the filesystem scan completed");
+        }
+        Ok(())
+    }
+
+    pub fn is_exhausted(&self) -> bool {
+        self.inner.exhausted.load(Ordering::Relaxed)
+            || self
+                .inner
+                .deadline
+                .is_some_and(|deadline| Instant::now() >= deadline)
+    }
+
+    pub fn remaining_duration(&self) -> Option<StdDuration> {
+        self.inner
+            .deadline
+            .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+    }
+}
 
 /// One directory's TOTAL on-disk byte size (its own files plus every descendant),
 /// as computed during the walk. This is the TOTAL size, NOT just the rule-matched
@@ -71,6 +161,11 @@ pub struct ScanResult {
     /// `largest_dirs`) still deserializes to an empty Vec.
     #[serde(default)]
     pub largest_dirs: Vec<DirTotal>,
+    /// Internal full-walk artifact used by watch's daily true-up. Never persisted
+    /// in scan.json; collecting it during the primary walk avoids a second HOME
+    /// traversal under the same deadline.
+    #[serde(skip)]
+    pub(crate) dir_mtimes: HashMap<PathBuf, (i64, u64)>,
 }
 
 /// Pick the top-N largest directories from the per-dir aggregate `dir_sizes` map,
@@ -101,7 +196,36 @@ fn top_largest_dirs(dir_sizes: &HashMap<PathBuf, u64>, n: usize) -> Vec<DirTotal
 /// during the walk so we can render the scan summary without holding every file path
 /// in memory or persisting them to disk.
 pub fn scan(root: &Path, rules: &[Rule]) -> Result<ScanResult> {
-    scan_impl(root, rules, &[])
+    scan_with_budget(root, rules, &ScanBudget::unlimited())
+}
+
+pub fn scan_with_budget(root: &Path, rules: &[Rule], budget: &ScanBudget) -> Result<ScanResult> {
+    scan_impl(root, rules, &[], budget)
+}
+
+/// Run a pure full scan in an isolated worker so the caller can return at the
+/// hard deadline even if a filesystem syscall stalls between checkpoints. The
+/// worker owns no durable state; a timed-out scan cannot publish a partial cache.
+pub fn scan_bounded(root: &Path, rules: &[Rule], budget: &ScanBudget) -> Result<ScanResult> {
+    budget.checkpoint()?;
+    let root = root.to_path_buf();
+    let rules = rules.to_vec();
+    let worker_budget = budget.clone();
+    let wait = budget
+        .remaining_duration()
+        .ok_or_else(|| anyhow::anyhow!("bounded scan requires a finite deadline"))?;
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let _ = tx.send(scan_with_budget(&root, &rules, &worker_budget));
+    });
+    rx.recv_timeout(wait).map_err(|e| match e {
+        std::sync::mpsc::RecvTimeoutError::Timeout => {
+            anyhow::anyhow!("scan budget exhausted before the filesystem scan completed")
+        }
+        std::sync::mpsc::RecvTimeoutError::Disconnected => {
+            anyhow::anyhow!("scan worker stopped before returning a result")
+        }
+    })?
 }
 
 /// Like [`scan`] but prunes macOS app sandbox containers
@@ -110,18 +234,64 @@ pub fn scan(root: &Path, rules: &[Rule]) -> Result<ScanResult> {
 /// reads into other apps' data and never trips Sequoia's "access data from
 /// other apps" TCC prompt. Interactive commands call [`scan`] (full descent),
 /// so they still surface candidates like the Docker VM store under Containers.
+#[allow(dead_code)]
 pub fn scan_excluding_appdata(root: &Path, rules: &[Rule]) -> Result<ScanResult> {
-    let excludes = appdata_excludes(root);
-    scan_impl(root, rules, &excludes)
+    scan_excluding_appdata_with_budget(root, rules, &ScanBudget::unlimited())
 }
 
-fn scan_impl(root: &Path, rules: &[Rule], excludes: &[PathBuf]) -> Result<ScanResult> {
+pub fn scan_excluding_appdata_with_budget(
+    root: &Path,
+    rules: &[Rule],
+    budget: &ScanBudget,
+) -> Result<ScanResult> {
+    let excludes = appdata_excludes(root);
+    scan_impl(root, rules, &excludes, budget)
+}
+
+pub fn scan_excluding_appdata_bounded(
+    root: &Path,
+    rules: &[Rule],
+    budget: &ScanBudget,
+) -> Result<ScanResult> {
+    budget.checkpoint()?;
+    let root = root.to_path_buf();
+    let rules = rules.to_vec();
+    let worker_budget = budget.clone();
+    let wait = budget
+        .remaining_duration()
+        .ok_or_else(|| anyhow::anyhow!("bounded scan requires a finite deadline"))?;
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let _ = tx.send(scan_excluding_appdata_with_budget(
+            &root,
+            &rules,
+            &worker_budget,
+        ));
+    });
+    rx.recv_timeout(wait).map_err(|e| match e {
+        std::sync::mpsc::RecvTimeoutError::Timeout => {
+            anyhow::anyhow!("scan budget exhausted before the filesystem scan completed")
+        }
+        std::sync::mpsc::RecvTimeoutError::Disconnected => {
+            anyhow::anyhow!("scan worker stopped before returning a result")
+        }
+    })?
+}
+
+fn scan_impl(
+    root: &Path,
+    rules: &[Rule],
+    excludes: &[PathBuf],
+    budget: &ScanBudget,
+) -> Result<ScanResult> {
+    budget.checkpoint()?;
     let home = dirs_home();
     let mut entries: Vec<ScannedEntry> = Vec::new();
     let mut total_bytes: u64 = 0;
     let mut cloud_placeholder_bytes: u64 = 0;
     let mut category_totals: HashMap<String, u64> = HashMap::new();
     let mut dir_sizes: HashMap<PathBuf, u64> = HashMap::new();
+    let mut dir_mtimes: HashMap<PathBuf, (i64, u64)> = HashMap::new();
 
     // Build a map of rule path patterns to categories for fast lookup
     let rule_map: Vec<(glob::Pattern, Category)> = rules
@@ -141,10 +311,15 @@ fn scan_impl(root: &Path, rules: &[Rule], excludes: &[PathBuf]) -> Result<ScanRe
     // unaffected.
     let excl: HashSet<PathBuf> = excludes.iter().cloned().collect();
     let root_dev = root_dev_of(root);
+    let walk_budget = budget.clone();
     for entry in WalkDir::new(root)
         .skip_hidden(false)
         .follow_links(false)
         .process_read_dir(move |_, _, _, children| {
+            if walk_budget.checkpoint().is_err() {
+                children.clear();
+                return;
+            }
             // Keep a home scan on the filesystem whose free space is being
             // measured. A nested mount can expose an effectively unbounded
             // remote/container tree (the incident topology was OrbStack NFS).
@@ -162,6 +337,7 @@ fn scan_impl(root: &Path, rules: &[Rule], excludes: &[PathBuf]) -> Result<ScanRe
         .into_iter()
         .flatten()
     {
+        budget.checkpoint()?;
         let path = entry.path();
         let metadata = match entry.metadata() {
             Ok(m) => m,
@@ -170,6 +346,12 @@ fn scan_impl(root: &Path, rules: &[Rule], excludes: &[PathBuf]) -> Result<ScanRe
 
         if !metadata.is_file() && !metadata.is_dir() {
             continue;
+        }
+        if metadata.is_dir() {
+            dir_mtimes.insert(
+                path.to_path_buf(),
+                (mtime_secs_of(&metadata).unwrap_or(0), 0),
+            );
         }
 
         // Skip iCloud Drive evicted and Dropbox Smart Sync online-only files —
@@ -247,8 +429,13 @@ fn scan_impl(root: &Path, rules: &[Rule], excludes: &[PathBuf]) -> Result<ScanRe
         }
     }
 
+    // A worker callback may have noticed exhaustion after the iterator's final
+    // yielded entry. Re-check before deriving or returning any partial result.
+    budget.checkpoint()?;
+
     // Patch directory entries (size 0 from walk) with their aggregated descendant size.
     for entry in &mut entries {
+        budget.checkpoint()?;
         if entry.size_bytes == 0 {
             if let Some(&s) = dir_sizes.get(&entry.path) {
                 entry.size_bytes = s;
@@ -264,6 +451,7 @@ fn scan_impl(root: &Path, rules: &[Rule], excludes: &[PathBuf]) -> Result<ScanRe
     // in an ancestor's aggregated size.)
     let mut top_level_total: u64 = 0;
     for entry in top_level_matched(&entries) {
+        budget.checkpoint()?;
         *category_totals
             .entry(entry.category.to_string())
             .or_insert(0) += entry.size_bytes;
@@ -279,7 +467,13 @@ fn scan_impl(root: &Path, rules: &[Rule], excludes: &[PathBuf]) -> Result<ScanRe
     // rule-matched bytes) let `hunt` find — and adaptively drill into — the
     // genuinely-unruled remainder without re-walking $HOME. Top-N only so the
     // cache stays small.
+    budget.checkpoint()?;
     let largest_dirs = top_largest_dirs(&dir_sizes, LARGEST_DIRS_TOP_N);
+    budget.checkpoint()?;
+    for (path, (_, bytes)) in &mut dir_mtimes {
+        budget.checkpoint()?;
+        *bytes = dir_sizes.get(path).copied().unwrap_or(0);
+    }
 
     // Compute `scanned_at` once so the derived `scan_id` matches the stored
     // timestamp. The id is deterministic from (timestamp nanos, total_bytes) —
@@ -306,6 +500,7 @@ fn scan_impl(root: &Path, rules: &[Rule], excludes: &[PathBuf]) -> Result<ScanRe
         // whole-$HOME metric after the walk (see commands/scan.rs).
         metrics: None,
         largest_dirs,
+        dir_mtimes,
     })
 }
 
@@ -513,7 +708,81 @@ fn save_tick_state_in(base: &Path, state: &TickState) -> Result<()> {
 /// [`TickOutcome::next_state`] must be persisted via [`save_tick_state`].
 #[allow(dead_code)]
 pub fn tick(root: &Path, rules: &[Rule], prior: &TickState) -> Result<TickOutcome> {
-    tick_in(&profile::data_dir(), root, rules, prior, Utc::now())
+    tick_with_budget(root, rules, prior, &ScanBudget::unlimited())
+}
+
+pub fn tick_with_budget(
+    root: &Path,
+    rules: &[Rule],
+    prior: &TickState,
+    budget: &ScanBudget,
+) -> Result<TickOutcome> {
+    tick_in_with_budget(&profile::data_dir(), root, rules, prior, Utc::now(), budget)
+}
+
+/// Compute a tick in an isolated, state-free worker. The caller owns persistence
+/// after receiving a complete outcome, so a hard timeout cannot leave a series
+/// append without its corresponding tick state.
+pub fn measure_tick_bounded(
+    root: &Path,
+    rules: &[Rule],
+    prior: &TickState,
+    budget: &ScanBudget,
+) -> Result<TickOutcome> {
+    measure_tick_bounded_with_hooks(
+        &profile::data_dir(),
+        root,
+        rules,
+        prior,
+        budget,
+        || {},
+        || {},
+    )
+}
+
+fn measure_tick_bounded_with_hooks<B, A>(
+    base: &Path,
+    root: &Path,
+    rules: &[Rule],
+    prior: &TickState,
+    budget: &ScanBudget,
+    before_work: B,
+    after_work: A,
+) -> Result<TickOutcome>
+where
+    B: FnOnce() + Send + 'static,
+    A: FnOnce() + Send + 'static,
+{
+    budget.checkpoint()?;
+    let base = base.to_path_buf();
+    let root = root.to_path_buf();
+    let rules = rules.to_vec();
+    let prior = prior.clone();
+    let worker_budget = budget.clone();
+    let now = Utc::now();
+    let wait = budget
+        .remaining_duration()
+        .ok_or_else(|| anyhow::anyhow!("bounded tick requires a finite deadline"))?;
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        before_work();
+        let outcome =
+            tick_in_with_budget_mode(&base, &root, &rules, &prior, now, &worker_budget, false);
+        after_work();
+        let _ = tx.send(outcome);
+    });
+    rx.recv_timeout(wait).map_err(|e| match e {
+        std::sync::mpsc::RecvTimeoutError::Timeout => {
+            anyhow::anyhow!("scan budget exhausted before the measurement tick completed")
+        }
+        std::sync::mpsc::RecvTimeoutError::Disconnected => {
+            anyhow::anyhow!("measurement worker stopped before returning a result")
+        }
+    })?
+}
+
+pub fn persist_tick_observations(outcome: &TickOutcome) -> Result<()> {
+    series_append_batch(&profile::data_dir(), &outcome.observations)
 }
 
 /// Crate-internal base-dir + clock seam for [`tick`], exposed to the `selfcheck`
@@ -540,12 +809,45 @@ fn tick_in(
     prior: &TickState,
     now: DateTime<Utc>,
 ) -> Result<TickOutcome> {
+    tick_in_with_budget(base, root, rules, prior, now, &ScanBudget::unlimited())
+}
+
+fn tick_in_with_budget(
+    base: &Path,
+    root: &Path,
+    rules: &[Rule],
+    prior: &TickState,
+    now: DateTime<Utc>,
+    budget: &ScanBudget,
+) -> Result<TickOutcome> {
+    tick_in_with_budget_mode(base, root, rules, prior, now, budget, true)
+}
+
+fn tick_in_with_budget_mode(
+    base: &Path,
+    root: &Path,
+    rules: &[Rule],
+    prior: &TickState,
+    now: DateTime<Utc>,
+    budget: &ScanBudget,
+    persist_series: bool,
+) -> Result<TickOutcome> {
+    budget.checkpoint()?;
     // The current whole-volume free bytes — used ONLY for the advisory note.
     let now_df_free = history_free_bytes(root);
 
     // --- Daily true-up: a full walk re-anchors everything. ----------------
     if now.signed_duration_since(prior.last_full_walk) >= Duration::hours(24) {
-        return full_true_up(base, root, rules, prior, now, now_df_free);
+        return full_true_up(
+            base,
+            root,
+            rules,
+            prior,
+            now,
+            now_df_free,
+            budget,
+            persist_series,
+        );
     }
 
     // --- Incremental path: Tier A (churn walk) + Tier B (re-stat). ---------
@@ -575,7 +877,7 @@ fn tick_in(
     // ---- Tier A: structural-churn walk. ----------------------------------
     // Returns the whole-tree delta counted ONCE (not per changed ancestor), with
     // registered inodes excluded — so we accumulate it a single time here.
-    accounted_delta += tier_a_churn_walk(
+    accounted_delta += tier_a_churn_walk_with_budget(
         root,
         prior,
         &registered_inodes,
@@ -583,7 +885,8 @@ fn tick_in(
         &mut observations,
         &scan_id,
         now,
-    );
+        budget,
+    )?;
 
     // ---- Tier B: re-stat the registry directly (no walk). ----------------
     let next_registry = tier_b_restat(
@@ -593,14 +896,19 @@ fn tick_in(
         &scan_id,
         now,
         base,
-    );
+        budget,
+    )?;
+
+    budget.checkpoint()?;
 
     // ---- df ADVISORY (signal only — never a trigger). --------------------
     let advisory = df_advisory(prior.last_df_free, now_df_free, accounted_delta);
 
     // Persist the observations under one batch lock (best-effort but propagate
     // a hard write error so the caller knows the tick didn't fully record).
-    series_append_batch(base, &observations)?;
+    if persist_series {
+        series_append_batch(base, &observations)?;
+    }
 
     let next_state = TickState {
         schema: TICK_STATE_SCHEMA,
@@ -627,10 +935,12 @@ fn full_true_up(
     prior: &TickState,
     now: DateTime<Utc>,
     now_df_free: Option<u64>,
+    budget: &ScanBudget,
+    persist_series: bool,
 ) -> Result<TickOutcome> {
     // `tick` is the background watch scanner. Its daily true-up must preserve
     // the same app-container pruning as the incremental and auto-reclaim paths.
-    let result = scan_excluding_appdata(root, rules)?;
+    let result = scan_excluding_appdata_with_budget(root, rules, budget)?;
     let scan_id = if result.scan_id.is_empty() {
         format!("full-{}", now.timestamp_millis())
     } else {
@@ -639,6 +949,7 @@ fn full_true_up(
 
     let mut observations: Vec<Observation> = Vec::with_capacity(result.entries.len());
     for e in &result.entries {
+        budget.checkpoint()?;
         let key = ObsKey::for_entry(e.dev, e.ino, &e.path);
         observations.push(Observation::new(
             key,
@@ -652,14 +963,19 @@ fn full_true_up(
     }
 
     // Rebuild the registry: top-N by bytes AND everything >= 1 GiB.
+    budget.checkpoint()?;
     let next_registry = rebuild_registry(&result.entries, now);
+    budget.checkpoint()?;
 
-    // Rebuild the dir-mtime cache from the full walk so the next incremental tick
-    // has a fresh baseline. We re-walk dir mtimes here (cheap relative to the full
-    // scan we just did) using the same follow_links/hidden settings.
-    let next_dir_mtimes = build_dir_mtimes(root, &appdata_excludes(root));
+    // The full scan collected this baseline in the same traversal. Reusing it is
+    // essential under watch's 30-second budget: a second HOME walk would make a
+    // successful true-up impossible on large but otherwise healthy homes.
+    let next_dir_mtimes = result.dir_mtimes.clone();
 
-    series_append_batch(base, &observations)?;
+    budget.checkpoint()?;
+    if persist_series {
+        series_append_batch(base, &observations)?;
+    }
 
     let next_state = TickState {
         schema: TICK_STATE_SCHEMA,
@@ -695,6 +1011,7 @@ fn full_true_up(
 /// the Tier-A/Tier-B overlap for registered files (finding 4): a registered
 /// inode's delta is owned solely by Tier B.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 fn tier_a_churn_walk(
     root: &Path,
     prior: &TickState,
@@ -704,6 +1021,31 @@ fn tier_a_churn_walk(
     scan_id: &str,
     now: DateTime<Utc>,
 ) -> i64 {
+    tier_a_churn_walk_with_budget(
+        root,
+        prior,
+        registered_inodes,
+        next_dir_mtimes,
+        observations,
+        scan_id,
+        now,
+        &ScanBudget::unlimited(),
+    )
+    .expect("unlimited scan budget")
+}
+
+#[allow(clippy::too_many_arguments)]
+fn tier_a_churn_walk_with_budget(
+    root: &Path,
+    prior: &TickState,
+    registered_inodes: &std::collections::HashSet<(u64, u64)>,
+    next_dir_mtimes: &mut HashMap<PathBuf, (i64, u64)>,
+    observations: &mut Vec<Observation>,
+    scan_id: &str,
+    now: DateTime<Utc>,
+    budget: &ScanBudget,
+) -> Result<i64> {
+    budget.checkpoint()?;
     // Per-inode prior bytes for registered entries — the reference Tier B uses for
     // its own delta. We subtract the SAME `(now − reg.bytes)` from Tier A so a
     // registered file in a re-walked subtree nets to zero in Tier A (Tier B owns
@@ -747,12 +1089,13 @@ fn tier_a_churn_walk(
         root_dev,
         scan_id,
         now,
-    );
+        budget,
+    )?;
 
     // The whole-tree delta, counted once: total subtree growth minus the part of
     // it attributable to registered inodes (which Tier B counts instead).
     let bytes_prior = prior_for_root.map(|(_, b)| b).unwrap_or(0);
-    (bytes_now as i64 - bytes_prior as i64) - registered_delta
+    Ok((bytes_now as i64 - bytes_prior as i64) - registered_delta)
 }
 
 /// Recursively measure `dir`. If `dir`'s mtime matches the prior cache we reuse
@@ -781,7 +1124,9 @@ fn walk_subtree(
     root_dev: Option<u64>,
     scan_id: &str,
     now: DateTime<Utc>,
-) -> u64 {
+    budget: &ScanBudget,
+) -> Result<u64> {
+    budget.checkpoint()?;
     // Fast path: directory mtime unchanged since last tick → no structural churn
     // here. Reuse the cached subtree bytes and skip the whole subtree.
     //
@@ -792,7 +1137,7 @@ fn walk_subtree(
     if let (Some(mtime), Some((prior_mtime, prior_bytes))) = (dir_mtime, prior_entry) {
         if mtime == prior_mtime {
             next_dir_mtimes.insert(dir.to_path_buf(), (prior_mtime, prior_bytes));
-            return prior_bytes;
+            return Ok(prior_bytes);
         }
     }
 
@@ -805,11 +1150,12 @@ fn walk_subtree(
             if let Some(mt) = dir_mtime {
                 next_dir_mtimes.insert(dir.to_path_buf(), (mt, 0));
             }
-            return 0;
+            return Ok(0);
         }
     };
 
     for child in read.flatten() {
+        budget.checkpoint()?;
         let child_path = child.path();
         // Prune TCC-protected app-container roots before we ever read into them
         // (see the `excludes` note in `tier_a_churn_walk`). Skipping here means
@@ -848,7 +1194,8 @@ fn walk_subtree(
                 root_dev,
                 scan_id,
                 now,
-            );
+                budget,
+            )?;
         } else if ft.is_file() {
             let fbytes = file_on_disk_bytes(&md);
             subtree_bytes += fbytes;
@@ -883,7 +1230,7 @@ fn walk_subtree(
     } else {
         next_dir_mtimes.insert(dir.to_path_buf(), (0, subtree_bytes));
     }
-    subtree_bytes
+    Ok(subtree_bytes)
 }
 
 /// Tier B: re-stat every prior registry entry DIRECTLY by path (no walk), keyed
@@ -897,10 +1244,12 @@ fn tier_b_restat(
     scan_id: &str,
     now: DateTime<Utc>,
     base: &Path,
-) -> Vec<RegistryEntry> {
+    budget: &ScanBudget,
+) -> Result<Vec<RegistryEntry>> {
     let mut next_registry: Vec<RegistryEntry> = Vec::with_capacity(prior.registry.len());
 
     for reg in &prior.registry {
+        budget.checkpoint()?;
         match std::fs::symlink_metadata(&reg.path) {
             Ok(md) if md.file_type().is_file() || md.file_type().is_dir() => {
                 let bytes = if md.file_type().is_file() {
@@ -961,7 +1310,7 @@ fn tier_b_restat(
         }
     }
     let _ = base;
-    next_registry
+    Ok(next_registry)
 }
 
 /// Build the df advisory note. Compares the whole-volume free-space delta to the
@@ -1034,7 +1383,13 @@ fn rebuild_registry(entries: &[ScannedEntry], now: DateTime<Utc>) -> Vec<Registr
 /// Walk `root` collecting every directory's mtime + subtree on-disk bytes, used
 /// to rebuild the dir-mtime cache after a full true-up. Mirrors `scan()` walk
 /// settings (no hidden skip, follow_links=false, blocks*512, cloud skip).
-fn build_dir_mtimes(root: &Path, excludes: &[PathBuf]) -> HashMap<PathBuf, (i64, u64)> {
+#[cfg(test)]
+fn build_dir_mtimes(
+    root: &Path,
+    excludes: &[PathBuf],
+    budget: &ScanBudget,
+) -> Result<HashMap<PathBuf, (i64, u64)>> {
+    budget.checkpoint()?;
     // Single pass: accumulate each file's on-disk bytes into all ancestor dirs,
     // and record each directory's mtime.
     let mut dir_bytes: HashMap<PathBuf, u64> = HashMap::new();
@@ -1042,10 +1397,15 @@ fn build_dir_mtimes(root: &Path, excludes: &[PathBuf]) -> HashMap<PathBuf, (i64,
 
     let excl: HashSet<PathBuf> = excludes.iter().cloned().collect();
     let root_dev = root_dev_of(root);
+    let walk_budget = budget.clone();
     for entry in WalkDir::new(root)
         .skip_hidden(false)
         .follow_links(false)
         .process_read_dir(move |_, _, _, children| {
+            if walk_budget.checkpoint().is_err() {
+                children.clear();
+                return;
+            }
             for child in children.iter_mut().filter_map(|child| child.as_mut().ok()) {
                 if child.file_type().is_dir() && !same_device(root_dev, dev_of(&child.path())) {
                     child.read_children_path = None;
@@ -1061,6 +1421,7 @@ fn build_dir_mtimes(root: &Path, excludes: &[PathBuf]) -> HashMap<PathBuf, (i64,
         .into_iter()
         .flatten()
     {
+        budget.checkpoint()?;
         let path = entry.path();
         let md = match entry.metadata() {
             Ok(m) => m,
@@ -1086,12 +1447,14 @@ fn build_dir_mtimes(root: &Path, excludes: &[PathBuf]) -> HashMap<PathBuf, (i64,
         }
     }
 
+    budget.checkpoint()?;
     let mut out: HashMap<PathBuf, (i64, u64)> = HashMap::new();
     for (path, mtime) in dir_mtime {
+        budget.checkpoint()?;
         let bytes = dir_bytes.get(&path).copied().unwrap_or(0);
         out.insert(path, (mtime, bytes));
     }
-    out
+    Ok(out)
 }
 
 fn appdata_excludes(root: &Path) -> [PathBuf; 2] {
@@ -1369,6 +1732,7 @@ mod tests {
             scan_id: "1700000000-9999".to_string(),
             metrics: None,
             largest_dirs: Vec::new(),
+            dir_mtimes: Default::default(),
         };
         let json = serde_json::to_string(&result).unwrap();
         let back: ScanResult = serde_json::from_str(&json).unwrap();
@@ -1537,6 +1901,101 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn full_scan_work_budget_exhaustion_returns_no_partial_result() {
+        let tmp = TickTmp::new("full-scan-budget");
+        let tree = tmp.tree();
+        write_bytes(&tree.join("artifact.bin"), 8192);
+
+        let budget = ScanBudget::for_work(0);
+        let err = scan_with_budget(&tree, &[], &budget).unwrap_err();
+
+        assert!(err.to_string().contains("scan budget exhausted"));
+        assert!(budget.is_exhausted());
+    }
+
+    #[test]
+    fn tier_a_budget_exhaustion_writes_no_partial_series() {
+        let tmp = TickTmp::new("tier-a-budget");
+        let base = tmp.base();
+        let tree = tmp.tree();
+        write_bytes(&tree.join("artifact.bin"), 8192);
+        let now = Utc::now();
+        let prior = TickState {
+            last_full_walk: now,
+            ..TickState::default()
+        };
+        // tick_in consumes the first checkpoint; Tier A must reject the second.
+        let budget = ScanBudget::for_work(1);
+
+        let err = tick_in_with_budget(&base, &tree, &[], &prior, now, &budget).unwrap_err();
+
+        assert!(err.to_string().contains("scan budget exhausted"));
+        assert!(!base.join("series.jsonl").exists());
+    }
+
+    #[test]
+    fn hard_deadline_returns_while_worker_is_blocked_and_never_publishes_later() {
+        let tmp = TickTmp::new("hard-deadline-worker");
+        let base = tmp.base();
+        let tree = tmp.tree();
+        write_bytes(&tree.join("artifact.bin"), 8192);
+        std::fs::create_dir_all(&base).unwrap();
+        let series = base.join("series.jsonl");
+        let tick_state = base.join("tick_state.json");
+        std::fs::write(&series, b"existing-series\n").unwrap();
+        std::fs::write(&tick_state, b"existing-tick-state\n").unwrap();
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let worker_barrier = barrier.clone();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let budget = ScanBudget::for_duration(StdDuration::from_millis(25));
+        let started = Instant::now();
+
+        let err = measure_tick_bounded_with_hooks(
+            &base,
+            &tree,
+            &[],
+            &TickState::default(),
+            &budget,
+            move || {
+                worker_barrier.wait();
+            },
+            move || {
+                let _ = done_tx.send(());
+            },
+        )
+        .unwrap_err();
+
+        assert!(started.elapsed() < StdDuration::from_secs(1));
+        assert!(err.to_string().contains("scan budget exhausted"));
+        assert_eq!(std::fs::read(&series).unwrap(), b"existing-series\n");
+        assert_eq!(
+            std::fs::read(&tick_state).unwrap(),
+            b"existing-tick-state\n"
+        );
+
+        barrier.wait();
+        done_rx.recv_timeout(StdDuration::from_secs(2)).unwrap();
+        assert_eq!(std::fs::read(&series).unwrap(), b"existing-series\n");
+        assert_eq!(
+            std::fs::read(&tick_state).unwrap(),
+            b"existing-tick-state\n"
+        );
+    }
+
+    #[test]
+    fn mtime_rebuild_budget_exhaustion_returns_no_partial_cache() {
+        let tmp = TickTmp::new("mtime-budget");
+        let tree = tmp.tree();
+        write_bytes(&tree.join("artifact.bin"), 8192);
+        let budget = ScanBudget::for_work(0);
+
+        let err = build_dir_mtimes(&tree, &[], &budget).unwrap_err();
+
+        assert!(err.to_string().contains("scan budget exhausted"));
     }
 
     #[cfg(unix)]

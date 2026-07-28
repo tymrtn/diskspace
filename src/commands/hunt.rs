@@ -705,6 +705,7 @@ mod tests {
             scan_id: String::new(),
             metrics: None,
             largest_dirs: largest,
+            dir_mtimes: Default::default(),
         }
     }
 
