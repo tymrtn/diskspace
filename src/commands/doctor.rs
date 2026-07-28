@@ -42,6 +42,9 @@ use crate::profile;
 
 const STALE_SCAN_SECS: i64 = 60 * 60; // 1 hour
 const DOCTOR_SCAN_BUDGET_SECS: u64 = 300;
+/// Doctor is interactive and may inspect a much larger tree than watch, but it
+/// still gets a finite memory/work ceiling and a serial bounded walker.
+const DOCTOR_SCAN_MAX_WORK: u64 = 2_000_000;
 const IMMEDIATE_THRESHOLD: f32 = 0.85;
 
 /// Default MINIMUM FREE % the ACUTE STABILIZE phase escapes the danger zone to.
@@ -359,6 +362,14 @@ pub fn run(
 /// `need_bytes` here is the *delta still to recover* (caller subtracts current
 /// free space). The returned `Plan.projected_freed` is the sum of chosen step
 /// sizes; `created_at` is now; `plan_hash` is empty (filled by `plan.rs`).
+fn doctor_scan_budget() -> scanner::ScanBudget {
+    scanner::ScanBudget::for_duration(
+        std::time::Duration::from_secs(DOCTOR_SCAN_BUDGET_SECS),
+        DOCTOR_SCAN_MAX_WORK,
+        scanner::ScanParallelism::Serial,
+    )
+}
+
 pub fn build_plan(
     need_bytes: u64,
     mode: Mode,
@@ -369,8 +380,7 @@ pub fn build_plan(
     let home = home_path.to_string_lossy().to_string();
 
     // Step 1: ensure scan cache is fresh.
-    let scan_budget =
-        scanner::ScanBudget::for_duration(std::time::Duration::from_secs(DOCTOR_SCAN_BUDGET_SECS));
+    let scan_budget = doctor_scan_budget();
     let scan = ensure_fresh_scan_with_budget(home_path, ctx, &scan_budget)?;
 
     // Step 2: build candidates (detect).
@@ -1383,8 +1393,7 @@ fn execute_airlock(
 
 #[cfg(test)]
 fn ensure_fresh_scan(root: &Path, ctx: &Context) -> Result<ScanResult> {
-    let budget =
-        scanner::ScanBudget::for_duration(std::time::Duration::from_secs(DOCTOR_SCAN_BUDGET_SECS));
+    let budget = doctor_scan_budget();
     ensure_fresh_scan_with_budget(root, ctx, &budget)
 }
 
@@ -1546,6 +1555,18 @@ fn render_preflight(
 mod tests {
     use super::*;
     use crate::core::candidate::{Category, ScannedEntry};
+
+    #[test]
+    fn production_scan_budget_is_finite_work_capped_and_serial() {
+        let budget = doctor_scan_budget();
+
+        assert_eq!(budget.remaining_work(), DOCTOR_SCAN_MAX_WORK);
+        assert_eq!(budget.parallelism(), scanner::ScanParallelism::Serial);
+        assert!(
+            budget.remaining_duration().unwrap()
+                <= std::time::Duration::from_secs(DOCTOR_SCAN_BUDGET_SECS)
+        );
+    }
     use crate::core::scanner::ScanResult;
     use crate::core::HOME_TEST_LOCK;
     use std::fs;

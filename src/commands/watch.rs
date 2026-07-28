@@ -83,7 +83,10 @@ const TREND_ALERT_DAYS_TO_FULL: u32 = 30;
 const TREND_WINDOW_DAYS: f64 = 7.0;
 
 /// One shared deadline covers every advisory/actuation scan in a watch run.
-const WATCH_SCAN_BUDGET_SECS: u64 = 30;
+const WATCH_SCAN_BUDGET_SECS: u64 = 5;
+/// Includes walk callbacks and post-processing checkpoints, so the number of
+/// retained paths is strictly lower than this cap.
+const WATCH_SCAN_MAX_WORK: u64 = 100_000;
 const TRUEUP_RETRY_BACKOFF_SECS: i64 = 6 * 60 * 60;
 
 /// Trend alerts are a forecast, so they re-nag slowly: once a day while the
@@ -122,7 +125,7 @@ struct WatchState {
     #[serde(default)]
     last_trend_notified_ts: Option<chrono::DateTime<chrono::Utc>>,
     /// Last failed daily true-up. Prevents a HOME that cannot finish inside the
-    /// bounded window from consuming 30 seconds on every five-minute tick.
+    /// bounded window from consuming 5 seconds on every five-minute tick.
     #[serde(default)]
     last_trueup_failure_ts: Option<chrono::DateTime<chrono::Utc>>,
 }
@@ -478,9 +481,16 @@ pub fn status(ctx: &Context) -> Result<()> {
 }
 
 pub fn run(ctx: &Context) -> Result<()> {
-    let scan_budget =
-        scanner::ScanBudget::for_duration(std::time::Duration::from_secs(WATCH_SCAN_BUDGET_SECS));
+    let scan_budget = watch_scan_budget();
     run_with_scan_budget(ctx, &scan_budget)
+}
+
+fn watch_scan_budget() -> scanner::ScanBudget {
+    scanner::ScanBudget::for_duration(
+        std::time::Duration::from_secs(WATCH_SCAN_BUDGET_SECS),
+        WATCH_SCAN_MAX_WORK,
+        scanner::ScanParallelism::Serial,
+    )
 }
 
 fn run_with_scan_budget(ctx: &Context, scan_budget: &scanner::ScanBudget) -> Result<()> {
@@ -567,7 +577,7 @@ fn run_with_scan_budget(ctx: &Context, scan_budget: &scanner::ScanBudget) -> Res
 
     // Advisory measurement runs after urgent actuation has had first claim on the
     // shared budget. Back off a failed daily true-up for six hours; otherwise a
-    // HOME that consistently needs >30s would spend 30s on every five-minute run.
+    // HOME that consistently needs >5s would spend 5s on every five-minute run.
     let tick_state = scanner::load_tick_state();
     let trueup_due =
         now.signed_duration_since(tick_state.last_full_walk) >= chrono::Duration::hours(24);
@@ -813,8 +823,7 @@ fn auto_reclaim(home: &Path, scan_budget: &scanner::ScanBudget) -> AutoReclaimOu
 /// helpers (which resolve from `$HOME`).
 #[cfg(test)]
 fn record_tick(home: &Path, free_bytes: u64, total_bytes: u64) -> Option<String> {
-    let budget =
-        scanner::ScanBudget::for_duration(std::time::Duration::from_secs(WATCH_SCAN_BUDGET_SECS));
+    let budget = watch_scan_budget();
     let sample = DfSample {
         ts: chrono::Utc::now(),
         free_bytes,
@@ -1041,6 +1050,18 @@ fn df_free_and_total(path: &Path) -> Result<(u64, u64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn production_scan_budget_is_short_work_capped_and_serial() {
+        let budget = watch_scan_budget();
+
+        assert_eq!(budget.remaining_work(), WATCH_SCAN_MAX_WORK);
+        assert_eq!(budget.parallelism(), scanner::ScanParallelism::Serial);
+        assert!(
+            budget.remaining_duration().unwrap()
+                <= std::time::Duration::from_secs(WATCH_SCAN_BUDGET_SECS)
+        );
+    }
 
     struct TempBase {
         path: PathBuf,

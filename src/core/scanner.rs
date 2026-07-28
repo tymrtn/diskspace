@@ -30,19 +30,33 @@ pub struct ScanBudget {
     inner: Arc<ScanBudgetInner>,
 }
 
+/// Filesystem-walk concurrency selected by the caller. Background scans use a
+/// dedicated bounded pool instead of jwalk's machine-wide default Rayon pool.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScanParallelism {
+    Serial,
+    Default,
+}
+
 #[derive(Debug)]
 struct ScanBudgetInner {
     deadline: Option<Instant>,
     remaining_work: AtomicU64,
+    parallelism: ScanParallelism,
     exhausted: AtomicBool,
 }
 
 impl ScanBudget {
-    pub fn for_duration(duration: StdDuration) -> Self {
+    pub fn for_duration(
+        duration: StdDuration,
+        max_work: u64,
+        parallelism: ScanParallelism,
+    ) -> Self {
         Self {
             inner: Arc::new(ScanBudgetInner {
                 deadline: Instant::now().checked_add(duration),
-                remaining_work: AtomicU64::new(u64::MAX),
+                remaining_work: AtomicU64::new(max_work),
+                parallelism,
                 exhausted: AtomicBool::new(false),
             }),
         }
@@ -53,6 +67,7 @@ impl ScanBudget {
             inner: Arc::new(ScanBudgetInner {
                 deadline: None,
                 remaining_work: AtomicU64::new(u64::MAX),
+                parallelism: ScanParallelism::Default,
                 exhausted: AtomicBool::new(false),
             }),
         }
@@ -65,6 +80,7 @@ impl ScanBudget {
             inner: Arc::new(ScanBudgetInner {
                 deadline: None,
                 remaining_work: AtomicU64::new(max_work),
+                parallelism: ScanParallelism::Serial,
                 exhausted: AtomicBool::new(false),
             }),
         }
@@ -107,6 +123,15 @@ impl ScanBudget {
         self.inner
             .deadline
             .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+    }
+
+    pub fn parallelism(&self) -> ScanParallelism {
+        self.inner.parallelism
+    }
+
+    #[cfg(test)]
+    pub(crate) fn remaining_work(&self) -> u64 {
+        self.inner.remaining_work.load(Ordering::Relaxed)
     }
 }
 
@@ -278,6 +303,108 @@ pub fn scan_excluding_appdata_bounded(
     })?
 }
 
+/// Visit filesystem entries without letting a single wide directory bypass a
+/// finite work budget. Bounded production callers use a streaming serial DFS:
+/// `read_dir` yields one child per checkpoint and the stack retains only one
+/// iterator per depth. Unlimited interactive scans retain jwalk's parallel path.
+fn walk_entries<F>(
+    root: &Path,
+    excludes: &[PathBuf],
+    budget: &ScanBudget,
+    mut visit: F,
+) -> Result<()>
+where
+    F: FnMut(PathBuf, std::fs::Metadata) -> Result<()>,
+{
+    let excluded: HashSet<PathBuf> = excludes.iter().cloned().collect();
+    let root_dev = root_dev_of(root);
+
+    match budget.parallelism() {
+        ScanParallelism::Default => {
+            let walk_budget = budget.clone();
+            let callback_excluded = excluded.clone();
+            for entry in WalkDir::new(root)
+                .skip_hidden(false)
+                .follow_links(false)
+                .process_read_dir(move |_, _, _, children| {
+                    if walk_budget.checkpoint().is_err() {
+                        children.clear();
+                        return;
+                    }
+                    for child in children.iter_mut().filter_map(|child| child.as_mut().ok()) {
+                        if child.file_type().is_dir()
+                            && !same_device(root_dev, dev_of(&child.path()))
+                        {
+                            child.read_children_path = None;
+                        }
+                    }
+                    children.retain(|child| {
+                        child
+                            .as_ref()
+                            .map(|entry| !callback_excluded.contains(&entry.path()))
+                            .unwrap_or(true)
+                    });
+                })
+                .into_iter()
+                .flatten()
+            {
+                budget.checkpoint()?;
+                let path = entry.path();
+                let metadata = match entry.metadata() {
+                    Ok(metadata) => metadata,
+                    Err(_) => continue,
+                };
+                visit(path, metadata)?;
+            }
+        }
+        ScanParallelism::Serial => {
+            budget.checkpoint()?;
+            let root_metadata = std::fs::metadata(root)?;
+            visit(root.to_path_buf(), root_metadata.clone())?;
+            if !root_metadata.is_dir() {
+                return Ok(());
+            }
+
+            let mut stack = Vec::new();
+            if let Ok(children) = std::fs::read_dir(root) {
+                stack.push(children);
+            }
+            while !stack.is_empty() {
+                // Charge before requesting the next child. Unlike jwalk's
+                // per-directory Vec, this makes a million-entry flat directory
+                // consume a million checkpoints without retaining every child.
+                budget.checkpoint()?;
+                let next = stack.last_mut().and_then(Iterator::next);
+                let Some(next) = next else {
+                    stack.pop();
+                    continue;
+                };
+                let entry = match next {
+                    Ok(entry) => entry,
+                    Err(_) => continue,
+                };
+                let path = entry.path();
+                if excluded.contains(&path) {
+                    continue;
+                }
+                let metadata = match entry.metadata() {
+                    Ok(metadata) => metadata,
+                    Err(_) => continue,
+                };
+                let descend =
+                    metadata.is_dir() && same_device(root_dev, dev_of_metadata(&metadata));
+                visit(path.clone(), metadata)?;
+                if descend {
+                    if let Ok(children) = std::fs::read_dir(path) {
+                        stack.push(children);
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn scan_impl(
     root: &Path,
     rules: &[Rule],
@@ -304,48 +431,9 @@ fn scan_impl(
         })
         .collect();
 
-    // Prune excluded roots (e.g. app sandbox containers) BEFORE jwalk descends —
-    // `process_read_dir` runs on the worker threads and removes matching children
-    // so their contents are never read (which is what trips the TCC prompt). An
-    // empty `excludes` set retains everything, so the interactive `scan()` path is
-    // unaffected.
-    let excl: HashSet<PathBuf> = excludes.iter().cloned().collect();
-    let root_dev = root_dev_of(root);
-    let walk_budget = budget.clone();
-    for entry in WalkDir::new(root)
-        .skip_hidden(false)
-        .follow_links(false)
-        .process_read_dir(move |_, _, _, children| {
-            if walk_budget.checkpoint().is_err() {
-                children.clear();
-                return;
-            }
-            // Keep a home scan on the filesystem whose free space is being
-            // measured. A nested mount can expose an effectively unbounded
-            // remote/container tree (the incident topology was OrbStack NFS).
-            for child in children.iter_mut().filter_map(|child| child.as_mut().ok()) {
-                if child.file_type().is_dir() && !same_device(root_dev, dev_of(&child.path())) {
-                    child.read_children_path = None;
-                }
-            }
-            children.retain(|der| {
-                der.as_ref()
-                    .map(|e| !excl.contains(&e.path()))
-                    .unwrap_or(true)
-            });
-        })
-        .into_iter()
-        .flatten()
-    {
-        budget.checkpoint()?;
-        let path = entry.path();
-        let metadata = match entry.metadata() {
-            Ok(m) => m,
-            Err(_) => continue,
-        };
-
+    walk_entries(root, excludes, budget, |path, metadata| {
         if !metadata.is_file() && !metadata.is_dir() {
-            continue;
+            return Ok(());
         }
         if metadata.is_dir() {
             dir_mtimes.insert(
@@ -377,7 +465,7 @@ fn scan_impl(
             use std::os::unix::fs::MetadataExt;
             if metadata.is_file() && metadata.len() > 4096 && metadata.blocks() == 0 {
                 cloud_placeholder_bytes += metadata.len();
-                continue;
+                return Ok(());
             }
             size = if metadata.is_file() {
                 metadata.blocks() * 512
@@ -417,7 +505,7 @@ fn scan_impl(
         // Only persist rule-matched entries — this is the cache-size fix.
         if let Some((_, cat)) = matched {
             entries.push(ScannedEntry {
-                path: path.to_path_buf(),
+                path,
                 size_bytes: size,
                 category: cat.clone(),
                 modified: system_time_to_dt(metadata.modified().ok()),
@@ -427,7 +515,8 @@ fn scan_impl(
                 ctime,
             });
         }
-    }
+        Ok(())
+    })?;
 
     // A worker callback may have noticed exhaustion after the iterator's final
     // yielded entry. Re-check before deriving or returning any partial result.
@@ -968,7 +1057,7 @@ fn full_true_up(
     budget.checkpoint()?;
 
     // The full scan collected this baseline in the same traversal. Reusing it is
-    // essential under watch's 30-second budget: a second HOME walk would make a
+    // essential under watch's 5-second budget: a second HOME walk would make a
     // successful true-up impossible on large but otherwise healthy homes.
     let next_dir_mtimes = result.dir_mtimes.clone();
 
@@ -1395,43 +1484,12 @@ fn build_dir_mtimes(
     let mut dir_bytes: HashMap<PathBuf, u64> = HashMap::new();
     let mut dir_mtime: HashMap<PathBuf, i64> = HashMap::new();
 
-    let excl: HashSet<PathBuf> = excludes.iter().cloned().collect();
-    let root_dev = root_dev_of(root);
-    let walk_budget = budget.clone();
-    for entry in WalkDir::new(root)
-        .skip_hidden(false)
-        .follow_links(false)
-        .process_read_dir(move |_, _, _, children| {
-            if walk_budget.checkpoint().is_err() {
-                children.clear();
-                return;
-            }
-            for child in children.iter_mut().filter_map(|child| child.as_mut().ok()) {
-                if child.file_type().is_dir() && !same_device(root_dev, dev_of(&child.path())) {
-                    child.read_children_path = None;
-                }
-            }
-            children.retain(|child| {
-                child
-                    .as_ref()
-                    .map(|entry| !excl.contains(&entry.path()))
-                    .unwrap_or(true)
-            });
-        })
-        .into_iter()
-        .flatten()
-    {
-        budget.checkpoint()?;
-        let path = entry.path();
-        let md = match entry.metadata() {
-            Ok(m) => m,
-            Err(_) => continue,
-        };
+    walk_entries(root, excludes, budget, |path, md| {
         if md.is_dir() {
             dir_mtime
-                .entry(path.to_path_buf())
+                .entry(path.clone())
                 .or_insert_with(|| mtime_secs_of(&md).unwrap_or(0));
-            dir_bytes.entry(path.to_path_buf()).or_insert(0);
+            dir_bytes.entry(path).or_insert(0);
         } else if md.is_file() {
             let size = file_on_disk_bytes(&md);
             if size > 0 {
@@ -1445,7 +1503,8 @@ fn build_dir_mtimes(
                 }
             }
         }
-    }
+        Ok(())
+    })?;
 
     budget.checkpoint()?;
     let mut out: HashMap<PathBuf, (i64, u64)> = HashMap::new();
@@ -1521,6 +1580,19 @@ fn dev_of(path: &Path) -> Option<u64> {
     #[cfg(not(unix))]
     {
         let _ = path;
+        None
+    }
+}
+
+fn dev_of_metadata(metadata: &std::fs::Metadata) -> Option<u64> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Some(metadata.dev())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
         None
     }
 }
@@ -1657,6 +1729,33 @@ mod tests {
     use super::*;
     use crate::core::candidate::ScannedEntry;
     use crate::core::series::SERIES_SCHEMA;
+
+    #[test]
+    fn duration_budget_enforces_work_cap_and_parallelism() {
+        let budget =
+            ScanBudget::for_duration(StdDuration::from_secs(60), 2, ScanParallelism::Serial);
+
+        assert_eq!(budget.parallelism(), ScanParallelism::Serial);
+        assert!(budget.checkpoint().is_ok());
+        assert!(budget.checkpoint().is_ok());
+        assert!(budget.checkpoint().is_err());
+        assert!(budget.is_exhausted());
+    }
+
+    #[test]
+    fn serial_budget_stops_a_wide_directory_before_a_partial_result() {
+        let tmp = TickTmp::new("wide-budget");
+        let tree = tmp.tree();
+        for index in 0..64 {
+            write_bytes(&tree.join(format!("entry-{index}")), 4096);
+        }
+
+        let budget = ScanBudget::for_work(16);
+        let err = scan_with_budget(&tree, &[], &budget).unwrap_err();
+
+        assert!(err.to_string().contains("scan budget exhausted"));
+        assert!(budget.is_exhausted());
+    }
 
     /// `ctime_nanos` folds whole-second ctime + ctime_nsec into nanos-since-epoch,
     /// preserving sub-second resolution (finding-1). Two ctimes in the SAME
@@ -1951,7 +2050,11 @@ mod tests {
         let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
         let worker_barrier = barrier.clone();
         let (done_tx, done_rx) = std::sync::mpsc::channel();
-        let budget = ScanBudget::for_duration(StdDuration::from_millis(25));
+        let budget = ScanBudget::for_duration(
+            StdDuration::from_millis(25),
+            u64::MAX,
+            ScanParallelism::Serial,
+        );
         let started = Instant::now();
 
         let err = measure_tick_bounded_with_hooks(
