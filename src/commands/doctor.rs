@@ -1551,6 +1551,32 @@ mod tests {
         assert_eq!(parse_size("1024"), Some(1024));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn doctor_fresh_scan_terminates_on_symlink_and_cloud_topology() {
+        let _lock = HOME_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = TempHome::new("bounded-scan");
+
+        let cache = home.path.join("project/node_modules");
+        fs::create_dir_all(&cache).unwrap();
+        fs::write(cache.join("artifact.bin"), vec![b'x'; 8192]).unwrap();
+        std::os::unix::fs::symlink(&home.path, home.path.join("cycle-to-home")).unwrap();
+
+        // Sparse/cloud-style placeholder: large logical length, zero allocation.
+        let placeholder = fs::File::create(home.path.join("online-only.bin")).unwrap();
+        placeholder.set_len(16 * 1024 * 1024).unwrap();
+        drop(placeholder);
+
+        let started = std::time::Instant::now();
+        let result = ensure_fresh_scan(&home.path, &quiet_ctx()).unwrap();
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "doctor's fresh scan must terminate on symlink/cloud topology"
+        );
+        assert!(result.entries.iter().any(|entry| entry.path == cache));
+        assert!(scan_cache_path().exists());
+    }
+
     /// A throwaway `$HOME` under the OS temp dir, cleaned on drop. While alive,
     /// `$HOME` points here so `profile::data_dir()` (scan cache, airlock,
     /// history) resolves under the tempdir and never touches the real

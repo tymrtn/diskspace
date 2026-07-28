@@ -1354,6 +1354,15 @@ mod tests {
             f.write_all(&vec![b'x'; n]).unwrap();
             f.flush().unwrap();
         }
+
+        // Pathological topology guards: a symlink cycle must never be followed,
+        // and the background daily true-up must prune app containers just like
+        // the incremental and auto-reclaim paths.
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(home, home.join("cycle-to-home")).unwrap();
+        let container = home.join("Library/Containers/com.example.app/Data/node_modules");
+        fs::create_dir_all(&container).unwrap();
+        fs::write(container.join("private.bin"), vec![b'x'; 8192]).unwrap();
     }
 
     /// The recorder appends to `series.jsonl` + `df_series.jsonl` and writes
@@ -1378,7 +1387,12 @@ mod tests {
         assert!(!tick_state.exists(), "no tick_state before first tick");
 
         // --- First run: default tick state (epoch) → daily true-up (full walk).
+        let started = std::time::Instant::now();
         let _ = record_tick(&home, 100 * 1024 * 1024 * 1024, 500 * 1024 * 1024 * 1024);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "one watch tick must terminate on symlink/app-container topology"
+        );
 
         assert!(series.exists(), "series.jsonl created on first tick");
         assert!(df_series.exists(), "df_series.jsonl created on first tick");
@@ -1395,6 +1409,13 @@ mod tests {
         assert!(
             state_1.last_full_walk > epoch,
             "first tick ran the daily true-up and advanced last_full_walk off the epoch sentinel"
+        );
+        assert!(
+            state_1
+                .dir_mtimes
+                .keys()
+                .all(|path| !path.starts_with(home.join("Library/Containers"))),
+            "watch daily true-up must not retain app-container paths"
         );
 
         // --- Second run: reuses prior state → within 24h → incremental path.

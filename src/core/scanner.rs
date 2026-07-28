@@ -2,7 +2,7 @@ use anyhow::Result;
 use chrono::{DateTime, Duration, Utc};
 use jwalk::WalkDir;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -111,10 +111,7 @@ pub fn scan(root: &Path, rules: &[Rule]) -> Result<ScanResult> {
 /// other apps" TCC prompt. Interactive commands call [`scan`] (full descent),
 /// so they still surface candidates like the Docker VM store under Containers.
 pub fn scan_excluding_appdata(root: &Path, rules: &[Rule]) -> Result<ScanResult> {
-    let excludes = [
-        root.join("Library").join("Containers"),
-        root.join("Library").join("Group Containers"),
-    ];
+    let excludes = appdata_excludes(root);
     scan_impl(root, rules, &excludes)
 }
 
@@ -142,11 +139,20 @@ fn scan_impl(root: &Path, rules: &[Rule], excludes: &[PathBuf]) -> Result<ScanRe
     // so their contents are never read (which is what trips the TCC prompt). An
     // empty `excludes` set retains everything, so the interactive `scan()` path is
     // unaffected.
-    let excl: std::collections::HashSet<PathBuf> = excludes.iter().cloned().collect();
+    let excl: HashSet<PathBuf> = excludes.iter().cloned().collect();
+    let root_dev = root_dev_of(root);
     for entry in WalkDir::new(root)
         .skip_hidden(false)
         .follow_links(false)
         .process_read_dir(move |_, _, _, children| {
+            // Keep a home scan on the filesystem whose free space is being
+            // measured. A nested mount can expose an effectively unbounded
+            // remote/container tree (the incident topology was OrbStack NFS).
+            for child in children.iter_mut().filter_map(|child| child.as_mut().ok()) {
+                if child.file_type().is_dir() && !same_device(root_dev, dev_of(&child.path())) {
+                    child.read_children_path = None;
+                }
+            }
             children.retain(|der| {
                 der.as_ref()
                     .map(|e| !excl.contains(&e.path()))
@@ -250,20 +256,18 @@ fn scan_impl(root: &Path, rules: &[Rule], excludes: &[PathBuf]) -> Result<ScanRe
         }
     }
 
-    // Compute category totals from top-level matched entries only.
+    // Compute category totals from top-level matched entries only. Sort once and
+    // retain ancestor roots in O(n log n); the former pairwise `any` was O(n²)
+    // over tens of thousands of matched paths and retained the full scan while
+    // consuming a core long after filesystem traversal had finished.
     // (Nested matches would double-count since their bytes are already included
     // in an ancestor's aggregated size.)
     let mut top_level_total: u64 = 0;
-    for entry in &entries {
-        let is_nested = entries
-            .iter()
-            .any(|other| other.path != entry.path && entry.path.starts_with(&other.path));
-        if !is_nested && entry.size_bytes > 0 {
-            *category_totals
-                .entry(entry.category.to_string())
-                .or_insert(0) += entry.size_bytes;
-            top_level_total += entry.size_bytes;
-        }
+    for entry in top_level_matched(&entries) {
+        *category_totals
+            .entry(entry.category.to_string())
+            .or_insert(0) += entry.size_bytes;
+        top_level_total += entry.size_bytes;
     }
     // Whatever isn't covered by a rule lands in "unknown".
     if total_bytes > top_level_total {
@@ -303,6 +307,22 @@ fn scan_impl(root: &Path, rules: &[Rule], excludes: &[PathBuf]) -> Result<ScanRe
         metrics: None,
         largest_dirs,
     })
+}
+
+fn top_level_matched(entries: &[ScannedEntry]) -> Vec<&ScannedEntry> {
+    let mut sorted: Vec<&ScannedEntry> = entries.iter().filter(|e| e.size_bytes > 0).collect();
+    sorted.sort_by(|a, b| a.path.cmp(&b.path));
+
+    let mut top = Vec::new();
+    let mut last_top: Option<&Path> = None;
+    for entry in sorted {
+        if last_top.is_some_and(|ancestor| entry.path.starts_with(ancestor)) {
+            continue;
+        }
+        last_top = Some(entry.path.as_path());
+        top.push(entry);
+    }
+    top
 }
 
 // ===========================================================================
@@ -608,7 +628,9 @@ fn full_true_up(
     now: DateTime<Utc>,
     now_df_free: Option<u64>,
 ) -> Result<TickOutcome> {
-    let result = scan(root, rules)?;
+    // `tick` is the background watch scanner. Its daily true-up must preserve
+    // the same app-container pruning as the incremental and auto-reclaim paths.
+    let result = scan_excluding_appdata(root, rules)?;
     let scan_id = if result.scan_id.is_empty() {
         format!("full-{}", now.timestamp_millis())
     } else {
@@ -635,7 +657,7 @@ fn full_true_up(
     // Rebuild the dir-mtime cache from the full walk so the next incremental tick
     // has a fresh baseline. We re-walk dir mtimes here (cheap relative to the full
     // scan we just did) using the same follow_links/hidden settings.
-    let next_dir_mtimes = build_dir_mtimes(root);
+    let next_dir_mtimes = build_dir_mtimes(root, &appdata_excludes(root));
 
     series_append_batch(base, &observations)?;
 
@@ -705,12 +727,8 @@ fn tier_a_churn_walk(
     // interactive `scan()`/`detect` use a separate jwalk walk that still descends
     // (a foreground run's consent persists via its terminal, and it needs
     // candidates like the Docker VM store under `~/Library/Containers`).
-    let excludes: std::collections::HashSet<PathBuf> = [
-        root.join("Library").join("Containers"),
-        root.join("Library").join("Group Containers"),
-    ]
-    .into_iter()
-    .collect();
+    let excludes: HashSet<PathBuf> = appdata_excludes(&root).into_iter().collect();
+    let root_dev = root_dev_of(&root);
 
     // Recurse, collecting the subtree byte total AND the net delta of registered
     // inodes encountered anywhere in the (walked) subtree.
@@ -726,6 +744,7 @@ fn tier_a_churn_walk(
         observations,
         &mut registered_delta,
         &excludes,
+        root_dev,
         scan_id,
         now,
     );
@@ -758,7 +777,8 @@ fn walk_subtree(
     next_dir_mtimes: &mut HashMap<PathBuf, (i64, u64)>,
     observations: &mut Vec<Observation>,
     registered_delta: &mut i64,
-    excludes: &std::collections::HashSet<PathBuf>,
+    excludes: &HashSet<PathBuf>,
+    root_dev: Option<u64>,
     scan_id: &str,
     now: DateTime<Utc>,
 ) -> u64 {
@@ -809,6 +829,9 @@ fn walk_subtree(
             continue;
         }
         if ft.is_dir() {
+            if !same_device(root_dev, dev_of(&child_path)) {
+                continue;
+            }
             let child_mtime = mtime_secs_of(&md);
             let child_prior = prior.dir_mtimes.get(&child_path).copied();
             subtree_bytes += walk_subtree(
@@ -822,6 +845,7 @@ fn walk_subtree(
                 observations,
                 registered_delta,
                 excludes,
+                root_dev,
                 scan_id,
                 now,
             );
@@ -1010,15 +1034,30 @@ fn rebuild_registry(entries: &[ScannedEntry], now: DateTime<Utc>) -> Vec<Registr
 /// Walk `root` collecting every directory's mtime + subtree on-disk bytes, used
 /// to rebuild the dir-mtime cache after a full true-up. Mirrors `scan()` walk
 /// settings (no hidden skip, follow_links=false, blocks*512, cloud skip).
-fn build_dir_mtimes(root: &Path) -> HashMap<PathBuf, (i64, u64)> {
+fn build_dir_mtimes(root: &Path, excludes: &[PathBuf]) -> HashMap<PathBuf, (i64, u64)> {
     // Single pass: accumulate each file's on-disk bytes into all ancestor dirs,
     // and record each directory's mtime.
     let mut dir_bytes: HashMap<PathBuf, u64> = HashMap::new();
     let mut dir_mtime: HashMap<PathBuf, i64> = HashMap::new();
 
+    let excl: HashSet<PathBuf> = excludes.iter().cloned().collect();
+    let root_dev = root_dev_of(root);
     for entry in WalkDir::new(root)
         .skip_hidden(false)
         .follow_links(false)
+        .process_read_dir(move |_, _, _, children| {
+            for child in children.iter_mut().filter_map(|child| child.as_mut().ok()) {
+                if child.file_type().is_dir() && !same_device(root_dev, dev_of(&child.path())) {
+                    child.read_children_path = None;
+                }
+            }
+            children.retain(|child| {
+                child
+                    .as_ref()
+                    .map(|entry| !excl.contains(&entry.path()))
+                    .unwrap_or(true)
+            });
+        })
         .into_iter()
         .flatten()
     {
@@ -1053,6 +1092,21 @@ fn build_dir_mtimes(root: &Path) -> HashMap<PathBuf, (i64, u64)> {
         out.insert(path, (mtime, bytes));
     }
     out
+}
+
+fn appdata_excludes(root: &Path) -> [PathBuf; 2] {
+    [
+        root.join("Library").join("Containers"),
+        root.join("Library").join("Group Containers"),
+    ]
+}
+
+fn same_device(root_dev: Option<u64>, child_dev: Option<u64>) -> bool {
+    match (root_dev, child_dev) {
+        (Some(root), Some(child)) => root == child,
+        // Platforms without unix device ids retain the existing traversal.
+        _ => true,
+    }
 }
 
 // --- small fs helpers (mirror scan()'s sizing / cloud-placeholder rules) ----
@@ -1100,6 +1154,22 @@ fn dev_of(path: &Path) -> Option<u64> {
     {
         use std::os::unix::fs::MetadataExt;
         std::fs::symlink_metadata(path).ok().map(|m| m.dev())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        None
+    }
+}
+
+/// Device identity for a walk root. jwalk intentionally follows a root symlink
+/// even when descendant symlink following is disabled, so this lookup must do
+/// the same or every child of a cross-volume symlinked root would be pruned.
+fn root_dev_of(path: &Path) -> Option<u64> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(path).ok().map(|m| m.dev())
     }
     #[cfg(not(unix))]
     {
@@ -1358,6 +1428,56 @@ mod tests {
         );
     }
 
+    #[test]
+    fn top_level_matching_is_bounded_for_large_flat_scans() {
+        let entries: Vec<ScannedEntry> = (0..50_000)
+            .map(|i| ScannedEntry {
+                path: PathBuf::from(format!("/home/project-{i:05}/node_modules")),
+                size_bytes: 4096,
+                category: Category::DevArtifact,
+                modified: None,
+                accessed: None,
+                dev: None,
+                ino: None,
+                ctime: None,
+            })
+            .collect();
+
+        let started = std::time::Instant::now();
+        let top = top_level_matched(&entries);
+        assert_eq!(top.len(), entries.len());
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "50k flat matches must not regress to the former O(n²) pairwise pass"
+        );
+    }
+
+    #[test]
+    fn top_level_matching_drops_nested_entries_and_mount_devices_are_bounded() {
+        let make = |path: &str, size_bytes| ScannedEntry {
+            path: PathBuf::from(path),
+            size_bytes,
+            category: Category::DevArtifact,
+            modified: None,
+            accessed: None,
+            dev: None,
+            ino: None,
+            ctime: None,
+        };
+        let entries = vec![
+            make("/home/a/cache", 10),
+            make("/home/a/cache/nested", 4),
+            make("/home/b/cache", 20),
+        ];
+        let top = top_level_matched(&entries);
+        assert_eq!(top.len(), 2);
+        assert!(top.iter().all(|entry| !entry.path.ends_with("nested")));
+
+        assert!(same_device(Some(7), Some(7)));
+        assert!(!same_device(Some(7), Some(99)));
+        assert!(same_device(None, None));
+    }
+
     /// Scanning a real tempdir tree persists `largest_dirs` with the correct TOTAL
     /// on-disk sizes (own files PLUS every descendant), sorted descending. The
     /// totals are TOTAL sizes, NOT just rule-matched bytes — there is no rule here
@@ -1417,6 +1537,29 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scan_follows_a_symlinked_root_but_not_descendant_symlinks() {
+        let tmp = TickTmp::new("symlink-root");
+        let target = tmp.root.join("target");
+        std::fs::create_dir_all(&target).unwrap();
+        write_bytes(&target.join("artifact.bin"), 8192);
+        let root_link = tmp.root.join("root-link");
+        std::os::unix::fs::symlink(&target, &root_link).unwrap();
+        std::os::unix::fs::symlink(&target, target.join("descendant-cycle")).unwrap();
+
+        let result = scan(&root_link, &[]).unwrap();
+        assert!(
+            result.total_bytes > 0,
+            "the symlinked root target is scanned"
+        );
+        assert!(
+            result.largest_dirs.len() < 10,
+            "the descendant symlink cycle is not followed"
+        );
+        assert_eq!(root_dev_of(&root_link), root_dev_of(&target));
     }
 
     /// On unix, scanning a tempdir with a matching rule populates dev/ino on the
