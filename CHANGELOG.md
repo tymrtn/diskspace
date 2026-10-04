@@ -10,11 +10,14 @@ All notable changes to `diskspace` are recorded here. Dates are `YYYY-MM-DD`.
   recorder.** Those scans can run well past their 5-second budget on a large
   HOME (`tick_state.json` is parsed outside it), and the alert used to wait
   behind them. Notification bookkeeping is now saved before the scans start, and
-  a failed state save is logged instead of ignored.
+  a failed state save is logged instead of ignored. The scans' budget starts
+  after notification delivery, so a slow `osascript` cannot use it up.
 - **The re-notify clock advances only when the OS accepts the notification.**
   A failed `osascript` launch, nonzero exit, or hang (killed after 10s) is logged
   to stderr, leaves `last_notified_ts` / `last_notified_pct` /
-  `last_trend_notified_ts` untouched, and retries on the next tick. New
+  `last_trend_notified_ts` untouched, and retries on the next tick. A failed
+  recovery ping is not retried: recovery is still announced once. `osascript`
+  stderr is drained while it runs and collected only within the 10s limit. New
   serde-default state field `notify_retry_pending`.
 - **`watch run --json`:** `notified` and `trend_notified` keep their names and
   boolean type, but now mean "submitted to the OS notifier this tick" instead of

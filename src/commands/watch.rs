@@ -146,7 +146,8 @@ struct WatchState {
 ///   * `Urgent` — notify on entry, then re-nag every `URGENT_RENOTIFY_SECS` OR
 ///                immediately if free space dropped ≥ `RENOTIFY_PCT_DROP` points
 ///                since the last notification.
-///   * Any level — notify while the previous due notification failed to submit.
+///   * `Soft`/`Urgent` — also notify while the previous due alert failed to
+///                submit. A failed recovery ping is not retried.
 ///
 /// Kept as a free function of `(&WatchState, Level, f32, now)` so it is unit
 /// testable without touching disk or the clock.
@@ -156,10 +157,8 @@ fn decide_notify(
     pct_free: f32,
     now: chrono::DateTime<chrono::Utc>,
 ) -> bool {
-    // The user has not seen a failed alert, so retrying it cannot nag.
-    if prior.notify_retry_pending {
-        return true;
-    }
+    // The user has not seen a failed pressure alert, so retrying it cannot nag.
+    let retry = prior.notify_retry_pending;
     let entered = prior.last_level != Some(level);
     let secs_since_notify = prior
         .last_notified_ts
@@ -170,9 +169,9 @@ fn decide_notify(
             // Recovery ping: only when we were previously in a worse state.
             prior.last_level.is_some() && prior.last_level != Some(Level::Ok)
         }
-        Level::Soft => entered || secs_since_notify >= SOFT_RENOTIFY_SECS,
+        Level::Soft => retry || entered || secs_since_notify >= SOFT_RENOTIFY_SECS,
         Level::Urgent => {
-            if entered || secs_since_notify >= URGENT_RENOTIFY_SECS {
+            if retry || entered || secs_since_notify >= URGENT_RENOTIFY_SECS {
                 return true;
             }
             // Fast further slide between timer ticks.
@@ -494,14 +493,14 @@ pub fn status(ctx: &Context) -> Result<()> {
 pub fn run(ctx: &Context) -> Result<()> {
     let home = home_dir()?;
     let (free_bytes, total_bytes) = df_free_and_total(&home).context("reading df")?;
-    let scan_budget = watch_scan_budget();
     run_tick(
         ctx,
         &home,
         free_bytes,
         total_bytes,
         &mut deliver_notification,
-        &mut |home, level, prior, now| scan_phase(home, level, prior, now, &scan_budget),
+        &watch_scan_budget,
+        &mut scan_phase,
     )
 }
 
@@ -523,8 +522,14 @@ struct ScanPhase {
 }
 
 type Notifier<'a> = dyn FnMut(&str, &str) -> NotifyOutcome + 'a;
-type Scanner<'a> =
-    dyn FnMut(&Path, Level, &WatchState, chrono::DateTime<chrono::Utc>) -> ScanPhase + 'a;
+type Scanner<'a> = dyn FnMut(
+        &Path,
+        Level,
+        &WatchState,
+        chrono::DateTime<chrono::Utc>,
+        &scanner::ScanBudget,
+    ) -> ScanPhase
+    + 'a;
 
 fn run_tick(
     ctx: &Context,
@@ -532,6 +537,7 @@ fn run_tick(
     free_bytes: u64,
     total_bytes: u64,
     notifier: &mut Notifier,
+    make_scan_budget: &dyn Fn() -> scanner::ScanBudget,
     scans: &mut Scanner,
 ) -> Result<()> {
     let pct_free = if total_bytes > 0 {
@@ -611,7 +617,9 @@ fn run_tick(
         } else {
             prior.last_notified_pct
         },
-        notify_retry_pending: matches!(notification, Some(NotifyOutcome::Failed { .. })),
+        // Recovery is announced once, so nothing stays owed while healthy.
+        notify_retry_pending: level != Level::Ok
+            && matches!(notification, Some(NotifyOutcome::Failed { .. })),
         last_autoreclaim_ts: prior.last_autoreclaim_ts,
         last_trend_notified_ts: if trend_submitted {
             Some(now)
@@ -624,7 +632,9 @@ fn run_tick(
     // that stalls or kills the process cannot lose it.
     save_state_or_log(&state);
 
-    let scan = scans(home, level, &prior, now);
+    // The budget's deadline starts here, after notification delivery (up to
+    // NOTIFY_TIMEOUT per alert), so a slow notifier cannot spend the scans' time.
+    let scan = scans(home, level, &prior, now, &make_scan_budget());
     state.last_autoreclaim_ts = scan.last_autoreclaim_ts;
     state.last_trueup_failure_ts = scan.last_trueup_failure_ts;
     save_state_or_log(&state);
@@ -1045,6 +1055,10 @@ enum NotifyOutcome {
 #[cfg(any(target_os = "macos", test))]
 const NOTIFY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// Notifier stderr kept for the error message. The rest is read and discarded.
+#[cfg(any(target_os = "macos", test))]
+const NOTIFY_STDERR_KEEP_BYTES: u64 = 1024;
+
 /// Hand a desktop notification to the OS. macOS uses `osascript display
 /// notification`. On every other OS (Linux is the portable target) this reports
 /// `Unsupported`: the watch tick still runs, records its measurement, and
@@ -1089,6 +1103,21 @@ fn run_notifier_command(mut cmd: Command, timeout: std::time::Duration) -> Notif
         }
     };
     let started = std::time::Instant::now();
+    // Drain stderr while the child runs: one that fills the pipe would otherwise
+    // block until it is killed. The thread reports once the pipe closes.
+    let stderr = child.stderr.take().map(|mut pipe| {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut kept = Vec::new();
+            let _ = pipe
+                .by_ref()
+                .take(NOTIFY_STDERR_KEEP_BYTES)
+                .read_to_end(&mut kept);
+            let _ = std::io::copy(&mut pipe, &mut std::io::sink());
+            let _ = tx.send(kept);
+        });
+        rx
+    });
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
@@ -1111,10 +1140,15 @@ fn run_notifier_command(mut cmd: Command, timeout: std::time::Duration) -> Notif
     if status.success() {
         return NotifyOutcome::Submitted;
     }
-    let mut stderr = String::new();
-    if let Some(mut pipe) = child.stderr.take() {
-        let _ = pipe.read_to_string(&mut stderr);
-    }
+    // A descendant can keep the pipe open after the child exits, so wait for
+    // stderr only as long as the deadline allows.
+    let stderr = stderr
+        .and_then(|rx| {
+            rx.recv_timeout(timeout.saturating_sub(started.elapsed()))
+                .ok()
+        })
+        .map(|kept| String::from_utf8_lossy(&kept).into_owned())
+        .unwrap_or_else(|| "stderr still open at deadline".to_string());
     NotifyOutcome::Failed {
         error: format!(
             "{} exited with {}: {}",
@@ -1388,6 +1422,18 @@ mod tests {
         assert!(decide_notify(&prior, Level::Urgent, 3.9, now));
     }
 
+    /// Recovery is announced once. A retry flag left over while healthy must not
+    /// turn every Ok tick into another recovery ping.
+    #[test]
+    fn notify_ignores_pending_retry_while_healthy() {
+        let prior = WatchState {
+            last_level: Some(Level::Ok),
+            notify_retry_pending: true,
+            ..Default::default()
+        };
+        assert!(!decide_notify(&prior, Level::Ok, 50.0, chrono::Utc::now()));
+    }
+
     // ---- notifier subprocess outcomes ----------------------------------------
 
     #[cfg(unix)]
@@ -1426,6 +1472,44 @@ mod tests {
             other => panic!("hung notifier must fail, got {:?}", other),
         }
         assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    /// stderr is drained while the notifier runs, so a chatty one cannot block on
+    /// a full pipe until it is killed. Only a short prefix reaches the error.
+    #[cfg(unix)]
+    #[test]
+    fn notifier_command_drains_large_stderr_while_running() {
+        let mut chatty = Command::new("sh");
+        chatty.args(["-c", "yes boom | head -c 200000 >&2; exit 3"]);
+        match run_notifier_command(chatty, std::time::Duration::from_secs(5)) {
+            NotifyOutcome::Failed { error } => {
+                assert!(error.contains("exit status: 3"), "{}", error);
+                assert!(error.contains("boom"), "{}", error);
+                assert!(error.len() < 1000, "error kept {} bytes", error.len());
+            }
+            other => panic!("nonzero exit must fail, got {:?}", other),
+        }
+    }
+
+    /// A notifier that exits while a descendant still holds its stderr open must
+    /// return by the deadline instead of waiting for the descendant.
+    #[cfg(unix)]
+    #[test]
+    fn notifier_command_deadline_covers_stderr_held_by_a_descendant() {
+        let mut leaky = Command::new("sh");
+        leaky.args(["-c", "sleep 5 & exit 3"]);
+        let started = std::time::Instant::now();
+        match run_notifier_command(leaky, std::time::Duration::from_millis(500)) {
+            NotifyOutcome::Failed { error } => {
+                assert!(error.contains("exit status: 3"), "{}", error)
+            }
+            other => panic!("nonzero exit must fail, got {:?}", other),
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(3),
+            "took {:?}",
+            started.elapsed()
+        );
     }
 
     // ---- decide_trend_notify: the slow-slide early warning -------------------
@@ -1695,7 +1779,6 @@ mod tests {
         let tick_state = data_dir.join("tick_state.json");
         fs::write(&series, b"existing-series\n").unwrap();
         fs::write(&tick_state, b"existing-tick-state\n").unwrap();
-        let budget = scanner::ScanBudget::for_work(0);
         let ctx = Context {
             json: false,
             yes: false,
@@ -1711,7 +1794,8 @@ mod tests {
             50,
             1000,
             &mut |_, _| NotifyOutcome::Submitted,
-            &mut |home, level, prior, now| scan_phase(home, level, prior, now, &budget),
+            &|| scanner::ScanBudget::for_work(0),
+            &mut scan_phase,
         )
         .unwrap();
 
@@ -1877,7 +1961,8 @@ mod tests {
                     error: "osascript exited with exit status: 1".into(),
                 }
             },
-            &mut |_, _, prior, _| no_scan_phase(prior),
+            &watch_scan_budget,
+            &mut |_, _, prior, _, _| no_scan_phase(prior),
         )
         .unwrap();
         assert_eq!(calls, 1);
@@ -1900,7 +1985,8 @@ mod tests {
                 retried += 1;
                 NotifyOutcome::Submitted
             },
-            &mut |_, _, prior, now| {
+            &watch_scan_budget,
+            &mut |_, _, prior, now, _| {
                 trueup_failed_at = Some(now);
                 ScanPhase {
                     last_trueup_failure_ts: Some(now),
@@ -1941,7 +2027,8 @@ mod tests {
                     events.borrow_mut().push(format!("notify: {}", title));
                     NotifyOutcome::Submitted
                 },
-                &mut |_, _, _, _| {
+                &watch_scan_budget,
+                &mut |_, _, _, _, _| {
                     events.borrow_mut().push("scan".to_string());
                     saved_when_scan_started = Some(load_state_from(&state_path).unwrap());
                     panic!("scanner stalled");
@@ -1966,5 +2053,93 @@ mod tests {
             load_state_from(&state_path).unwrap().last_notified_ts,
             at_scan.last_notified_ts
         );
+    }
+
+    /// The scan budget's clock starts when the scans do. osascript may take up to
+    /// NOTIFY_TIMEOUT, twice the production budget, and must not leave auto-reclaim
+    /// and the recorder with nothing.
+    #[test]
+    fn slow_notifier_does_not_spend_the_scan_budget() {
+        let base = TempBase::new("slow-notifier");
+        let home = base.path.clone();
+        let _guard = HomeGuard::set(&home);
+        let allowance = std::time::Duration::from_millis(200);
+
+        let mut remaining_at_scan = None;
+        run_tick(
+            &quiet_ctx(),
+            &home,
+            30,
+            1000,
+            &mut |_, _| {
+                std::thread::sleep(allowance * 2);
+                NotifyOutcome::Submitted
+            },
+            &|| {
+                scanner::ScanBudget::for_duration(
+                    allowance,
+                    WATCH_SCAN_MAX_WORK,
+                    scanner::ScanParallelism::Serial,
+                )
+            },
+            &mut |_, _, prior, _, budget| {
+                remaining_at_scan = budget.remaining_duration();
+                no_scan_phase(prior)
+            },
+        )
+        .unwrap();
+
+        let remaining = remaining_at_scan.expect("scanner received a timed budget");
+        assert!(
+            remaining > allowance / 2,
+            "scans started with {:?} of {:?} left",
+            remaining,
+            allowance
+        );
+    }
+
+    /// A recovery ping that fails to submit is not retried on later healthy
+    /// ticks, and recovery also clears a retry owed for the earlier urgent alert.
+    #[test]
+    fn failed_recovery_ping_is_not_retried_while_healthy() {
+        let base = TempBase::new("recovery-fail");
+        let home = base.path.clone();
+        let _guard = HomeGuard::set(&home);
+        let state_path = home.join(".diskspace/watch_state.json");
+        fs::create_dir_all(state_path.parent().unwrap()).unwrap();
+        save_state_to(
+            &state_path,
+            &WatchState {
+                last_level: Some(Level::Urgent),
+                notify_retry_pending: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let mut titles = Vec::new();
+        for tick in 0..3 {
+            run_tick(
+                &quiet_ctx(),
+                &home,
+                500,
+                1000,
+                &mut |title, _| {
+                    titles.push(title.to_string());
+                    NotifyOutcome::Failed {
+                        error: "osascript exited with exit status: 1".into(),
+                    }
+                },
+                &watch_scan_budget,
+                &mut |_, _, prior, _, _| no_scan_phase(prior),
+            )
+            .unwrap();
+            if tick == 0 {
+                let after_recovery = load_state_from(&state_path).unwrap();
+                assert_eq!(after_recovery.last_level, Some(Level::Ok));
+                assert!(!after_recovery.notify_retry_pending);
+            }
+        }
+        assert_eq!(titles.len(), 1, "recovery is pinged once: {:?}", titles);
     }
 }
