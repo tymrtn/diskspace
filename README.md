@@ -140,7 +140,7 @@ diskspace watch uninstall    # remove it
 
 Checks `df` every 5 minutes. **10% free** fires a soft macOS notification suggesting `diskspace detect`. **5% free** flips to urgent and recommends `doctor`. The agent ships as a Developer-ID-signed `.app` bundle (`DiskspaceWatch.app`) so System Settings → Login Items shows a real icon and identity, not a blank tile.
 
-Notifications are deduped via a state file — you don't get pinged every 5 minutes once you've already been told.
+Notifications are deduped via a state file — you don't get pinged every 5 minutes once you've already been told. A due notification goes out before the tick's slower cleanup and measurement scans, and the dedup clock only advances when macOS accepts the request. A failed hand-off is logged to `~/.diskspace/watch.stderr.log` and retried on the next tick. macOS gives no receipt that a banner was actually displayed, so the strongest status `watch run --json` reports is `submitted`.
 
 The watch also fits a trailing-week burn rate from its own tick history. When the projection says the disk fills within **30 days** — even with free space still comfortably above the thresholds — it sends a once-a-day forecast alert naming the top-growing path. Threshold alerts catch the cliff; the forecast catches the slow slide that arrives at the cliff. `diskspace trend` shows the full picture on demand: a free-space sparkline, burn rate, days-to-full, and which paths grew most over the window. `diskspace top` is the same view as a live TUI dashboard. All of it is advisory — trend signals never trigger a deletion.
 

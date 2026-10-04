@@ -15,8 +15,9 @@
 //!     alert (the slow-slide early warning), recommending `diskspace trend`.
 //!
 //! Notification dedup: state file at `~/.diskspace/watch_state.json` tracks
-//! the last-notified level. We re-notify only when the level changes (so the
-//! user doesn't get pinged every 5 minutes if their disk stays at 7% free).
+//! the last notification macOS accepted, and [`decide_notify`] re-nags on a
+//! fixed cadence from there. A due notification is sent and recorded before the
+//! tick's scans start; one that fails to submit stays due for the next tick.
 
 use anyhow::{Context as _, Result};
 use console::Style;
@@ -108,18 +109,23 @@ struct WatchState {
     last_pct_free: Option<f32>,
     last_free_bytes: Option<u64>,
     last_total_bytes: Option<u64>,
-    /// When we last actually delivered a notification, and the pct_free at that
-    /// moment. Drives the re-notify cadence (timer + drop threshold) so a
-    /// sustained slide keeps alerting instead of going silent after the first
-    /// crossing. serde-default so legacy state files still parse.
+    /// When a threshold notification was last submitted to the OS, and the
+    /// pct_free at that moment. Drives the re-notify cadence (timer + drop
+    /// threshold) so a sustained slide keeps alerting instead of going silent
+    /// after the first crossing. serde-default so legacy state files still parse.
     #[serde(default)]
     last_notified_ts: Option<chrono::DateTime<chrono::Utc>>,
     #[serde(default)]
     last_notified_pct: Option<f32>,
+    /// The last due threshold notification failed to submit. `last_level`
+    /// advances every tick, so without this a failed level-entry alert would
+    /// wait for the re-nag timer. serde-default.
+    #[serde(default)]
+    notify_retry_pending: bool,
     /// When we last ran an autonomous reclaim, for rate-limiting. serde-default.
     #[serde(default)]
     last_autoreclaim_ts: Option<chrono::DateTime<chrono::Utc>>,
-    /// When we last delivered a TREND (days-to-full forecast) alert, for the
+    /// When a TREND (days-to-full forecast) alert was last submitted, for the
     /// once-a-day cadence. Independent of the threshold-alert bookkeeping so a
     /// forecast ping never resets the urgent re-nag timer. serde-default.
     #[serde(default)]
@@ -140,6 +146,7 @@ struct WatchState {
 ///   * `Urgent` — notify on entry, then re-nag every `URGENT_RENOTIFY_SECS` OR
 ///                immediately if free space dropped ≥ `RENOTIFY_PCT_DROP` points
 ///                since the last notification.
+///   * Any level — notify while the previous due notification failed to submit.
 ///
 /// Kept as a free function of `(&WatchState, Level, f32, now)` so it is unit
 /// testable without touching disk or the clock.
@@ -149,6 +156,10 @@ fn decide_notify(
     pct_free: f32,
     now: chrono::DateTime<chrono::Utc>,
 ) -> bool {
+    // The user has not seen a failed alert, so retrying it cannot nag.
+    if prior.notify_retry_pending {
+        return true;
+    }
     let entered = prior.last_level != Some(level);
     let secs_since_notify = prior
         .last_notified_ts
@@ -481,8 +492,17 @@ pub fn status(ctx: &Context) -> Result<()> {
 }
 
 pub fn run(ctx: &Context) -> Result<()> {
+    let home = home_dir()?;
+    let (free_bytes, total_bytes) = df_free_and_total(&home).context("reading df")?;
     let scan_budget = watch_scan_budget();
-    run_with_scan_budget(ctx, &scan_budget)
+    run_tick(
+        ctx,
+        &home,
+        free_bytes,
+        total_bytes,
+        &mut deliver_notification,
+        &mut |home, level, prior, now| scan_phase(home, level, prior, now, &scan_budget),
+    )
 }
 
 fn watch_scan_budget() -> scanner::ScanBudget {
@@ -493,9 +513,27 @@ fn watch_scan_budget() -> scanner::ScanBudget {
     )
 }
 
-fn run_with_scan_budget(ctx: &Context, scan_budget: &scanner::ScanBudget) -> Result<()> {
-    let home = home_dir()?;
-    let (free_bytes, total_bytes) = df_free_and_total(&home).context("reading df")?;
+/// The expensive half of a tick: gated auto-reclaim, then the advisory recorder.
+/// Split from [`run_tick`] so tests can stand in a stalled or failing scanner.
+struct ScanPhase {
+    autoreclaim: Option<AutoReclaimOutcome>,
+    advisory: Option<String>,
+    last_autoreclaim_ts: Option<chrono::DateTime<chrono::Utc>>,
+    last_trueup_failure_ts: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+type Notifier<'a> = dyn FnMut(&str, &str) -> NotifyOutcome + 'a;
+type Scanner<'a> =
+    dyn FnMut(&Path, Level, &WatchState, chrono::DateTime<chrono::Utc>) -> ScanPhase + 'a;
+
+fn run_tick(
+    ctx: &Context,
+    home: &Path,
+    free_bytes: u64,
+    total_bytes: u64,
+    notifier: &mut Notifier,
+    scans: &mut Scanner,
+) -> Result<()> {
     let pct_free = if total_bytes > 0 {
         (free_bytes as f64 / total_bytes as f64 * 100.0) as f32
     } else {
@@ -528,29 +566,154 @@ fn run_with_scan_budget(ctx: &Context, scan_budget: &scanner::ScanBudget) -> Res
     let prior = load_state().unwrap_or_default();
     let now = chrono::Utc::now();
 
-    let should_notify = decide_notify(&prior, level, pct_free, now);
-
-    // Carry the notification bookkeeping forward: only advance it on a tick that
-    // actually notifies, so the re-nag timer/drop measure from the LAST real
-    // notification (not from every silent tick).
-    let (last_notified_ts, last_notified_pct) = if should_notify {
-        (Some(now), Some(pct_free))
-    } else {
-        (prior.last_notified_ts, prior.last_notified_pct)
-    };
+    // Warn before any scanning. Auto-reclaim and the recorder can take far longer
+    // than their 5s scan budget on a large HOME (tick_state.json is parsed outside
+    // that deadline), and an alert must never queue behind them.
+    let notification = decide_notify(&prior, level, pct_free, now).then(|| {
+        let (title, body) = threshold_message(level, free_bytes, pct_free);
+        notifier(&title, &body)
+    });
 
     // Forecast alert: the disk is still Ok but the trailing burn rate projects
     // it full within TREND_ALERT_DAYS_TO_FULL. Separate bookkeeping from the
     // threshold alerts so the once-a-day forecast cadence never interacts with
     // the urgent re-nag timers.
-    let should_trend_notify =
-        decide_trend_notify(level, trend.days_to_full, prior.last_trend_notified_ts, now);
-    let last_trend_notified_ts = if should_trend_notify {
-        Some(now)
-    } else {
-        prior.last_trend_notified_ts
-    };
+    let trend_notification =
+        if decide_trend_notify(level, trend.days_to_full, prior.last_trend_notified_ts, now) {
+            trend_message(&trend, free_bytes).map(|(title, body)| notifier(&title, &body))
+        } else {
+            None
+        };
 
+    for outcome in [&notification, &trend_notification].into_iter().flatten() {
+        if let NotifyOutcome::Failed { error } = outcome {
+            eprintln!("(watch: notification not submitted: {})", error);
+        }
+    }
+
+    // Cadence counts from the last notification the OS accepted. A failed
+    // submission leaves the timestamps alone and marks the alert as still owed.
+    let threshold_submitted = notification == Some(NotifyOutcome::Submitted);
+    let trend_submitted = trend_notification == Some(NotifyOutcome::Submitted);
+    let mut state = WatchState {
+        last_level: Some(level),
+        last_ts: Some(now),
+        last_pct_free: Some(pct_free),
+        last_free_bytes: Some(free_bytes),
+        last_total_bytes: Some(total_bytes),
+        last_notified_ts: if threshold_submitted {
+            Some(now)
+        } else {
+            prior.last_notified_ts
+        },
+        last_notified_pct: if threshold_submitted {
+            Some(pct_free)
+        } else {
+            prior.last_notified_pct
+        },
+        notify_retry_pending: matches!(notification, Some(NotifyOutcome::Failed { .. })),
+        last_autoreclaim_ts: prior.last_autoreclaim_ts,
+        last_trend_notified_ts: if trend_submitted {
+            Some(now)
+        } else {
+            prior.last_trend_notified_ts
+        },
+        last_trueup_failure_ts: prior.last_trueup_failure_ts,
+    };
+    // Persist the alert bookkeeping before the slow half of the tick, so a scan
+    // that stalls or kills the process cannot lose it.
+    save_state_or_log(&state);
+
+    let scan = scans(home, level, &prior, now);
+    state.last_autoreclaim_ts = scan.last_autoreclaim_ts;
+    state.last_trueup_failure_ts = scan.last_trueup_failure_ts;
+    save_state_or_log(&state);
+    let advisory = scan.advisory;
+    let autoreclaim = scan.autoreclaim;
+
+    if ctx.json {
+        println!(
+            "{}",
+            serde_json::to_string(&serde_json::json!({
+                "level": level,
+                "pct_free": pct_free,
+                "free_bytes": free_bytes,
+                "total_bytes": total_bytes,
+                "notified": threshold_submitted,
+                "notification": notification,
+                "advisory": advisory,
+                "autoreclaim": autoreclaim,
+                "trend": trend,
+                "trend_notified": trend_submitted,
+                "trend_notification": trend_notification,
+            }))?
+        );
+    } else if !ctx.quiet {
+        let dim = Style::new().dim();
+        println!(
+            "  watch: {} — {:.1}% free ({} / {}){}",
+            match level {
+                Level::Ok => "ok",
+                Level::Soft => "soft",
+                Level::Urgent => "urgent",
+            },
+            pct_free,
+            crate::output::format_bytes(free_bytes),
+            crate::output::format_bytes(total_bytes),
+            ctx.style(notification_note(&notification), &dim),
+        );
+        if let Some(note) = &advisory {
+            println!("  {}", ctx.style(note, &dim));
+        }
+        if let (Some(rate), Some(days)) = (trend.burn_rate_bytes_per_day, trend.days_to_full) {
+            if rate > 0.0 {
+                println!(
+                    "  {}",
+                    ctx.style(
+                        &format!(
+                            "trend: filling at {}/day — full in ~{} day(s) at this rate{}",
+                            crate::output::format_bytes(rate as u64),
+                            days,
+                            notification_note(&trend_notification)
+                        ),
+                        &dim
+                    )
+                );
+            }
+        }
+        if let Some(ar) = &autoreclaim {
+            println!(
+                "  {}",
+                ctx.style(
+                    &format!(
+                        "auto-reclaim: freed {} across {} item(s)",
+                        crate::output::format_bytes(ar.bytes_freed),
+                        ar.items
+                    ),
+                    &dim
+                )
+            );
+        }
+    }
+    Ok(())
+}
+
+fn notification_note(outcome: &Option<NotifyOutcome>) -> &'static str {
+    match outcome {
+        Some(NotifyOutcome::Submitted) => "  · notification submitted",
+        Some(NotifyOutcome::Failed { .. }) => "  · notification FAILED (see stderr)",
+        Some(NotifyOutcome::Unsupported) => "  · no desktop notifier on this OS",
+        None => "",
+    }
+}
+
+fn scan_phase(
+    home: &Path,
+    level: Level,
+    prior: &WatchState,
+    now: chrono::DateTime<chrono::Utc>,
+    scan_budget: &scanner::ScanBudget,
+) -> ScanPhase {
     // --- Autonomous reclaim (gated) ----------------------------------------
     // Only when the user has turned on the standing opt-in AND we are urgent AND
     // the rate-limit has elapsed. Self-contained and best-effort: a reclaim error
@@ -562,7 +725,7 @@ fn run_with_scan_budget(ctx: &Context, scan_budget: &scanner::ScanBudget) -> Res
         prior.last_autoreclaim_ts,
         now,
     ) {
-        Some(auto_reclaim(&home, scan_budget))
+        Some(auto_reclaim(home, scan_budget))
     } else {
         None
     };
@@ -585,7 +748,7 @@ fn run_with_scan_budget(ctx: &Context, scan_budget: &scanner::ScanBudget) -> Res
     let recorder = if trueup_deferred {
         None
     } else {
-        record_tick_with_budget(&home, scan_budget)
+        record_tick_with_budget(home, scan_budget)
     };
     let advisory = recorder
         .as_ref()
@@ -598,94 +761,12 @@ fn run_with_scan_budget(ctx: &Context, scan_budget: &scanner::ScanBudget) -> Res
         Some(now)
     };
 
-    let new_state = WatchState {
-        last_level: Some(level),
-        last_ts: Some(now),
-        last_pct_free: Some(pct_free),
-        last_free_bytes: Some(free_bytes),
-        last_total_bytes: Some(total_bytes),
-        last_notified_ts,
-        last_notified_pct,
+    ScanPhase {
+        autoreclaim,
+        advisory,
         last_autoreclaim_ts,
-        last_trend_notified_ts,
         last_trueup_failure_ts,
-    };
-    save_state(&new_state).ok();
-
-    if should_notify {
-        notify(level, free_bytes, pct_free);
     }
-    if should_trend_notify {
-        notify_trend(&trend, free_bytes);
-    }
-
-    if ctx.json {
-        println!(
-            "{}",
-            serde_json::to_string(&serde_json::json!({
-                "level": level,
-                "pct_free": pct_free,
-                "free_bytes": free_bytes,
-                "total_bytes": total_bytes,
-                "notified": should_notify,
-                "advisory": advisory,
-                "autoreclaim": autoreclaim,
-                "trend": trend,
-                "trend_notified": should_trend_notify,
-            }))?
-        );
-    } else if !ctx.quiet {
-        let dim = Style::new().dim();
-        println!(
-            "  watch: {} — {:.1}% free ({} / {}){}",
-            match level {
-                Level::Ok => "ok",
-                Level::Soft => "soft",
-                Level::Urgent => "urgent",
-            },
-            pct_free,
-            crate::output::format_bytes(free_bytes),
-            crate::output::format_bytes(total_bytes),
-            ctx.style(if should_notify { "  · notified" } else { "" }, &dim),
-        );
-        if let Some(note) = &advisory {
-            println!("  {}", ctx.style(note, &dim));
-        }
-        if let (Some(rate), Some(days)) = (trend.burn_rate_bytes_per_day, trend.days_to_full) {
-            if rate > 0.0 {
-                println!(
-                    "  {}",
-                    ctx.style(
-                        &format!(
-                            "trend: filling at {}/day — full in ~{} day(s) at this rate{}",
-                            crate::output::format_bytes(rate as u64),
-                            days,
-                            if should_trend_notify {
-                                "  · notified"
-                            } else {
-                                ""
-                            }
-                        ),
-                        &dim
-                    )
-                );
-            }
-        }
-        if let Some(ar) = &autoreclaim {
-            println!(
-                "  {}",
-                ctx.style(
-                    &format!(
-                        "auto-reclaim: freed {} across {} item(s)",
-                        crate::output::format_bytes(ar.bytes_freed),
-                        ar.items
-                    ),
-                    &dim
-                )
-            );
-        }
-    }
-    Ok(())
 }
 
 /// Read the standing `watch_autoreclaim` opt-in from the profile. Best-effort: a
@@ -879,8 +960,8 @@ fn record_tick_with_budget(
     })
 }
 
-fn notify(level: Level, free_bytes: u64, pct_free: f32) {
-    let (title, body) = match level {
+fn threshold_message(level: Level, free_bytes: u64, pct_free: f32) -> (String, String) {
+    match level {
         Level::Urgent => (
             // Escalate the wording as free space craters, so a sustained slide
             // reads as more alarming each re-nag instead of a flat repeat.
@@ -911,20 +992,15 @@ fn notify(level: Level, free_bytes: u64, pct_free: f32) {
                 crate::output::format_bytes(free_bytes)
             ),
         ),
-    };
-
-    deliver_notification(&title, &body);
+    }
 }
 
 /// Forecast notification: the disk is still Ok but the trailing burn rate
 /// projects it full within the alert horizon. Enriched with the top grower so
 /// the alert names a probable CAUSE, not just a date — reading the per-entry
 /// series is acceptable here because this fires at most once a day.
-fn notify_trend(trend: &metrics::BurnTrend, free_bytes: u64) {
-    let days = match trend.days_to_full {
-        Some(d) => d,
-        None => return,
-    };
+fn trend_message(trend: &metrics::BurnTrend, free_bytes: u64) -> Option<(String, String)> {
+    let days = trend.days_to_full?;
     let rate = trend.burn_rate_bytes_per_day.unwrap_or(0.0).max(0.0);
     let grower = metrics::top_growers(TREND_WINDOW_DAYS, 1)
         .ok()
@@ -945,31 +1021,109 @@ fn notify_trend(trend: &metrics::BurnTrend, free_bytes: u64) {
         crate::output::format_bytes(free_bytes),
         grower
     );
-    deliver_notification(&title, &body);
+    Some((title, body))
 }
 
-/// Deliver a desktop notification. macOS uses `osascript display notification`.
-/// On every other OS (Linux is the portable target) this is a graceful no-op:
-/// the watch tick still runs, records its measurement, and prints/JSON-emits its
-/// result — only the macOS-only GUI ping is skipped. `osascript` does not exist
-/// on Linux, so shelling out to it there would just be a silent failure anyway;
-/// we cfg it out so no macOS-only assumption leaks into the Linux build.
+/// What happened when a notification was handed to the OS. `Submitted` only
+/// means `osascript` accepted the request and exited 0. macOS returns no receipt
+/// that a banner was shown (Focus, per-app notification settings, or a missing
+/// permission all suppress it silently), so no outcome claims the user saw it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+enum NotifyOutcome {
+    Submitted,
+    Failed {
+        error: String,
+    },
+    /// No desktop notifier on this OS. Constructed only by non-macOS builds.
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
+    Unsupported,
+}
+
+/// `osascript` normally returns in well under a second. A hung one must not
+/// hold the tick: launchd starts no new tick while this process is alive.
+#[cfg(any(target_os = "macos", test))]
+const NOTIFY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Hand a desktop notification to the OS. macOS uses `osascript display
+/// notification`. On every other OS (Linux is the portable target) this reports
+/// `Unsupported`: the watch tick still runs, records its measurement, and
+/// prints/JSON-emits its result — only the macOS-only GUI ping is skipped.
 #[cfg(target_os = "macos")]
-fn deliver_notification(title: &str, body: &str) {
-    // Keep quiet on failure — best-effort.
+fn deliver_notification(title: &str, body: &str) -> NotifyOutcome {
     let escaped_title = title.replace('"', "'");
     let escaped_body = body.replace('"', "'");
     let script = format!(
         r#"display notification "{}" with title "{}""#,
         escaped_body, escaped_title
     );
-    let _ = Command::new("osascript").arg("-e").arg(script).output();
+    let mut cmd = Command::new("osascript");
+    cmd.arg("-e").arg(script);
+    run_notifier_command(cmd, NOTIFY_TIMEOUT)
 }
 
-/// Non-macOS graceful no-op (see the macOS variant above). The watch run
-/// recorder is the portable core and is NOT cfg-gated; only this GUI ping is.
 #[cfg(not(target_os = "macos"))]
-fn deliver_notification(_title: &str, _body: &str) {}
+fn deliver_notification(_title: &str, _body: &str) -> NotifyOutcome {
+    NotifyOutcome::Unsupported
+}
+
+/// Run a notifier subprocess with a hard wait limit, turning launch errors,
+/// nonzero exits, and timeouts into `Failed` with a short reason.
+#[cfg(any(target_os = "macos", test))]
+fn run_notifier_command(mut cmd: Command, timeout: std::time::Duration) -> NotifyOutcome {
+    use std::io::Read as _;
+    use std::process::Stdio;
+
+    let program = cmd.get_program().to_string_lossy().into_owned();
+    let mut child = match cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(e) => {
+            return NotifyOutcome::Failed {
+                error: format!("could not launch {}: {}", program, e),
+            }
+        }
+    };
+    let started = std::time::Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if started.elapsed() >= timeout => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return NotifyOutcome::Failed {
+                    error: format!("{} still running after {:?}; killed", program, timeout),
+                };
+            }
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(20)),
+            Err(e) => {
+                let _ = child.kill();
+                return NotifyOutcome::Failed {
+                    error: format!("waiting for {}: {}", program, e),
+                };
+            }
+        }
+    };
+    if status.success() {
+        return NotifyOutcome::Submitted;
+    }
+    let mut stderr = String::new();
+    if let Some(mut pipe) = child.stderr.take() {
+        let _ = pipe.read_to_string(&mut stderr);
+    }
+    NotifyOutcome::Failed {
+        error: format!(
+            "{} exited with {}: {}",
+            program,
+            status,
+            stderr.trim().chars().take(200).collect::<String>()
+        ),
+    }
+}
 
 fn launch_agent_plist_path() -> Result<PathBuf> {
     let home = home_dir()?;
@@ -1001,6 +1155,12 @@ fn load_state_from(path: &Path) -> Result<WatchState> {
     }
     let s = fs::read_to_string(path)?;
     Ok(serde_json::from_str(&s).unwrap_or_default())
+}
+
+fn save_state_or_log(state: &WatchState) {
+    if let Err(e) = save_state(state) {
+        eprintln!("(watch: failed to save watch state: {:#})", e);
+    }
 }
 
 fn save_state(state: &WatchState) -> Result<()> {
@@ -1098,6 +1258,7 @@ mod tests {
             last_total_bytes: Some(98765),
             last_notified_ts: None,
             last_notified_pct: None,
+            notify_retry_pending: false,
             last_autoreclaim_ts: None,
             last_trend_notified_ts: None,
             last_trueup_failure_ts: None,
@@ -1209,6 +1370,62 @@ mod tests {
             ..Default::default()
         };
         assert!(decide_notify(&stale, Level::Soft, 8.0, now));
+    }
+
+    /// A failed submission stays owed even where the cadence alone would be
+    /// quiet (same level, inside the timer, no further drop).
+    #[test]
+    fn notify_retries_failed_submission_inside_cadence() {
+        let now = chrono::Utc::now();
+        let mut prior = WatchState {
+            last_level: Some(Level::Urgent),
+            last_notified_ts: Some(now - chrono::Duration::seconds(60)),
+            last_notified_pct: Some(4.0),
+            ..Default::default()
+        };
+        assert!(!decide_notify(&prior, Level::Urgent, 3.9, now));
+        prior.notify_retry_pending = true;
+        assert!(decide_notify(&prior, Level::Urgent, 3.9, now));
+    }
+
+    // ---- notifier subprocess outcomes ----------------------------------------
+
+    #[cfg(unix)]
+    #[test]
+    fn notifier_command_reports_submit_exit_launch_and_timeout() {
+        assert_eq!(
+            run_notifier_command(Command::new("true"), NOTIFY_TIMEOUT),
+            NotifyOutcome::Submitted
+        );
+
+        let mut failing = Command::new("sh");
+        failing.args(["-c", "echo boom >&2; exit 3"]);
+        match run_notifier_command(failing, NOTIFY_TIMEOUT) {
+            NotifyOutcome::Failed { error } => {
+                assert!(error.contains("exit status: 3"), "{}", error);
+                assert!(error.contains("boom"), "{}", error);
+            }
+            other => panic!("nonzero exit must fail, got {:?}", other),
+        }
+
+        match run_notifier_command(
+            Command::new("/nonexistent/diskspace-notifier"),
+            NOTIFY_TIMEOUT,
+        ) {
+            NotifyOutcome::Failed { error } => {
+                assert!(error.contains("could not launch"), "{}", error)
+            }
+            other => panic!("launch error must fail, got {:?}", other),
+        }
+
+        let mut hung = Command::new("sleep");
+        hung.arg("30");
+        let started = std::time::Instant::now();
+        match run_notifier_command(hung, std::time::Duration::from_millis(200)) {
+            NotifyOutcome::Failed { error } => assert!(error.contains("killed"), "{}", error),
+            other => panic!("hung notifier must fail, got {:?}", other),
+        }
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
     }
 
     // ---- decide_trend_notify: the slow-slide early warning -------------------
@@ -1488,7 +1705,15 @@ mod tests {
         };
 
         let started = std::time::Instant::now();
-        run_with_scan_budget(&ctx, &budget).unwrap();
+        run_tick(
+            &ctx,
+            &home,
+            50,
+            1000,
+            &mut |_, _| NotifyOutcome::Submitted,
+            &mut |home, level, prior, now| scan_phase(home, level, prior, now, &budget),
+        )
+        .unwrap();
 
         assert!(started.elapsed() < std::time::Duration::from_secs(2));
         assert!(home.join(".diskspace/watch_state.json").exists());
@@ -1594,6 +1819,152 @@ mod tests {
         assert!(
             !obs.is_empty(),
             "series observations round-trip via the store"
+        );
+    }
+
+    fn quiet_ctx() -> Context {
+        Context {
+            json: false,
+            yes: false,
+            no_color: true,
+            verbose: false,
+            quiet: true,
+        }
+    }
+
+    fn no_scan_phase(prior: &WatchState) -> ScanPhase {
+        ScanPhase {
+            autoreclaim: None,
+            advisory: None,
+            last_autoreclaim_ts: prior.last_autoreclaim_ts,
+            last_trueup_failure_ts: prior.last_trueup_failure_ts,
+        }
+    }
+
+    /// A failed hand-off to the OS must not consume the alert: the last-success
+    /// bookkeeping stays put and the next tick retries, even though the level
+    /// entry that triggered it is already behind us and the urgent timer has
+    /// not elapsed.
+    #[test]
+    fn failed_submission_keeps_last_success_and_retries_next_tick() {
+        let base = TempBase::new("notify-fail");
+        let home = base.path.clone();
+        let _guard = HomeGuard::set(&home);
+        let state_path = home.join(".diskspace/watch_state.json");
+        fs::create_dir_all(state_path.parent().unwrap()).unwrap();
+        let last_success = chrono::Utc::now() - chrono::Duration::seconds(600);
+        save_state_to(
+            &state_path,
+            &WatchState {
+                last_level: Some(Level::Soft),
+                last_notified_ts: Some(last_success),
+                last_notified_pct: Some(5.2),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        // Tick 1: 4.9% free enters urgent; the notifier fails.
+        let mut calls = 0;
+        run_tick(
+            &quiet_ctx(),
+            &home,
+            49,
+            1000,
+            &mut |_, _| {
+                calls += 1;
+                NotifyOutcome::Failed {
+                    error: "osascript exited with exit status: 1".into(),
+                }
+            },
+            &mut |_, _, prior, _| no_scan_phase(prior),
+        )
+        .unwrap();
+        assert_eq!(calls, 1);
+        let after_failure = load_state_from(&state_path).unwrap();
+        assert_eq!(after_failure.last_level, Some(Level::Urgent));
+        assert_eq!(after_failure.last_notified_ts, Some(last_success));
+        assert_eq!(after_failure.last_notified_pct, Some(5.2));
+        assert!(after_failure.notify_retry_pending);
+
+        // Tick 2: still urgent, 0.3 points below the last success, inside the
+        // 15-minute timer. Only the pending retry makes this tick notify.
+        let mut retried = 0;
+        let mut trueup_failed_at = None;
+        run_tick(
+            &quiet_ctx(),
+            &home,
+            49,
+            1000,
+            &mut |_, _| {
+                retried += 1;
+                NotifyOutcome::Submitted
+            },
+            &mut |_, _, prior, now| {
+                trueup_failed_at = Some(now);
+                ScanPhase {
+                    last_trueup_failure_ts: Some(now),
+                    ..no_scan_phase(prior)
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(retried, 1, "a failed alert is retried on the next tick");
+        let after_retry = load_state_from(&state_path).unwrap();
+        assert!(after_retry.last_notified_ts.unwrap() > last_success);
+        assert_eq!(after_retry.last_notified_pct, Some(4.9));
+        assert!(!after_retry.notify_retry_pending);
+        assert_eq!(
+            after_retry.last_trueup_failure_ts, trueup_failed_at,
+            "the post-scan save keeps the scan result alongside the notification"
+        );
+    }
+
+    /// The pressure alert goes out, and its bookkeeping reaches disk, before the
+    /// scanner starts. A scanner that never comes back cannot delay or erase it.
+    #[test]
+    fn pressure_alert_is_sent_and_saved_before_a_stalled_scanner() {
+        let base = TempBase::new("notify-first");
+        let home = base.path.clone();
+        let _guard = HomeGuard::set(&home);
+        let state_path = home.join(".diskspace/watch_state.json");
+
+        let events = std::cell::RefCell::new(Vec::new());
+        let mut saved_when_scan_started = None;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_tick(
+                &quiet_ctx(),
+                &home,
+                30,
+                1000,
+                &mut |title, _| {
+                    events.borrow_mut().push(format!("notify: {}", title));
+                    NotifyOutcome::Submitted
+                },
+                &mut |_, _, _, _| {
+                    events.borrow_mut().push("scan".to_string());
+                    saved_when_scan_started = Some(load_state_from(&state_path).unwrap());
+                    panic!("scanner stalled");
+                },
+            )
+        }));
+
+        assert!(result.is_err(), "the stand-in scanner never returned");
+        assert_eq!(
+            *events.borrow(),
+            vec![
+                "notify: diskspace — disk is full".to_string(),
+                "scan".to_string()
+            ]
+        );
+        let at_scan = saved_when_scan_started.expect("scanner ran");
+        assert_eq!(at_scan.last_level, Some(Level::Urgent));
+        assert!(at_scan.last_notified_ts.is_some());
+        assert_eq!(at_scan.last_notified_pct, Some(3.0));
+        assert!(!at_scan.notify_retry_pending);
+        assert_eq!(
+            load_state_from(&state_path).unwrap().last_notified_ts,
+            at_scan.last_notified_ts
         );
     }
 }

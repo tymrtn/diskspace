@@ -4,6 +4,26 @@ All notable changes to `diskspace` are recorded here. Dates are `YYYY-MM-DD`.
 
 ## [Unreleased]
 
+### Fixed (watch notifications)
+
+- **`watch run` sends a due notification before auto-reclaim and the advisory
+  recorder.** Those scans can run well past their 5-second budget on a large
+  HOME (`tick_state.json` is parsed outside it), and the alert used to wait
+  behind them. Notification bookkeeping is now saved before the scans start, and
+  a failed state save is logged instead of ignored.
+- **The re-notify clock advances only when the OS accepts the notification.**
+  A failed `osascript` launch, nonzero exit, or hang (killed after 10s) is logged
+  to stderr, leaves `last_notified_ts` / `last_notified_pct` /
+  `last_trend_notified_ts` untouched, and retries on the next tick. New
+  serde-default state field `notify_retry_pending`.
+- **`watch run --json`:** `notified` and `trend_notified` keep their names and
+  boolean type, but now mean "submitted to the OS notifier this tick" instead of
+  "a notification was due". New `notification` / `trend_notification` fields are
+  `null` when nothing was due, otherwise `{"status": "submitted"}`,
+  `{"status": "failed", "error": "..."}`, or `{"status": "unsupported"}`
+  (non-macOS builds, which now report `notified: false`). `submitted` means
+  `osascript` exited 0; macOS offers no receipt that a banner was displayed.
+
 ### Changed (agent-facing — `detect --json` schema)
 
 - **`diskspace detect --json` now emits an OBJECT envelope, not a bare array.**
