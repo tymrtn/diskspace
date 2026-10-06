@@ -2027,6 +2027,55 @@ mod tests {
 
     /// Extended state round-trips including the new fields, and a LEGACY state
     /// file (without them) still parses (serde defaults).
+    /// `watch run` writes `watch_state.json` every five minutes while the
+    /// panel may be reading it. The tmp+rename save means a reader sees either
+    /// the previous or the next complete document, never a torn one.
+    #[test]
+    fn concurrent_reader_never_sees_a_torn_state_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "diskspace-watch-torn-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("watch_state.json");
+        save_state_to(&path, &sample_state()).unwrap();
+
+        let writer_path = path.clone();
+        let writer = std::thread::spawn(move || {
+            for i in 0..300u32 {
+                let mut st = sample_state();
+                st.last_pct_free = Some(i as f32);
+                st.incidents = (0..20)
+                    .map(|k| Incident {
+                        id: format!("urgent-2026100{}", k),
+                        level: Level::Urgent,
+                        opened_ts: chrono::Utc::now(),
+                        last_ts: chrono::Utc::now(),
+                        passes: i,
+                        items: k,
+                        refused: 0,
+                        bytes_estimated: 1,
+                        actually_freed: 0,
+                        disposition: None,
+                    })
+                    .collect();
+                save_state_to(&writer_path, &st).unwrap();
+            }
+        });
+
+        let mut reads = 0;
+        while !writer.is_finished() {
+            let raw = std::fs::read_to_string(&path).unwrap();
+            let parsed: Result<WatchState, _> = serde_json::from_str(&raw);
+            assert!(parsed.is_ok(), "torn read: {}", &raw[..raw.len().min(80)]);
+            reads += 1;
+        }
+        writer.join().unwrap();
+        assert!(reads > 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn legacy_state_without_new_fields_parses() {
         let base = TempBase::new("legacy");
