@@ -314,7 +314,7 @@ fn find_rule<'a>(path: &Path, rules: &'a [Rule], home: &str) -> Option<&'a Rule>
     rules.iter().find(|r| {
         let resolved = expand_home(&r.path_pattern, &home_path);
         match glob::Pattern::new(&resolved) {
-            Ok(p) => p.matches_path(path),
+            Ok(p) => crate::core::rules::glob_matches(&p, path),
             Err(_) => false,
         }
     })

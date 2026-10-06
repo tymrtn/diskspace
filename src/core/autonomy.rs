@@ -11,10 +11,12 @@
 //! 2. `tier`: confidence floor + regenerable recovery class (`auto` /
 //!    `redownload` / `rebuild`). Grants may RELAX this tier in `actuation`
 //!    builds; they never widen this path.
-//! 3. `pressure-test`: `check::pressure_test`, the floor every delete shares.
-//! 4. `gate`: `safety::autonomous_gate`, the extra unattended checks (symlinks,
+//! 3. `provenance`: a producer that still needs the artifact (uncommitted or
+//!    unpushed work, see `core::provenance`) refuses.
+//! 4. `pressure-test`: `check::pressure_test`, the floor every delete shares.
+//! 5. `gate`: `safety::autonomous_gate`, the extra unattended checks (symlinks,
 //!    containment, cloud sync, protected content).
-//! 5. `execute`: airlock (reversible) or, under disk pressure, delete.
+//! 6. `execute`: airlock (reversible) or, under disk pressure, delete.
 //!
 //! Free space is measured before and after so the receipt carries ACTUAL
 //! recovery, never an estimate: a same-volume airlock rename frees nothing until
@@ -28,6 +30,7 @@ use crate::commands::check;
 use crate::core::airlock_store;
 use crate::core::candidate::Candidate;
 use crate::core::history::{self, ActionKind, Entry};
+use crate::core::provenance;
 use crate::core::safety;
 use crate::profile::Profile;
 
@@ -151,6 +154,20 @@ pub fn reclaim(candidates: &[Candidate], req: &Request) -> Outcome {
                     c.confidence,
                     recovery.unwrap_or("unknown")
                 ),
+            );
+            continue;
+        }
+
+        if let Some(p) = c
+            .provenance
+            .as_ref()
+            .filter(|p| p.liveness == provenance::Liveness::Active)
+        {
+            refuse(
+                &mut out,
+                c,
+                "provenance",
+                format!("producer still active: {}", p.evidence.join("; ")),
             );
             continue;
         }
@@ -337,6 +354,7 @@ mod tests {
             consequence_contract: None,
             metrics: None,
             reference_url: None,
+            provenance: None,
         }
     }
 
@@ -432,6 +450,35 @@ mod tests {
         assert_eq!(out.refusals[0].stage, "gate");
         assert!(out.refusals[0].reason.contains("credentials"));
         assert!(p.exists());
+    }
+
+    /// A producer that still needs the artifact (uncommitted or unpushed work)
+    /// refuses before any filesystem check runs.
+    #[test]
+    fn active_provenance_is_refused_before_the_pressure_test() {
+        use crate::core::provenance::{Liveness, Producer, Provenance};
+        let home = TempHome::new("prov-active");
+        let prof = Profile::default();
+        let p = home.cache("worktree-build");
+        std::fs::write(p.join("blob.bin"), vec![0u8; 4096]).unwrap();
+        age(&p);
+        let mut c = cand(&p, 0.95, Some("rebuild"));
+        c.provenance = Some(Provenance {
+            producer: Producer::GitRepository,
+            producer_path: None,
+            liveness: Liveness::Active,
+            evidence: vec!["2 uncommitted change(s)".into()],
+        });
+        let req = request(&home, &prof, Disposition::Delete);
+        let out = reclaim(&[c], &req);
+        assert!(out.actions.is_empty());
+        assert_eq!(out.refusals[0].stage, "provenance");
+        assert!(
+            out.refusals[0].reason.contains("uncommitted"),
+            "{}",
+            out.refusals[0].reason
+        );
+        assert!(p.exists(), "an active producer's artifact is never touched");
     }
 
     #[test]

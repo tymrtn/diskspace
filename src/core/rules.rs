@@ -45,6 +45,21 @@ pub struct Consequences {
 
 static BUILTIN_RULES_YAML: &str = include_str!("../../rules/builtin.yaml");
 
+/// Match a rule glob against a path the way every rule is written: `*` and `?`
+/// stay inside one path component, `**` spans directories. With the glob
+/// crate's defaults a trailing `/*` would match every file beneath the
+/// directory and bloat the survey cache with the whole tree.
+pub fn glob_matches(pat: &glob::Pattern, path: &std::path::Path) -> bool {
+    pat.matches_path_with(
+        path,
+        glob::MatchOptions {
+            case_sensitive: true,
+            require_literal_separator: true,
+            require_literal_leading_dot: false,
+        },
+    )
+}
+
 pub fn load_builtin() -> Result<Vec<Rule>> {
     let rules: Vec<Rule> = serde_yaml::from_str(BUILTIN_RULES_YAML)?;
     Ok(rules)
@@ -58,6 +73,76 @@ mod tests {
     fn builtin_rules_parse() {
         let rules = load_builtin().expect("builtin rules parse");
         assert!(!rules.is_empty(), "builtin.yaml has rules");
+    }
+
+    /// Agent worktree rules match one worktree at a time: the directory one
+    /// level below the worktrees folder, never the folder itself or its contents.
+    #[test]
+    fn agent_worktree_rules_match_one_level_below_the_worktrees_folder() {
+        let rules = load_builtin().unwrap();
+        let home = std::path::Path::new("/home/u");
+        for (id, hit, misses) in [
+            (
+                "repo-dot-worktrees",
+                "/home/u/code/repo/.worktrees/feat-x",
+                [
+                    "/home/u/code/repo/.worktrees",
+                    "/home/u/code/repo/.worktrees/feat-x/src",
+                ],
+            ),
+            (
+                "claude-code-worktrees",
+                "/home/u/code/repo/.claude/worktrees/feat-x",
+                [
+                    "/home/u/code/repo/.claude/worktrees",
+                    "/home/u/code/repo/.claude/worktrees/feat-x/src",
+                ],
+            ),
+            (
+                "hermes-worktrees",
+                "/home/u/.hermes/profiles/nagatha/worktrees/feat-x",
+                [
+                    "/home/u/.hermes/profiles/nagatha/worktrees",
+                    "/home/u/.hermes/profiles/nagatha/worktrees/feat-x/src",
+                ],
+            ),
+        ] {
+            let rule = rules
+                .iter()
+                .find(|r| r.id == id)
+                .unwrap_or_else(|| panic!("rule {} exists", id));
+            let pat =
+                glob::Pattern::new(&crate::core::scanner::expand_home(&rule.path_pattern, home))
+                    .unwrap();
+            let path = std::path::Path::new;
+            assert!(glob_matches(&pat, path(hit)), "{} matches {}", id, hit);
+            for miss in misses {
+                assert!(
+                    !glob_matches(&pat, path(miss)),
+                    "{} must not match {}",
+                    id,
+                    miss
+                );
+            }
+            let cons = rule.consequences.as_ref().expect("consequences stated");
+            assert_eq!(cons.recovery, "irreversible", "{}", id);
+        }
+    }
+
+    /// Rule globs match path components: `*` never crosses a `/`, so a rule
+    /// ending in `/*` names the directory one level down, not every file
+    /// beneath it. `**` still spans directories.
+    #[test]
+    fn single_star_never_crosses_a_path_separator() {
+        let pat = glob::Pattern::new("**/stale/*").unwrap();
+        assert!(glob_matches(&pat, std::path::Path::new("/a/b/stale/x")));
+        assert!(!glob_matches(&pat, std::path::Path::new("/a/b/stale/x/y")));
+        assert!(!glob_matches(&pat, std::path::Path::new("/a/b/stale")));
+        let deep = glob::Pattern::new("**/_archive/**/node_modules").unwrap();
+        assert!(glob_matches(
+            &deep,
+            std::path::Path::new("/a/_archive/p/q/node_modules")
+        ));
     }
 
     #[test]

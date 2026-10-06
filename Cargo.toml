@@ -73,6 +73,8 @@ ed25519-dalek = { version = "2", features = ["rand_core"] }
 rand = "0.8"
 ratatui = "0.29"
 crossterm = "0.28"
+# Reproduces cargo's `{workspace-path-hash}` build-dir layout (core::provenance).
+rustc-stable-hash = "0.1.2"
 
 [profile.release]
 opt-level = 3

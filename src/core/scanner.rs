@@ -146,6 +146,10 @@ pub struct DirTotal {
     pub total_bytes: u64,
 }
 
+/// Cap on recorded workspace manifests: enough for any developer machine,
+/// small enough to keep the cache bounded.
+pub const MANIFESTS_KEPT: usize = 5_000;
+
 /// Cached scan result written to ~/.diskspace/scan.json
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ScanResult {
@@ -186,6 +190,12 @@ pub struct ScanResult {
     /// `largest_dirs`) still deserializes to an empty Vec.
     #[serde(default)]
     pub largest_dirs: Vec<DirTotal>,
+    /// Every `Cargo.toml` the walk saw outside `target`/`.cargo` trees, capped
+    /// at [`MANIFESTS_KEPT`]. `core::provenance` hashes these the way cargo
+    /// hashes a workspace root to tell an orphaned `build-dir` from a live one.
+    /// Additive + serde-default so legacy scan.json still deserializes.
+    #[serde(default)]
+    pub manifests: Vec<PathBuf>,
     /// Internal full-walk artifact used by watch's daily true-up. Never persisted
     /// in scan.json; collecting it during the primary walk avoids a second HOME
     /// traversal under the same deadline.
@@ -419,6 +429,7 @@ fn scan_impl(
     let mut category_totals: HashMap<String, u64> = HashMap::new();
     let mut dir_sizes: HashMap<PathBuf, u64> = HashMap::new();
     let mut dir_mtimes: HashMap<PathBuf, (i64, u64)> = HashMap::new();
+    let mut manifests: Vec<PathBuf> = Vec::new();
 
     // Build a map of rule path patterns to categories for fast lookup
     let rule_map: Vec<(glob::Pattern, Category)> = rules
@@ -440,6 +451,8 @@ fn scan_impl(
                 path.to_path_buf(),
                 (mtime_secs_of(&metadata).unwrap_or(0), 0),
             );
+        } else if manifests.len() < MANIFESTS_KEPT && is_workspace_manifest(&path) {
+            manifests.push(path.clone());
         }
 
         // Skip iCloud Drive evicted and Dropbox Smart Sync online-only files —
@@ -490,7 +503,9 @@ fn scan_impl(
 
         total_bytes += size;
 
-        let matched = rule_map.iter().find(|(pat, _)| pat.matches_path(&path));
+        let matched = rule_map
+            .iter()
+            .find(|(pat, _)| crate::core::rules::glob_matches(pat, &path));
 
         // Accumulate file sizes into ancestor directories so a rule-matched
         // directory entry knows its total size.
@@ -589,8 +604,18 @@ fn scan_impl(
         // whole-$HOME metric after the walk (see commands/scan.rs).
         metrics: None,
         largest_dirs,
+        manifests,
         dir_mtimes,
     })
+}
+
+/// A `Cargo.toml` that could be a workspace root: not a vendored registry copy
+/// and not a build artifact.
+fn is_workspace_manifest(path: &Path) -> bool {
+    path.file_name().is_some_and(|n| n == "Cargo.toml")
+        && !path
+            .components()
+            .any(|c| c.as_os_str() == "target" || c.as_os_str() == ".cargo")
 }
 
 fn top_level_matched(entries: &[ScannedEntry]) -> Vec<&ScannedEntry> {
@@ -1831,6 +1856,7 @@ mod tests {
             scan_id: "1700000000-9999".to_string(),
             metrics: None,
             largest_dirs: Vec::new(),
+            manifests: Vec::new(),
             dir_mtimes: Default::default(),
         };
         let json = serde_json::to_string(&result).unwrap();
@@ -2122,6 +2148,27 @@ mod tests {
             "the descendant symlink cycle is not followed"
         );
         assert_eq!(root_dev_of(&root_link), root_dev_of(&target));
+    }
+
+    /// The walk records every `Cargo.toml` that could be a workspace root and
+    /// skips vendored registry copies and build artifacts.
+    #[test]
+    fn scan_records_workspace_manifests_outside_target_and_cargo_trees() {
+        let mut dir = std::env::temp_dir();
+        dir.push(format!(
+            "diskspace-scanner-manifests-{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        for rel in ["ws", "ws/target/pkg", ".cargo/registry/src/x/pkg-1.0"] {
+            std::fs::create_dir_all(dir.join(rel)).unwrap();
+            std::fs::write(dir.join(rel).join("Cargo.toml"), "[package]\n").unwrap();
+        }
+
+        let result = scan(&dir, &[]).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(result.manifests, vec![dir.join("ws").join("Cargo.toml")]);
     }
 
     /// On unix, scanning a tempdir with a matching rule populates dev/ino on the

@@ -8,6 +8,7 @@ pub mod fsutil;
 pub mod grant;
 pub mod history;
 pub mod metrics;
+pub mod provenance;
 pub mod repack;
 pub mod rules;
 pub mod safety;

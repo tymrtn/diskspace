@@ -43,6 +43,40 @@ All notable changes to `diskspace` are recorded here. Dates are `YYYY-MM-DD`.
   instead of being skipped; a `$HOME` reached through a symlink is no longer
   refused wholesale.
 
+### Added (provenance: who produced an artifact, and do they still need it)
+
+- **`core::provenance`** attaches an additive `provenance` object to a
+  candidate (`detect --json`, `explain --json`) when the path carries evidence:
+  `producer` (`cargo_workspace` / `git_repository`), `producer_path`,
+  `liveness` (`active` / `present` / `orphaned` / `unknown`) and the
+  `evidence` lines behind the verdict. A linked git worktree is read through
+  its `.git` file: uncommitted changes or commits on no remote mean `active`;
+  clean and fully pushed means `orphaned`; a missing parent repository means
+  `unknown`, never a guess. A cargo `build-dir` (`<base>/<2 hex>/<14 hex>/target`)
+  is matched to its workspace by reproducing cargo's `{workspace-path-hash}`
+  (new dependency `rustc-stable-hash`); no surveyed workspace hashing to it
+  means `orphaned`.
+- **Orphaned artifacts rank higher** (confidence +0.10, capped at 0.99) and
+  `detect` prints the evidence under the path. **An `active` producer is a new
+  refusal stage, `provenance`, in the unattended reclaim gate**, ahead of the
+  pressure test.
+- The survey now records every `Cargo.toml` it sees outside `target` and
+  `.cargo` trees (`scan.json` `manifests`, serde-default, capped at 5000) so
+  build dirs can be matched without a rescan.
+- **Agent worktree rules**: `repo-dot-worktrees` (`**/.worktrees/*`),
+  `claude-code-worktrees` (`**/.claude/worktrees/*`) and `hermes-worktrees`
+  (`~/.hermes/profiles/*/worktrees/*`), each one worktree per candidate,
+  `irreversible`, excluded when modified within 14 days.
+
+### Changed (rule globs match path components)
+
+- Rule `path_pattern` globs now match with `require_literal_separator`: `*`
+  and `?` stay inside one path component, `**` still spans directories. Every
+  builtin pattern already meant this; the change matters for patterns ending in
+  `/*` (`**/stale/*`, the new worktree rules), which previously also matched
+  every file beneath the directory and would have filled the survey cache with
+  the whole tree. Profile `never_touch` / `never_suggest` globs are unchanged.
+
 ### Added (instant known-state panel)
 
 - **`diskspace investigate`** and the bare `diskspace` launch now open with

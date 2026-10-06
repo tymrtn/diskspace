@@ -454,7 +454,9 @@ fn hunt_fresh_walk(
             continue;
         }
 
-        let matched = patterns.iter().any(|p| p.matches_path(&path));
+        let matched = patterns
+            .iter()
+            .any(|p| crate::core::rules::glob_matches(p, &path));
 
         let mut p = path.parent();
         while let Some(parent) = p {
@@ -705,6 +707,7 @@ mod tests {
             scan_id: String::new(),
             metrics: None,
             largest_dirs: largest,
+            manifests: Vec::new(),
             dir_mtimes: Default::default(),
         }
     }

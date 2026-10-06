@@ -109,6 +109,13 @@ pub struct Candidate {
     /// rule. Additive + serde-default skip-if-none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reference_url: Option<String>,
+    /// Who produced this artifact and whether they still need it
+    /// (`core::provenance`). Set by `detect` when evidence exists. Additive +
+    /// serde-default skip-if-none. Read by the autonomous gate (an `active`
+    /// producer refuses); ranking sees it only through the confidence `detect`
+    /// already adjusted, and `score()` never reads it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<crate::core::provenance::Provenance>,
 }
 
 impl Candidate {
@@ -207,6 +214,7 @@ mod tests {
             }),
             metrics: Some(Metrics::default()),
             reference_url: Some("https://x/y".into()),
+            provenance: None,
         }
     }
 

@@ -1693,6 +1693,7 @@ mod tests {
             scan_id: String::new(),
             metrics: None,
             largest_dirs: Vec::new(),
+            manifests: Vec::new(),
             dir_mtimes: Default::default(),
         }
     }
@@ -1774,6 +1775,7 @@ mod tests {
             consequence_contract: None,
             metrics: None,
             reference_url: None,
+            provenance: None,
         }
     }
 
