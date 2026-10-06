@@ -316,6 +316,43 @@ pub(crate) fn read_all_in_pub(base: &Path) -> Result<Vec<Observation>> {
     read_all_in(base)
 }
 
+/// The parsed series, shared across calls within one process while
+/// `series.jsonl` is unchanged (same path, length and mtime). The per-candidate
+/// metrics enrichment in `detect` and the watch's reclaim pass ask for the
+/// whole log once per candidate; on a machine with a multi-hundred-MB series
+/// that was one full parse per candidate. Any append invalidates the cache on
+/// the next call, so a reader never sees a stale log.
+pub(crate) fn read_all_shared_in(base: &Path) -> Result<std::sync::Arc<Vec<Observation>>> {
+    use std::sync::{Arc, Mutex};
+    struct Cached {
+        path: PathBuf,
+        len: u64,
+        modified: Option<std::time::SystemTime>,
+        observations: Arc<Vec<Observation>>,
+    }
+    static CACHE: Mutex<Option<Cached>> = Mutex::new(None);
+
+    let path = series_path_in(base);
+    let (len, modified) = match std::fs::metadata(&path) {
+        Ok(m) => (m.len(), m.modified().ok()),
+        Err(_) => return Ok(Arc::new(Vec::new())),
+    };
+    let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(c) = cache.as_ref() {
+        if c.path == path && c.len == len && c.modified == modified {
+            return Ok(Arc::clone(&c.observations));
+        }
+    }
+    let observations = Arc::new(read_all_in(base)?);
+    *cache = Some(Cached {
+        path,
+        len,
+        modified,
+        observations: Arc::clone(&observations),
+    });
+    Ok(observations)
+}
+
 /// Crate-internal base-dir seam for the batch writer (used by `metrics` tests to
 /// seed a tempdir series). Thin pass-through to [`append_batch_in`]. Test-only:
 /// production writes go through [`append`] / [`append_batch`].
@@ -631,6 +668,29 @@ mod tests {
             assert_eq!(o.bytes, (i as u64) * 100);
             assert_eq!(o.path, PathBuf::from(format!("/x/{i}")));
         }
+    }
+
+    /// `detect` asks for the series once per candidate. The parsed log is
+    /// shared between calls while the file is unchanged and re-read as soon as
+    /// an append lands, so a 400 MB series costs one parse per run, not one
+    /// per candidate, and never serves stale data.
+    #[test]
+    fn shared_read_reuses_the_parsed_series_until_the_file_changes() {
+        let base = TempBase::new("shared");
+        append_batch_in(base.path(), &[obs("/x/1", 1, ts(2026, 6, 1, 0, 0, 0))]).unwrap();
+
+        let first = read_all_shared_in(base.path()).unwrap();
+        let second = read_all_shared_in(base.path()).unwrap();
+        assert_eq!(first.len(), 1);
+        assert!(
+            std::sync::Arc::ptr_eq(&first, &second),
+            "unchanged file: the same parsed series is handed back"
+        );
+
+        append_batch_in(base.path(), &[obs("/x/2", 2, ts(2026, 6, 1, 0, 0, 1))]).unwrap();
+        let third = read_all_shared_in(base.path()).unwrap();
+        assert_eq!(third.len(), 2, "an append is visible on the next read");
+        assert!(!std::sync::Arc::ptr_eq(&first, &third));
     }
 
     #[test]

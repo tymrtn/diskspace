@@ -43,6 +43,15 @@ All notable changes to `diskspace` are recorded here. Dates are `YYYY-MM-DD`.
   instead of being skipped; a `$HOME` reached through a symlink is no longer
   refused wholesale.
 
+### Fixed (detect and watch reclaim re-parsed the series log per candidate)
+
+- `detect` and the watch's reclaim pass asked for the whole `series.jsonl` once
+  per candidate inside the advisory metrics enrichment. On a machine with a
+  400 MB series that was a full JSON parse per candidate: a debug `detect`
+  ran past 11 minutes and the release build took 2 minutes. The parsed series
+  is now shared within a process while the file's path, length and mtime are
+  unchanged, and re-read after any append. Same machine, debug build: 50 s.
+
 ### Added (provenance: who produced an artifact, and do they still need it)
 
 - **`core::provenance`** attaches an additive `provenance` object to a
