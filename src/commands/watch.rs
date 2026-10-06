@@ -26,6 +26,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use crate::commands::known_state;
 use crate::core::bundle;
 use crate::core::metrics::{self, DfSample};
 use crate::core::rules;
@@ -489,20 +490,7 @@ pub fn uninstall(ctx: &Context) -> Result<()> {
 pub fn status(ctx: &Context) -> Result<()> {
     let plist_path = launch_agent_plist_path()?;
     let installed = plist_path.exists();
-    let loaded = if installed {
-        Command::new("launchctl")
-            .arg("list")
-            .output()
-            .ok()
-            .map(|o| {
-                String::from_utf8_lossy(&o.stdout)
-                    .lines()
-                    .any(|l| l.contains(PLIST_LABEL))
-            })
-            .unwrap_or(false)
-    } else {
-        false
-    };
+    let loaded = agent_loaded(installed);
 
     let state = load_state().unwrap_or_default();
 
@@ -934,6 +922,97 @@ fn prof_watch_policy() -> WatchPolicy {
             enabled: false,
             headroom_bytes: None,
         },
+    }
+}
+
+/// Whether launchd currently lists the watch agent. Only asked when the plist
+/// exists, so an uninstalled watch never shells out.
+fn agent_loaded(installed: bool) -> bool {
+    installed
+        && Command::new("launchctl")
+            .arg("list")
+            .output()
+            .ok()
+            .map(|o| {
+                String::from_utf8_lossy(&o.stdout)
+                    .lines()
+                    .any(|l| l.contains(PLIST_LABEL))
+            })
+            .unwrap_or(false)
+}
+
+/// A watcher sample older than this no longer describes the disk: three missed
+/// ticks means the agent is stopped, unloaded, or the machine was asleep.
+const WATCH_STALE_AFTER_SECS: i64 = 3 * CHECK_INTERVAL_SECONDS as i64;
+
+/// An incident whose last pass is older than this is reported closed.
+const INCIDENT_OPEN_SECS: i64 = 24 * 3600;
+
+/// The thresholds and standing policy the watch operates under, for the
+/// known-state panel. Pure: reads only the profile it is given.
+pub fn policy_view(prof: &profile::Profile) -> known_state::PolicyView {
+    known_state::PolicyView {
+        soft_pct_free: SOFT_PCT_FREE,
+        urgent_pct_free: URGENT_PCT_FREE,
+        critical_pct_free: CRITICAL_PCT_FREE,
+        autoreclaim_opt_in: prof.preferences.watch_autoreclaim,
+        headroom_gb: prof
+            .preferences
+            .headroom_gb
+            .filter(|gb| gb.is_finite() && *gb > 0.0),
+        pressure_threshold_gb: prof.preferences.disk_pressure_threshold_gb,
+    }
+}
+
+/// The watcher's last persisted sample, labelled by how current it is. Reads
+/// `watch_state.json` and the plist; never scans.
+pub fn watch_view(now: chrono::DateTime<chrono::Utc>) -> known_state::WatchView {
+    let installed = launch_agent_plist_path()
+        .map(|p| p.exists())
+        .unwrap_or(false);
+    let state = load_state().unwrap_or_default();
+    let certainty = match state.last_ts {
+        None => known_state::Certainty::Unknown,
+        Some(ts) if now.signed_duration_since(ts).num_seconds() > WATCH_STALE_AFTER_SECS => {
+            known_state::Certainty::Stale
+        }
+        Some(_) => known_state::Certainty::Recorded,
+    };
+    known_state::WatchView {
+        installed,
+        loaded: agent_loaded(installed),
+        last_tick: state.last_ts,
+        last_level: state.last_level.map(|l| l.label().to_string()),
+        last_pct_free: state.last_pct_free,
+        last_free_bytes: state.last_free_bytes,
+        certainty,
+    }
+}
+
+/// The most recent incident the watcher recorded, with measured recovery.
+pub fn recovery_view(now: chrono::DateTime<chrono::Utc>) -> known_state::RecoveryView {
+    let state = load_state().unwrap_or_default();
+    let latest =
+        state
+            .incidents
+            .iter()
+            .max_by_key(|i| i.last_ts)
+            .map(|i| known_state::IncidentView {
+                id: i.id.clone(),
+                level: i.level.label().to_string(),
+                opened_ts: i.opened_ts,
+                last_ts: i.last_ts,
+                passes: i.passes,
+                items: i.items,
+                refused: i.refused,
+                bytes_estimated: i.bytes_estimated,
+                actually_freed: i.actually_freed,
+                disposition: i.disposition.clone(),
+                open: now.signed_duration_since(i.last_ts).num_seconds() <= INCIDENT_OPEN_SECS,
+            });
+    known_state::RecoveryView {
+        latest,
+        incidents_recorded: state.incidents.len(),
     }
 }
 

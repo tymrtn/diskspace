@@ -225,6 +225,10 @@ enum Commands {
     },
     /// Show airlock state and pending purges
     Status,
+    /// What is going on? Everything already known about the disk, drawn from
+    /// persisted watcher state without scanning (read-only). Same panel as the
+    /// bare `diskspace` launch.
+    Investigate,
     /// Verify the P1 measurement layer's invariants hold at runtime (read-only)
     Selfcheck {
         /// Run the G1–G7 measurement-layer gate
@@ -432,6 +436,7 @@ fn main() -> Result<()> {
         Some(Commands::Trend { window_days, top }) => commands::trend::run(window_days, top, &ctx),
         Some(Commands::Top { window_days, top }) => commands::top::run(window_days, top),
         Some(Commands::Status) => commands::status::run(&ctx),
+        Some(Commands::Investigate) => commands::investigate::run(&ctx),
         Some(Commands::Selfcheck { measurement }) => commands::selfcheck::run(measurement, &ctx),
         Some(Commands::Profile { action }) => match action {
             ProfileAction::Get => commands::profile_cmd::get(&ctx),

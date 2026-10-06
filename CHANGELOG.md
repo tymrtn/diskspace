@@ -43,6 +43,20 @@ All notable changes to `diskspace` are recorded here. Dates are `YYYY-MM-DD`.
   instead of being skipped; a `$HOME` reached through a symlink is no longer
   refused wholesale.
 
+### Added (instant known-state panel)
+
+- **`diskspace investigate`** and the bare `diskspace` launch now open with
+  everything the watcher already knows, drawn from persisted state without a
+  scan: live `df`, the watch's last sample (level, % free, age, monitoring
+  on/off), the survey's age and scope (STALE past 24h, `unknown` when absent),
+  the largest known owners strictly below the survey root, rule-matched bytes as
+  an *estimate*, the 7-day free-space sparkline and advisory trend, the latest
+  incident with its *measured* recovery, and next actions. `investigate --json`
+  emits the same document. Both views are read-only and never create or touch
+  `scan.json`.
+- `watch status` now shares its launchd check with the panel; the bare launch's
+  previous one-line disk/profile/survey status is replaced by the panel.
+
 ### Fixed (watch notifications)
 
 - **`watch run` sends a due notification before auto-reclaim and the advisory
