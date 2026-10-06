@@ -60,18 +60,6 @@ const RENOTIFY_PCT_DROP: f32 = 0.5;
 /// doesn't thrash the reclaim path every 5-minute tick.
 const AUTORECLAIM_MIN_INTERVAL_SECS: i64 = 1800; // 30 min
 
-/// Confidence floor for autonomous reclaim — matches the manual `reclaim`
-/// command's floor. Below this, nothing is auto-deleted.
-const AUTORECLAIM_MIN_CONFIDENCE: f32 = 0.85;
-
-/// Recovery classes safe for autonomous reclaim. These come back on their own
-/// (`auto`) or on next use with no project-breaking step (`redownload`,
-/// `rebuild`). We deliberately EXCLUDE `recreate` (venvs / node_modules — a
-/// project won't run until manually reinstalled), plus `manual` and
-/// `irreversible`. The data-safety floor still independently blocks databases and
-/// secret stores regardless of this list.
-const AUTORECLAIM_SAFE_RECOVERY: &[&str] = &["auto", "redownload", "rebuild"];
-
 /// Trend early-warning: alert when the trailing-window burn rate projects the
 /// volume FULL within this many days, even while free space is still above the
 /// Ok threshold. This is the fix for the slow slide the threshold alerts can't
@@ -237,17 +225,6 @@ fn trueup_retry_deferred(
     last_failure.is_some_and(|failed_at| {
         now.signed_duration_since(failed_at).num_seconds() < TRUEUP_RETRY_BACKOFF_SECS
     })
-}
-
-/// Pure safe-subset filter for autonomous reclaim. A candidate is eligible only
-/// if it clears the confidence floor AND its recovery class is in
-/// [`AUTORECLAIM_SAFE_RECOVERY`]. A candidate with no consequence metadata is
-/// NOT eligible (fail-closed — we never auto-delete something whose recovery
-/// semantics we can't read). The data-safety floor and the per-item pressure
-/// test are enforced separately and independently downstream.
-fn is_autoreclaim_safe(confidence: f32, recovery: Option<&str>) -> bool {
-    confidence >= AUTORECLAIM_MIN_CONFIDENCE
-        && matches!(recovery, Some(r) if AUTORECLAIM_SAFE_RECOVERY.contains(&r))
 }
 
 pub fn install(ctx: &Context) -> Result<()> {
@@ -692,13 +669,25 @@ fn run_tick(
             }
         }
         if let Some(ar) = &autoreclaim {
+            let verb = match ar.disposition.as_deref() {
+                Some("airlock") => "airlocked",
+                Some("delete") => "deleted",
+                _ => "acted on",
+            };
+            let measured = match ar.actually_freed {
+                Some(b) => crate::output::format_bytes(b),
+                None => "unmeasured".into(),
+            };
             println!(
                 "  {}",
                 ctx.style(
                     &format!(
-                        "auto-reclaim: freed {} across {} item(s)",
-                        crate::output::format_bytes(ar.bytes_freed),
-                        ar.items
+                        "auto-reclaim: {} {} item(s), est. {} · measured freed {} · {} refused",
+                        verb,
+                        ar.items,
+                        crate::output::format_bytes(ar.bytes_estimated),
+                        measured,
+                        ar.refused
                     ),
                     &dim
                 )
@@ -735,7 +724,11 @@ fn scan_phase(
         prior.last_autoreclaim_ts,
         now,
     ) {
-        Some(auto_reclaim(home, scan_budget))
+        Some(auto_reclaim(
+            home,
+            scan_budget,
+            &incident_id_for(level, now),
+        ))
     } else {
         None
     };
@@ -787,37 +780,60 @@ fn prof_watch_autoreclaim() -> bool {
         .unwrap_or(false)
 }
 
-/// Outcome of one autonomous reclaim pass, surfaced in output and recorded to the
-/// receipts ledger (via `reclaim`'s own history append inside `auto_reclaim`).
+/// Outcome of one autonomous reclaim pass, surfaced in output. Per-item receipts
+/// are written by `core::autonomy`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct AutoReclaimOutcome {
-    bytes_freed: u64,
+    /// `<level>-<yyyymmdd>`: every pass inside one pressure episode shares it.
+    incident_id: String,
+    /// `"airlock"` or `"delete"`; `None` when nothing cleared the gate.
+    disposition: Option<String>,
     items: usize,
+    refused: usize,
+    /// Sum of acted-on candidate sizes as the scan estimated them.
+    bytes_estimated: u64,
+    /// `df` delta on `$HOME`'s volume across the pass. A same-volume airlock
+    /// legitimately reports 0 until purge. `None` when df was unavailable.
+    actually_freed: Option<u64>,
     #[serde(skip)]
     scan_complete: bool,
 }
 
-/// Perform one gated, autonomous reclaim of SAFE regenerable caches. Called only
-/// when [`should_autoreclaim`] returned true (opt-in on, urgent, rate-limit
-/// elapsed). Best-effort: any failure returns a zero-outcome rather than
-/// propagating, so the watch tick never crashes.
+/// One incident per pressure level per UTC day, so every autonomous pass inside
+/// the same episode is grouped in receipts and watch state.
+fn incident_id_for(level: Level, now: chrono::DateTime<chrono::Utc>) -> String {
+    format!(
+        "{}-{}",
+        format!("{:?}", level).to_ascii_lowercase(),
+        now.format("%Y%m%d")
+    )
+}
+
+/// Perform one autonomous reclaim pass. Called only when [`should_autoreclaim`]
+/// returned true (opt-in on, urgent, rate-limit elapsed). Best-effort: a failed
+/// rule load or scan returns a zero outcome rather than propagating, so the
+/// watch tick never crashes.
 ///
-/// Selection is deliberately conservative and defense-in-depth:
-///   1. Fresh scan of `$HOME`, build candidates the same way `detect`/`reclaim` do.
-///   2. Keep only [`is_autoreclaim_safe`] items (confidence floor + recovery class
-///      in {auto, redownload, rebuild} — never `recreate`/`manual`/`irreversible`).
-///   3. Pressure-test each survivor (the same check `reclaim` runs); the test
-///      independently blocks databases, secret stores, and in-use paths.
-///   4. Delete survivors, appending each to the receipts ledger with an
-///      `auto: true` context marker so the action is auditable.
-fn auto_reclaim(home: &Path, scan_budget: &scanner::ScanBudget) -> AutoReclaimOutcome {
-    use crate::commands::check;
+/// This function only scans and builds candidates the same way `detect` does;
+/// every decision to touch a path belongs to [`autonomy::reclaim`], the single
+/// unattended gate. Survivors are airlocked, or deleted only when free space is
+/// already below the profile's pressure threshold (where staging frees nothing).
+fn auto_reclaim(
+    home: &Path,
+    scan_budget: &scanner::ScanBudget,
+    incident_id: &str,
+) -> AutoReclaimOutcome {
     use crate::commands::detect::build_candidates_pub;
-    use crate::core::history::{self, ActionKind, Entry as HistEntry};
+    use crate::core::autonomy;
+    use crate::core::history;
 
     let zero = AutoReclaimOutcome {
-        bytes_freed: 0,
+        incident_id: incident_id.to_string(),
+        disposition: None,
         items: 0,
+        refused: 0,
+        bytes_estimated: 0,
+        actually_freed: None,
         scan_complete: false,
     };
 
@@ -846,59 +862,46 @@ fn auto_reclaim(home: &Path, scan_budget: &scanner::ScanBudget) -> AutoReclaimOu
     let home_str = home.to_string_lossy().to_string();
     let candidates = build_candidates_pub(&scan, &rules, &prof, &home_str);
 
-    let safe: Vec<_> = candidates
-        .into_iter()
-        .filter(|c| {
-            is_autoreclaim_safe(
-                c.confidence,
-                c.consequences.as_ref().map(|q| q.recovery.as_str()),
-            )
-        })
-        .collect();
+    // Unknown free space is not pressure: stay reversible.
+    let disposition = history::free_bytes(home)
+        .map(|free| autonomy::disposition_for(free, &prof))
+        .unwrap_or(autonomy::Disposition::Airlock);
 
-    let mut bytes_freed = 0u64;
-    let mut items = 0usize;
-    for c in &safe {
-        // Independent pressure test — blocks databases, secret stores, in-use paths.
-        match check::pressure_test(&c.id, &c.path, &prof) {
-            Ok(r) if r.safe => {}
-            _ => continue,
-        }
-        let del = if c.path.is_dir() {
-            fs::remove_dir_all(&c.path)
-        } else {
-            fs::remove_file(&c.path)
-        };
-        if del.is_ok() {
-            bytes_freed += c.size_bytes;
-            items += 1;
-            let mut context = serde_json::Map::new();
-            context.insert("auto".into(), serde_json::Value::Bool(true));
-            context.insert(
-                "trigger".into(),
-                serde_json::Value::String("watch-urgent".into()),
-            );
-            history::append(&HistEntry {
-                ts: chrono::Utc::now(),
-                command: ActionKind::Reclaim,
-                candidate_id: Some(c.id.clone()),
-                rule_id: Some(c.rule_id.clone()),
-                path: c.path.clone(),
-                size_bytes: c.size_bytes,
-                df_before: None,
-                df_after: None,
-                actually_freed: None,
-                reversible: false,
-                undo_cmd: None,
-                rule_confidence: Some(c.confidence),
-                context,
-            });
-        }
+    let outcome = autonomy::reclaim(
+        &candidates,
+        &autonomy::Request {
+            home,
+            prof: &prof,
+            opt_in: prof.preferences.watch_autoreclaim,
+            disposition,
+            trigger: "watch-urgent",
+            incident_id,
+        },
+    );
+    // Tier refusals are the common case (most candidates are not regenerable
+    // caches) and would flood the log; the later stages are worth a line each.
+    for r in outcome.refusals.iter().filter(|r| r.stage != "tier") {
+        eprintln!(
+            "(watch: auto-reclaim refused {} at {}: {})",
+            r.path.display(),
+            r.stage,
+            r.reason
+        );
     }
 
     AutoReclaimOutcome {
-        bytes_freed,
-        items,
+        incident_id: incident_id.to_string(),
+        disposition: (!outcome.actions.is_empty()).then(|| {
+            match disposition {
+                autonomy::Disposition::Airlock => "airlock",
+                autonomy::Disposition::Delete => "delete",
+            }
+            .to_string()
+        }),
+        items: outcome.actions.len(),
+        refused: outcome.refusals.len(),
+        bytes_estimated: outcome.bytes_estimated,
+        actually_freed: outcome.actually_freed,
         scan_complete: true,
     }
 }
@@ -1614,26 +1617,47 @@ mod tests {
         assert!(!trueup_retry_deferred(None, now));
     }
 
-    // ---- is_autoreclaim_safe subset filter ----------------------------------
+    // ---- auto_reclaim goes through core::autonomy ---------------------------
 
+    /// The watch tick's reclaim is the autonomy module's gate, nothing else: a
+    /// regenerable cache matched by a builtin rule is acted on, and the same kind
+    /// of cache holding a credential is refused and left in place.
     #[test]
-    fn autoreclaim_safe_recovery_classes() {
-        // Safe, regenerable caches at/above the floor.
-        assert!(is_autoreclaim_safe(0.90, Some("auto")));
-        assert!(is_autoreclaim_safe(0.85, Some("redownload")));
-        assert!(is_autoreclaim_safe(0.88, Some("rebuild")));
-    }
+    fn auto_reclaim_routes_through_the_autonomy_gate() {
+        let base = TempBase::new("autoreclaim-gate");
+        let home = fs::canonicalize(&base.path).unwrap();
+        let _guard = crate::core::HomeGuard::set(&home);
 
-    #[test]
-    fn autoreclaim_excludes_project_envs_and_low_confidence() {
-        // `recreate` = venvs / node_modules — a project won't run until reinstalled.
-        assert!(!is_autoreclaim_safe(0.99, Some("recreate")));
-        assert!(!is_autoreclaim_safe(0.99, Some("manual")));
-        assert!(!is_autoreclaim_safe(0.99, Some("irreversible")));
-        // Below the confidence floor, even a safe class is excluded.
-        assert!(!is_autoreclaim_safe(0.50, Some("auto")));
-        // Fail-closed: no recovery metadata → not eligible.
-        assert!(!is_autoreclaim_safe(0.99, None));
+        let mut prof = profile::Profile::default();
+        prof.preferences.watch_autoreclaim = true;
+        prof.preferences.min_candidate_size_gb = 0.0;
+        profile::save(&prof).unwrap();
+
+        let clean = home.join("Library/Caches/Homebrew");
+        let tainted = home.join("Library/Caches/pip");
+        for d in [&clean, &tainted] {
+            fs::create_dir_all(d).unwrap();
+            fs::write(d.join("blob.tmp"), vec![b'x'; 8192]).unwrap();
+        }
+        fs::write(tainted.join(".env"), b"TOKEN=x").unwrap();
+        crate::core::backdate_files(&home);
+
+        let out = auto_reclaim(&home, &watch_scan_budget(), "incident-test");
+
+        assert!(out.scan_complete);
+        assert!(!clean.exists(), "clean regenerable cache must be acted on");
+        assert!(
+            tainted.exists(),
+            "cache holding a credential must be refused"
+        );
+        assert_eq!(out.items, 1);
+        assert_eq!(out.refused, 1);
+        assert_eq!(out.bytes_estimated, 8192);
+        assert!(
+            out.actually_freed.is_some(),
+            "recovery is measured, not estimated"
+        );
+        assert_eq!(out.incident_id, "incident-test");
     }
 
     /// Extended state round-trips including the new fields, and a LEGACY state

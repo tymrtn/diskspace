@@ -4,6 +4,33 @@ All notable changes to `diskspace` are recorded here. Dates are `YYYY-MM-DD`.
 
 ## [Unreleased]
 
+### Changed (watch auto-reclaim: one gated, reversible path)
+
+- **Every unattended delete now goes through `core::autonomy::reclaim`.** The
+  watch tick used to filter candidates and call `remove_dir_all` inline. It now
+  hands them to a single gate: standing opt-in (`preferences.watch_autoreclaim`)
+  → regenerable tier (confidence ≥ 0.85, recovery `auto`/`redownload`/`rebuild`)
+  → `pressure_test` → the new unattended checks (no symlinked component below
+  `$HOME`, strict containment, not cloud-synced, no model weights / patches /
+  version-controlled source / credentials inside) → act. Each refused candidate
+  is recorded with the stage that refused it. Grants are never consulted on this
+  path in any build; in `actuation` builds they only relax bounds elsewhere.
+- **Survivors are airlocked, not deleted, unless free space is already below
+  `preferences.disk_pressure_threshold_gb`** (same rule `doctor` uses, because a
+  same-volume airlock frees nothing until purge). Airlocked items get a
+  reversible receipt with `diskspace restore <id>`.
+- **Recovery is measured, not estimated.** `watch run --json` `autoreclaim` now
+  carries `incident_id`, `disposition` (`"airlock"` / `"delete"` / `null`),
+  `items`, `refused`, `bytes_estimated` (scan sizes) and `actually_freed` (df
+  delta on `$HOME`'s volume; 0 for a same-volume airlock). The former
+  `bytes_freed` field, which reported the scan estimate, is gone. Receipts in
+  `history.jsonl` carry `trigger`, `incident_id` and `disposition` in `context`.
+- Unattended-gate fixes: a trailing `..` no longer slips containment; a `.git`
+  FILE (worktree / submodule) counts as source; `.mlpackage` / `.mlmodelc` bundle
+  directories count as model weights; an unreadable directory entry refuses
+  instead of being skipped; a `$HOME` reached through a symlink is no longer
+  refused wholesale.
+
 ### Fixed (watch notifications)
 
 - **`watch run` sends a due notification before auto-reclaim and the advisory
