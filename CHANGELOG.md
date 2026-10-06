@@ -25,6 +25,18 @@ All notable changes to `diskspace` are recorded here. Dates are `YYYY-MM-DD`.
   delta on `$HOME`'s volume; 0 for a same-volume airlock). The former
   `bytes_freed` field, which reported the scan estimate, is gone. Receipts in
   `history.jsonl` carry `trigger`, `incident_id` and `disposition` in `context`.
+- **New `critical` level below 1% free.** `watch run` and `watch status` report
+  `level: "critical"` (additive JSON value; consumers matching on
+  `ok`/`soft`/`urgent` should add it). Critical re-notifies on every 5-minute
+  tick and retries autonomous reclaim after 10 minutes instead of 30.
+- **Headroom policy.** New optional `preferences.headroom_gb`. With
+  `watch_autoreclaim` on, the monitor also runs its gated reclaim whenever
+  MEASURED free space is below that floor, even while the percentage level is
+  still `ok`. The burn-rate forecast is still advisory and never triggers it.
+- **Incidents.** `watch_state.json` gains an `incidents` list (serde-default,
+  capped at 30): one record per trigger kind per UTC day
+  (`urgent-20261006`, `critical-…`, `headroom-…`) with passes, items, refused,
+  `bytes_estimated` and summed `actually_freed`. Receipts carry the same id.
 - Unattended-gate fixes: a trailing `..` no longer slips containment; a `.git`
   FILE (worktree / submodule) counts as source; `.mlpackage` / `.mlmodelc` bundle
   directories count as model weights; an unreadable directory entry refuses

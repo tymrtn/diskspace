@@ -56,6 +56,17 @@ const SOFT_RENOTIFY_SECS: i64 = 3600; // 1 h
 /// fast slide between timer ticks.
 const RENOTIFY_PCT_DROP: f32 = 0.5;
 
+/// Critical threshold: the volume is about to hit zero and the OS itself starts
+/// misbehaving (swap, Spotlight, sync clients). Re-nag on every tick.
+const CRITICAL_PCT_FREE: f32 = 1.0;
+const CRITICAL_RENOTIFY_SECS: i64 = CHECK_INTERVAL_SECONDS as i64;
+
+/// While critical, retry autonomous reclaim sooner than the urgent cadence.
+const AUTORECLAIM_CRITICAL_INTERVAL_SECS: i64 = 600; // 10 min
+
+/// Incident records kept in watch state (one per pressure episode per day).
+const INCIDENTS_KEPT: usize = 30;
+
 /// Minimum gap between autonomous reclaims so an urgent disk that stays urgent
 /// doesn't thrash the reclaim path every 5-minute tick.
 const AUTORECLAIM_MIN_INTERVAL_SECS: i64 = 1800; // 30 min
@@ -88,6 +99,56 @@ enum Level {
     Ok,
     Soft,
     Urgent,
+    Critical,
+}
+
+impl Level {
+    fn label(self) -> &'static str {
+        match self {
+            Level::Ok => "ok",
+            Level::Soft => "soft",
+            Level::Urgent => "urgent",
+            Level::Critical => "critical",
+        }
+    }
+
+    /// Urgent and critical are pressure: they authorize autonomous reclaim on
+    /// their own. Soft and Ok do not.
+    fn is_pressure(self) -> bool {
+        matches!(self, Level::Urgent | Level::Critical)
+    }
+}
+
+/// Classify free space. Boundaries are exclusive on the low side: exactly 1%
+/// is urgent, exactly 5% is soft, exactly 10% is ok.
+fn level_for(pct_free: f32) -> Level {
+    if pct_free < CRITICAL_PCT_FREE {
+        Level::Critical
+    } else if pct_free < URGENT_PCT_FREE {
+        Level::Urgent
+    } else if pct_free < SOFT_PCT_FREE {
+        Level::Soft
+    } else {
+        Level::Ok
+    }
+}
+
+/// One pressure episode as the watcher experienced it: every autonomous pass
+/// that shared the incident id, with MEASURED recovery summed across them.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Incident {
+    id: String,
+    level: Level,
+    opened_ts: chrono::DateTime<chrono::Utc>,
+    last_ts: chrono::DateTime<chrono::Utc>,
+    passes: u32,
+    items: usize,
+    refused: usize,
+    bytes_estimated: u64,
+    /// Sum of df deltas across passes. 0 is an honest answer for airlocked items.
+    actually_freed: u64,
+    /// Disposition of the latest pass that acted on something.
+    disposition: Option<String>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -122,6 +183,59 @@ struct WatchState {
     /// bounded window from consuming 5 seconds on every five-minute tick.
     #[serde(default)]
     last_trueup_failure_ts: Option<chrono::DateTime<chrono::Utc>>,
+    /// Pressure episodes and what autonomous reclaim actually recovered in each.
+    /// Deduplicated by incident id, newest last, capped at [`INCIDENTS_KEPT`].
+    #[serde(default)]
+    incidents: Vec<Incident>,
+}
+
+impl WatchState {
+    /// Fold one autonomous pass into its incident, creating the incident on
+    /// first sight. Deletion is the only time an incident's measured recovery
+    /// can be nonzero; an airlock pass adds 0 and says so.
+    fn record_incident(
+        &mut self,
+        outcome: &AutoReclaimOutcome,
+        level: Level,
+        now: chrono::DateTime<chrono::Utc>,
+    ) {
+        let freed = outcome.actually_freed.unwrap_or(0);
+        match self
+            .incidents
+            .iter_mut()
+            .find(|i| i.id == outcome.incident_id)
+        {
+            Some(incident) => {
+                incident.last_ts = now;
+                incident.passes += 1;
+                incident.items += outcome.items;
+                incident.refused += outcome.refused;
+                incident.bytes_estimated += outcome.bytes_estimated;
+                incident.actually_freed += freed;
+                if outcome.disposition.is_some() {
+                    incident.disposition = outcome.disposition.clone();
+                }
+            }
+            None => {
+                self.incidents.push(Incident {
+                    id: outcome.incident_id.clone(),
+                    level,
+                    opened_ts: now,
+                    last_ts: now,
+                    passes: 1,
+                    items: outcome.items,
+                    refused: outcome.refused,
+                    bytes_estimated: outcome.bytes_estimated,
+                    actually_freed: freed,
+                    disposition: outcome.disposition.clone(),
+                });
+                if self.incidents.len() > INCIDENTS_KEPT {
+                    let excess = self.incidents.len() - INCIDENTS_KEPT;
+                    self.incidents.drain(..excess);
+                }
+            }
+        }
+    }
 }
 
 /// Pure notify decision: should this tick deliver a notification?
@@ -158,8 +272,13 @@ fn decide_notify(
             prior.last_level.is_some() && prior.last_level != Some(Level::Ok)
         }
         Level::Soft => retry || entered || secs_since_notify >= SOFT_RENOTIFY_SECS,
-        Level::Urgent => {
-            if retry || entered || secs_since_notify >= URGENT_RENOTIFY_SECS {
+        Level::Urgent | Level::Critical => {
+            let renotify_secs = if level == Level::Critical {
+                CRITICAL_RENOTIFY_SECS
+            } else {
+                URGENT_RENOTIFY_SECS
+            };
+            if retry || entered || secs_since_notify >= renotify_secs {
                 return true;
             }
             // Fast further slide between timer ticks.
@@ -200,20 +319,28 @@ fn decide_trend_notify(
 }
 
 /// Pure gate for autonomous reclaim. Returns true only when the standing opt-in
-/// is on, the disk is urgent, and enough time has elapsed since the last
-/// autonomous reclaim (rate-limit). All authority to delete flows from the
-/// `enabled` flag — the user's durable `preferences.watch_autoreclaim` consent.
+/// is on, there is a reason to act (pressure level, or measured free space
+/// under the user's headroom floor), and the rate-limit has elapsed. All
+/// authority to act flows from the `enabled` flag — the user's durable
+/// `preferences.watch_autoreclaim` consent. The burn-rate forecast is never an
+/// input here: trend stays advisory.
 fn should_autoreclaim(
     enabled: bool,
     level: Level,
+    below_headroom: bool,
     last_autoreclaim_ts: Option<chrono::DateTime<chrono::Utc>>,
     now: chrono::DateTime<chrono::Utc>,
 ) -> bool {
-    if !enabled || level != Level::Urgent {
+    if !enabled || !(level.is_pressure() || below_headroom) {
         return false;
     }
+    let interval = if level == Level::Critical {
+        AUTORECLAIM_CRITICAL_INTERVAL_SECS
+    } else {
+        AUTORECLAIM_MIN_INTERVAL_SECS
+    };
     match last_autoreclaim_ts {
-        Some(t) => (now - t).num_seconds() >= AUTORECLAIM_MIN_INTERVAL_SECS,
+        Some(t) => (now - t).num_seconds() >= interval,
         None => true,
     }
 }
@@ -389,6 +516,7 @@ pub fn status(ctx: &Context) -> Result<()> {
                 "interval_seconds": CHECK_INTERVAL_SECONDS,
                 "soft_pct_free": SOFT_PCT_FREE,
                 "urgent_pct_free": URGENT_PCT_FREE,
+                "critical_pct_free": CRITICAL_PCT_FREE,
                 "last": {
                     "level": state.last_level,
                     "ts": state.last_ts,
@@ -428,11 +556,12 @@ pub fn status(ctx: &Context) -> Result<()> {
         }
     );
     println!(
-        "    {:<14}  every {}s ({}% soft / {}% urgent)",
+        "    {:<14}  every {}s ({}% soft / {}% urgent / {}% critical)",
         ctx.style("interval", &bold),
         CHECK_INTERVAL_SECONDS,
         SOFT_PCT_FREE,
-        URGENT_PCT_FREE
+        URGENT_PCT_FREE,
+        CRITICAL_PCT_FREE
     );
 
     if let (Some(pct), Some(level), Some(ts)) =
@@ -441,7 +570,7 @@ pub fn status(ctx: &Context) -> Result<()> {
         let level_styled = match level {
             Level::Ok => ctx.style("ok", &green),
             Level::Soft => ctx.style("soft", &yellow),
-            Level::Urgent => ctx.style("urgent", &red),
+            Level::Urgent | Level::Critical => ctx.style(level.label(), &red),
         };
         println!();
         println!(
@@ -538,13 +667,7 @@ fn run_tick(
     // enough for every tick). Advisory: it can notify below, never actuate.
     let trend = metrics::burn_trend(TREND_WINDOW_DAYS).unwrap_or_default();
 
-    let level = if pct_free < URGENT_PCT_FREE {
-        Level::Urgent
-    } else if pct_free < SOFT_PCT_FREE {
-        Level::Soft
-    } else {
-        Level::Ok
-    };
+    let level = level_for(pct_free);
 
     let prior = load_state().unwrap_or_default();
     let now = chrono::Utc::now();
@@ -604,6 +727,7 @@ fn run_tick(
             prior.last_trend_notified_ts
         },
         last_trueup_failure_ts: prior.last_trueup_failure_ts,
+        incidents: prior.incidents,
     };
     // Persist the alert bookkeeping before the slow half of the tick, so a scan
     // that stalls or kills the process cannot lose it.
@@ -611,9 +735,14 @@ fn run_tick(
 
     // The budget's deadline starts here, after notification delivery (up to
     // NOTIFY_TIMEOUT per alert), so a slow notifier cannot spend the scans' time.
-    let scan = scans(home, level, &prior, now, &make_scan_budget());
+    // The scans see the CURRENT state: this tick's free bytes drive the headroom
+    // decision, and the prior autoreclaim/true-up timestamps were carried over.
+    let scan = scans(home, level, &state, now, &make_scan_budget());
     state.last_autoreclaim_ts = scan.last_autoreclaim_ts;
     state.last_trueup_failure_ts = scan.last_trueup_failure_ts;
+    if let Some(ar) = &scan.autoreclaim {
+        state.record_incident(ar, level, now);
+    }
     save_state_or_log(&state);
     let advisory = scan.advisory;
     let autoreclaim = scan.autoreclaim;
@@ -639,11 +768,7 @@ fn run_tick(
         let dim = Style::new().dim();
         println!(
             "  watch: {} — {:.1}% free ({} / {}){}",
-            match level {
-                Level::Ok => "ok",
-                Level::Soft => "soft",
-                Level::Urgent => "urgent",
-            },
+            level.label(),
             pct_free,
             crate::output::format_bytes(free_bytes),
             crate::output::format_bytes(total_bytes),
@@ -709,25 +834,38 @@ fn notification_note(outcome: &Option<NotifyOutcome>) -> &'static str {
 fn scan_phase(
     home: &Path,
     level: Level,
-    prior: &WatchState,
+    state: &WatchState,
     now: chrono::DateTime<chrono::Utc>,
     scan_budget: &scanner::ScanBudget,
 ) -> ScanPhase {
     // --- Autonomous reclaim (gated) ----------------------------------------
-    // Only when the user has turned on the standing opt-in AND we are urgent AND
-    // the rate-limit has elapsed. Self-contained and best-effort: a reclaim error
-    // must never crash the tick. Advances `last_autoreclaim_ts` only after a
-    // complete scan, so a budget timeout remains immediately retryable.
+    // Only when the user has turned on the standing opt-in AND there is pressure
+    // (urgent/critical level, or measured free space under the headroom floor)
+    // AND the rate-limit has elapsed. Self-contained and best-effort: a reclaim
+    // error must never crash the tick. Advances `last_autoreclaim_ts` only after
+    // a complete scan, so a budget timeout remains immediately retryable.
+    let policy = prof_watch_policy();
+    let below_headroom = match (policy.headroom_bytes, state.last_free_bytes) {
+        (Some(floor), Some(free)) => free < floor,
+        _ => false,
+    };
     let autoreclaim = if should_autoreclaim(
-        prof_watch_autoreclaim(),
+        policy.enabled,
         level,
-        prior.last_autoreclaim_ts,
+        below_headroom,
+        state.last_autoreclaim_ts,
         now,
     ) {
+        let kind = if level.is_pressure() {
+            level.label()
+        } else {
+            "headroom"
+        };
         Some(auto_reclaim(
             home,
             scan_budget,
-            &incident_id_for(level, now),
+            &incident_id_for(kind, now),
+            &format!("watch-{}", kind),
         ))
     } else {
         None
@@ -738,7 +876,7 @@ fn scan_phase(
     {
         Some(now)
     } else {
-        prior.last_autoreclaim_ts
+        state.last_autoreclaim_ts
     };
 
     // Advisory measurement runs after urgent actuation has had first claim on the
@@ -747,7 +885,7 @@ fn scan_phase(
     let tick_state = scanner::load_tick_state();
     let trueup_due =
         now.signed_duration_since(tick_state.last_full_walk) >= chrono::Duration::hours(24);
-    let trueup_deferred = trueup_due && trueup_retry_deferred(prior.last_trueup_failure_ts, now);
+    let trueup_deferred = trueup_due && trueup_retry_deferred(state.last_trueup_failure_ts, now);
     let recorder = if trueup_deferred {
         None
     } else {
@@ -759,7 +897,7 @@ fn scan_phase(
     let last_trueup_failure_ts = if !trueup_due || recorder.is_some() {
         None
     } else if trueup_deferred {
-        prior.last_trueup_failure_ts
+        state.last_trueup_failure_ts
     } else {
         Some(now)
     };
@@ -772,12 +910,31 @@ fn scan_phase(
     }
 }
 
-/// Read the standing `watch_autoreclaim` opt-in from the profile. Best-effort: a
-/// missing/garbage profile means the feature is OFF (fail-closed to notify-only).
-fn prof_watch_autoreclaim() -> bool {
-    profile::load()
-        .map(|p| p.preferences.watch_autoreclaim)
-        .unwrap_or(false)
+/// The user's standing autonomous-reclaim policy, as the profile states it.
+struct WatchPolicy {
+    enabled: bool,
+    /// `preferences.headroom_gb` in bytes: act whenever measured free space is
+    /// below this, even while the percentage level is healthy.
+    headroom_bytes: Option<u64>,
+}
+
+/// Read the policy from the profile. Best-effort: a missing/garbage profile
+/// means the feature is OFF (fail-closed to notify-only).
+fn prof_watch_policy() -> WatchPolicy {
+    match profile::load() {
+        Ok(p) => WatchPolicy {
+            enabled: p.preferences.watch_autoreclaim,
+            headroom_bytes: p
+                .preferences
+                .headroom_gb
+                .filter(|gb| gb.is_finite() && *gb > 0.0)
+                .map(|gb| (gb as f64 * 1024.0 * 1024.0 * 1024.0) as u64),
+        },
+        Err(_) => WatchPolicy {
+            enabled: false,
+            headroom_bytes: None,
+        },
+    }
 }
 
 /// Outcome of one autonomous reclaim pass, surfaced in output. Per-item receipts
@@ -799,14 +956,11 @@ struct AutoReclaimOutcome {
     scan_complete: bool,
 }
 
-/// One incident per pressure level per UTC day, so every autonomous pass inside
-/// the same episode is grouped in receipts and watch state.
-fn incident_id_for(level: Level, now: chrono::DateTime<chrono::Utc>) -> String {
-    format!(
-        "{}-{}",
-        format!("{:?}", level).to_ascii_lowercase(),
-        now.format("%Y%m%d")
-    )
+/// One incident per trigger kind (`urgent`, `critical`, `headroom`) per UTC day,
+/// so every autonomous pass inside the same episode is grouped in receipts and
+/// watch state.
+fn incident_id_for(kind: &str, now: chrono::DateTime<chrono::Utc>) -> String {
+    format!("{}-{}", kind, now.format("%Y%m%d"))
 }
 
 /// Perform one autonomous reclaim pass. Called only when [`should_autoreclaim`]
@@ -822,6 +976,7 @@ fn auto_reclaim(
     home: &Path,
     scan_budget: &scanner::ScanBudget,
     incident_id: &str,
+    trigger: &str,
 ) -> AutoReclaimOutcome {
     use crate::commands::detect::build_candidates_pub;
     use crate::core::autonomy;
@@ -874,7 +1029,7 @@ fn auto_reclaim(
             prof: &prof,
             opt_in: prof.preferences.watch_autoreclaim,
             disposition,
-            trigger: "watch-urgent",
+            trigger,
             incident_id,
         },
     );
@@ -975,6 +1130,14 @@ fn record_tick_with_budget(
 
 fn threshold_message(level: Level, free_bytes: u64, pct_free: f32) -> (String, String) {
     match level {
+        Level::Critical => (
+            "diskspace — disk CRITICALLY full".to_string(),
+            format!(
+                "Only {:.1}% free ({}). Run `diskspace` now to see what is safe to clear.",
+                pct_free,
+                crate::output::format_bytes(free_bytes)
+            ),
+        ),
         Level::Urgent => (
             // Escalate the wording as free space craters, so a sustained slide
             // reads as more alarming each re-nag instead of a flat repeat.
@@ -1299,6 +1462,7 @@ mod tests {
             last_autoreclaim_ts: None,
             last_trend_notified_ts: None,
             last_trueup_failure_ts: None,
+            incidents: Vec::new(),
         }
     }
 
@@ -1563,25 +1727,66 @@ mod tests {
         assert!(decide_trend_notify(Level::Ok, Some(5), stale, now));
     }
 
+    // ---- level classification ----------------------------------------------
+
+    #[test]
+    fn level_for_adds_critical_below_one_percent() {
+        assert_eq!(level_for(0.0), Level::Critical);
+        assert_eq!(level_for(0.99), Level::Critical);
+        assert_eq!(level_for(1.0), Level::Urgent);
+        assert_eq!(level_for(4.99), Level::Urgent);
+        assert_eq!(level_for(5.0), Level::Soft);
+        assert_eq!(level_for(9.99), Level::Soft);
+        assert_eq!(level_for(10.0), Level::Ok);
+        assert_eq!(level_for(55.0), Level::Ok);
+    }
+
+    /// Critical re-nags on every tick; the 15-minute urgent timer is too slow
+    /// when the volume is about to hit zero.
+    #[test]
+    fn critical_renotifies_every_tick() {
+        let now = chrono::Utc::now();
+        let prior = WatchState {
+            last_level: Some(Level::Critical),
+            last_notified_ts: Some(now - chrono::Duration::seconds(CRITICAL_RENOTIFY_SECS + 1)),
+            last_notified_pct: Some(0.8),
+            ..WatchState::default()
+        };
+        assert!(decide_notify(&prior, Level::Critical, 0.8, now));
+        let fresh = WatchState {
+            last_notified_ts: Some(now - chrono::Duration::seconds(30)),
+            ..prior
+        };
+        assert!(!decide_notify(&fresh, Level::Critical, 0.8, now));
+    }
+
     // ---- should_autoreclaim gate --------------------------------------------
 
     #[test]
     fn autoreclaim_off_by_default() {
-        // Opt-in false → never, even when urgent.
-        assert!(!should_autoreclaim(
-            false,
-            Level::Urgent,
-            None,
-            chrono::Utc::now()
-        ));
+        // Opt-in false → never, even when critical or below headroom.
+        let now = chrono::Utc::now();
+        assert!(!should_autoreclaim(false, Level::Urgent, false, None, now));
+        assert!(!should_autoreclaim(false, Level::Critical, true, None, now));
+        assert!(!should_autoreclaim(false, Level::Ok, true, None, now));
     }
 
     #[test]
-    fn autoreclaim_only_when_urgent() {
+    fn autoreclaim_when_urgent_or_critical() {
         let now = chrono::Utc::now();
-        assert!(!should_autoreclaim(true, Level::Ok, None, now));
-        assert!(!should_autoreclaim(true, Level::Soft, None, now));
-        assert!(should_autoreclaim(true, Level::Urgent, None, now));
+        assert!(!should_autoreclaim(true, Level::Ok, false, None, now));
+        assert!(!should_autoreclaim(true, Level::Soft, false, None, now));
+        assert!(should_autoreclaim(true, Level::Urgent, false, None, now));
+        assert!(should_autoreclaim(true, Level::Critical, false, None, now));
+    }
+
+    /// The headroom policy keeps free space above a byte floor the user chose,
+    /// so it fires while the percentage level is still healthy.
+    #[test]
+    fn autoreclaim_below_headroom_while_still_ok() {
+        let now = chrono::Utc::now();
+        assert!(should_autoreclaim(true, Level::Ok, true, None, now));
+        assert!(should_autoreclaim(true, Level::Soft, true, None, now));
     }
 
     #[test]
@@ -1591,6 +1796,7 @@ mod tests {
         assert!(!should_autoreclaim(
             true,
             Level::Urgent,
+            false,
             Some(now - chrono::Duration::seconds(60)),
             now
         ));
@@ -1598,9 +1804,89 @@ mod tests {
         assert!(should_autoreclaim(
             true,
             Level::Urgent,
+            false,
             Some(now - chrono::Duration::seconds(AUTORECLAIM_MIN_INTERVAL_SECS + 1)),
             now
         ));
+        // Critical retries sooner than urgent.
+        assert!(should_autoreclaim(
+            true,
+            Level::Critical,
+            false,
+            Some(now - chrono::Duration::seconds(AUTORECLAIM_CRITICAL_INTERVAL_SECS + 1)),
+            now
+        ));
+        assert!(!should_autoreclaim(
+            true,
+            Level::Critical,
+            false,
+            Some(now - chrono::Duration::seconds(AUTORECLAIM_CRITICAL_INTERVAL_SECS - 1)),
+            now
+        ));
+    }
+
+    // ---- incidents -----------------------------------------------------------
+
+    fn outcome(incident_id: &str, items: usize, freed: Option<u64>) -> AutoReclaimOutcome {
+        AutoReclaimOutcome {
+            incident_id: incident_id.into(),
+            disposition: Some("airlock".into()),
+            items,
+            refused: 1,
+            bytes_estimated: 1000 * items as u64,
+            actually_freed: freed,
+            scan_complete: true,
+        }
+    }
+
+    /// Passes inside one pressure episode share an incident id; the state keeps
+    /// one record per id and accumulates MEASURED recovery across passes.
+    #[test]
+    fn incidents_dedupe_by_id_and_sum_measured_recovery() {
+        let now = chrono::Utc::now();
+        let mut state = WatchState::default();
+        state.record_incident(
+            &outcome("urgent-20261006", 2, Some(500)),
+            Level::Urgent,
+            now,
+        );
+        let later = now + chrono::Duration::minutes(30);
+        state.record_incident(
+            &outcome("urgent-20261006", 1, Some(0)),
+            Level::Urgent,
+            later,
+        );
+        state.record_incident(&outcome("urgent-20261007", 1, None), Level::Urgent, later);
+
+        assert_eq!(state.incidents.len(), 2);
+        let first = &state.incidents[0];
+        assert_eq!(first.id, "urgent-20261006");
+        assert_eq!(first.passes, 2);
+        assert_eq!(first.items, 3);
+        assert_eq!(first.refused, 2);
+        assert_eq!(first.bytes_estimated, 3000);
+        assert_eq!(first.actually_freed, 500);
+        assert_eq!(first.opened_ts, now);
+        assert_eq!(first.last_ts, later);
+        assert_eq!(state.incidents[1].actually_freed, 0);
+    }
+
+    #[test]
+    fn incidents_are_capped_to_the_most_recent() {
+        let now = chrono::Utc::now();
+        let mut state = WatchState::default();
+        for i in 0..(INCIDENTS_KEPT + 5) {
+            state.record_incident(
+                &outcome(&format!("urgent-{}", i), 1, Some(1)),
+                Level::Urgent,
+                now,
+            );
+        }
+        assert_eq!(state.incidents.len(), INCIDENTS_KEPT);
+        assert_eq!(
+            state.incidents.last().unwrap().id,
+            format!("urgent-{}", INCIDENTS_KEPT + 4)
+        );
     }
 
     #[test]
@@ -1642,7 +1928,7 @@ mod tests {
         fs::write(tainted.join(".env"), b"TOKEN=x").unwrap();
         crate::core::backdate_files(&home);
 
-        let out = auto_reclaim(&home, &watch_scan_budget(), "incident-test");
+        let out = auto_reclaim(&home, &watch_scan_budget(), "incident-test", "watch-test");
 
         assert!(out.scan_complete);
         assert!(!clean.exists(), "clean regenerable cache must be acted on");
@@ -1676,6 +1962,7 @@ mod tests {
         assert_eq!(loaded.last_level, Some(Level::Urgent));
         assert_eq!(loaded.last_notified_ts, None);
         assert_eq!(loaded.last_autoreclaim_ts, None);
+        assert!(loaded.incidents.is_empty());
     }
 
     #[test]
