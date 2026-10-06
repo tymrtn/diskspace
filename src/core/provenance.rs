@@ -56,17 +56,21 @@ pub struct Provenance {
 }
 
 /// What the last survey knows about workspaces on this disk: every `Cargo.toml`
-/// it saw, indexed by the hash cargo would use for its `build-dir`.
+/// it saw, indexed by the hash cargo would use for its `build-dir`, plus whether
+/// the survey could have seen every workspace at all.
 #[derive(Debug, Default)]
 pub struct Index {
     by_hash: HashMap<String, PathBuf>,
     manifests_seen: usize,
+    /// The survey covered `$HOME` (or an ancestor) and did not hit the manifest
+    /// cap. Only then does "no manifest hashes to this build dir" mean orphaned.
+    complete: bool,
 }
 
 impl Index {
     /// Hash every manifest that still exists. One deleted since the survey
     /// hashes to nothing, which is exactly what leaves its build dir orphaned.
-    pub fn from_manifests(manifests: &[PathBuf]) -> Self {
+    pub fn from_survey(survey_root: &Path, home: &Path, manifests: &[PathBuf]) -> Self {
         let mut by_hash = HashMap::new();
         for m in manifests.iter().filter(|m| m.is_file()) {
             if let Some(root) = m.parent() {
@@ -76,6 +80,8 @@ impl Index {
         Self {
             by_hash,
             manifests_seen: manifests.len(),
+            complete: home.starts_with(survey_root)
+                && manifests.len() < crate::core::scanner::MANIFESTS_KEPT,
         }
     }
 }
@@ -152,6 +158,13 @@ fn probe_cargo_target(path: &Path, index: &Index) -> Option<Provenance> {
             prov.producer_path = Some(root.clone());
             prov.liveness = Liveness::Present;
         }
+        None if !index.complete => {
+            prov.evidence.push(format!(
+                "no workspace among {} surveyed manifest(s) hashes to this build dir, but the \
+                 survey was incomplete (scoped below $HOME or manifest cap reached)",
+                index.manifests_seen
+            ));
+        }
         None => {
             prov.evidence.push(format!(
                 "no workspace among {} surveyed manifest(s) hashes to this build dir",
@@ -211,11 +224,23 @@ fn probe_git_worktree(path: &Path) -> Option<Provenance> {
             .push("parent repository missing; uncommitted work cannot be assessed".into());
         return Some(prov);
     }
-    let Some(status) = git(path, &["status", "--porcelain", "--untracked-files=normal"]) else {
+    let Some(status) = git(
+        path,
+        &[
+            "status",
+            "--porcelain",
+            "--untracked-files=normal",
+            "--ignored=matching",
+        ],
+    ) else {
         prov.evidence.push("git status failed".into());
         return Some(prov);
     };
-    let dirty = status.lines().filter(|l| !l.trim().is_empty()).count();
+    let ignored = status.lines().filter(|l| l.starts_with("!!")).count();
+    let dirty = status
+        .lines()
+        .filter(|l| !l.trim().is_empty() && !l.starts_with("!!"))
+        .count();
     if dirty > 0 {
         prov.evidence
             .push(format!("{} uncommitted change(s)", dirty));
@@ -233,6 +258,13 @@ fn probe_git_worktree(path: &Path) -> Option<Provenance> {
                 .push(format!("{} commit(s) not on any remote", n));
             prov.liveness = Liveness::Active;
         }
+        Some(_) if ignored > 0 => {
+            prov.evidence.push(format!(
+                "clean and pushed, but {} ignored file(s) present (in no commit)",
+                ignored
+            ));
+            prov.liveness = Liveness::Present;
+        }
         Some(_) => {
             prov.evidence
                 .push("clean; every commit is on a remote".into());
@@ -242,10 +274,12 @@ fn probe_git_worktree(path: &Path) -> Option<Provenance> {
     Some(prov)
 }
 
+/// Read-only git: no index refresh writes, no fsmonitor daemon.
 fn git(dir: &Path, args: &[&str]) -> Option<String> {
     Command::new("git")
         .arg("-C")
         .arg(dir)
+        .args(["--no-optional-locks", "-c", "core.fsmonitor=false"])
         .args(args)
         .output()
         .ok()
@@ -345,7 +379,7 @@ mod tests {
             .join("target");
         std::fs::create_dir_all(&build).unwrap();
 
-        let idx = Index::from_manifests(&[manifest]);
+        let idx = Index::from_survey(tmp.path(), tmp.path(), &[manifest]);
         let p = probe(&build, &idx).expect("evidence");
         assert_eq!(p.producer, Producer::CargoWorkspace);
         assert_eq!(p.liveness, Liveness::Present);
@@ -366,10 +400,83 @@ mod tests {
             .join("target");
         std::fs::create_dir_all(&build).unwrap();
 
-        let p = probe(&build, &Index::from_manifests(&[other])).expect("evidence");
+        let p = probe(
+            &build,
+            &Index::from_survey(tmp.path(), tmp.path(), &[other]),
+        )
+        .expect("evidence");
         assert_eq!(p.liveness, Liveness::Orphaned);
         assert!(
             p.evidence.iter().any(|e| e.contains("no workspace")),
+            "{:?}",
+            p.evidence
+        );
+    }
+
+    /// A hash miss only means "orphaned" when the survey could have seen the
+    /// workspace: it covered $HOME and did not hit the manifest cap. Otherwise
+    /// the honest answer is unknown, and no confidence boost follows.
+    #[test]
+    fn hash_miss_with_an_incomplete_index_is_unknown() {
+        let tmp = Tmp::new("incomplete");
+        let other = tmp.path().join("other").join("Cargo.toml");
+        std::fs::create_dir_all(other.parent().unwrap()).unwrap();
+        std::fs::write(&other, "[package]\nname='y'\n").unwrap();
+        let build = tmp
+            .path()
+            .join("cargo-build")
+            .join("0c")
+            .join("a4d1336e85fe5d")
+            .join("target");
+        std::fs::create_dir_all(&build).unwrap();
+
+        // Survey scoped below $HOME.
+        let scoped = Index::from_survey(&tmp.path().join("other"), tmp.path(), &[other.clone()]);
+        let p = probe(&build, &scoped).expect("evidence");
+        assert_eq!(p.liveness, Liveness::Unknown, "{:?}", p.evidence);
+        assert!(
+            p.evidence.iter().any(|e| e.contains("incomplete")),
+            "{:?}",
+            p.evidence
+        );
+
+        // Survey hit the manifest cap.
+        let mut many = vec![other; crate::core::scanner::MANIFESTS_KEPT];
+        many.dedup();
+        let capped = Index::from_survey(
+            tmp.path(),
+            tmp.path(),
+            &vec![tmp.path().join("missing/Cargo.toml"); crate::core::scanner::MANIFESTS_KEPT],
+        );
+        let p = probe(&build, &capped).expect("evidence");
+        assert_eq!(p.liveness, Liveness::Unknown, "{:?}", p.evidence);
+        drop(many);
+    }
+
+    /// Ignored files (`.env`, local data) live in no commit, so a worktree that
+    /// holds them is not safely removable even when clean and pushed.
+    #[test]
+    fn clean_pushed_worktree_with_ignored_files_is_present() {
+        let tmp = Tmp::new("ignored");
+        let (repo, wt) = repo_with_worktree(&tmp);
+        let remote = tmp.path().join("remote.git");
+        git(
+            tmp.path(),
+            &["init", "-q", "--bare", remote.to_str().unwrap()],
+        );
+        git(
+            &repo,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
+        std::fs::write(wt.join(".gitignore"), "*.env\n").unwrap();
+        git(&wt, &["add", ".gitignore"]);
+        git(&wt, &["commit", "-q", "-m", "ignore env"]);
+        git(&wt, &["push", "-q", "-u", "origin", "HEAD"]);
+        std::fs::write(wt.join("secret.env"), "k=v").unwrap();
+        let p = probe(&wt, &Index::default()).expect("evidence");
+        assert_eq!(p.liveness, Liveness::Present, "{:?}", p.evidence);
+        assert!(
+            p.evidence.iter().any(|e| e.contains("ignored")),
             "{:?}",
             p.evidence
         );

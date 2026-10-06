@@ -210,7 +210,8 @@ fn build_candidates(
 ) -> Vec<Candidate> {
     let mut candidates: Vec<Candidate> = Vec::new();
     let home_path = Path::new(home);
-    let workspaces = crate::core::provenance::Index::from_manifests(&scan.manifests);
+    let workspaces =
+        crate::core::provenance::Index::from_survey(&scan.root, home_path, &scan.manifests);
 
     for rule in rules {
         let pattern_str = crate::core::scanner::expand_home(&rule.path_pattern, home_path);
@@ -659,6 +660,7 @@ mod tests {
         let rules = vec![rule("target", "**/target", 0.78, "rebuild", None)];
         let mut scan = scan_with(vec![entry(build.to_str().unwrap(), 5 << 30, 30)]);
         scan.manifests = vec![other];
+        scan.root = PathBuf::from("/home/test");
         let got = build_candidates(&scan, &rules, &test_profile(), "/home/test");
         let _ = std::fs::remove_dir_all(&tmp);
 

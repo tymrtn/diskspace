@@ -508,7 +508,7 @@
 
 - id: old-dmg-files
   category: download-entropy
-  path_pattern: "~/Downloads/*.dmg"
+  path_pattern: "~/Downloads/**/*.dmg"
   base_confidence: 0.80
   reason: "Disk image installer — app is already installed or abandoned"
   exclude_if_recent_modified_days: 30
@@ -519,7 +519,7 @@
 
 - id: old-zip-installers
   category: download-entropy
-  path_pattern: "~/Downloads/*.zip"
+  path_pattern: "~/Downloads/**/*.zip"
   base_confidence: 0.70
   reason: "Downloaded archive — likely already extracted or abandoned"
   exclude_if_recent_modified_days: 60
@@ -530,7 +530,7 @@
 
 - id: old-pkg-installers
   category: download-entropy
-  path_pattern: "~/Downloads/*.pkg"
+  path_pattern: "~/Downloads/**/*.pkg"
   base_confidence: 0.82
   reason: "macOS package installer — already installed or abandoned"
   exclude_if_recent_modified_days: 30
@@ -541,7 +541,7 @@
 
 - id: desktop-screenshots
   category: download-entropy
-  path_pattern: "~/Desktop/Screenshot*.png"
+  path_pattern: "~/Desktop/**/Screenshot*.png"
   base_confidence: 0.72
   reason: "Screenshots accumulate on Desktop — move or delete once reviewed"
   exclude_if_recent_modified_days: 7
@@ -551,7 +551,7 @@
 
 - id: downloads-screenshots
   category: download-entropy
-  path_pattern: "~/Downloads/Screenshot*.png"
+  path_pattern: "~/Downloads/**/Screenshot*.png"
   base_confidence: 0.75
   reason: "Screenshots in Downloads — likely already reviewed"
   exclude_if_recent_modified_days: 14
@@ -560,7 +560,7 @@
 
 - id: parallels-vm
   category: vm-disk
-  path_pattern: "~/Parallels/*.pvm"
+  path_pattern: "~/Parallels/**/*.pvm"
   domain: virtualization
   base_confidence: 0.60
   reason: "Parallels VM disk — keep only VMs you actively use"
@@ -568,7 +568,7 @@
 
 - id: vmware-vm
   category: vm-disk
-  path_pattern: "~/Virtual Machines/*.vmwarevm"
+  path_pattern: "~/Virtual Machines/**/*.vmwarevm"
   domain: virtualization
   base_confidence: 0.60
   reason: "VMware Fusion VM — keep only VMs you actively use"
@@ -624,7 +624,7 @@
 
 - id: shipit-update-cache
   category: app-cache
-  path_pattern: "~/Library/Caches/*ShipIt*"
+  path_pattern: "~/Library/Caches/**/*ShipIt*"
   base_confidence: 0.92
   reason: "Sparkle ShipIt updater leftovers — pure waste, app already updated"
   consequences:

@@ -18,9 +18,10 @@
 //!    containment, cloud sync, protected content).
 //! 6. `execute`: airlock (reversible) or, under disk pressure, delete.
 //!
-//! Free space is measured before and after so the receipt carries ACTUAL
-//! recovery, never an estimate: a same-volume airlock rename frees nothing until
-//! purge, and the outcome says so.
+//! Free space is measured before and after the pass so the outcome (and the
+//! watch incident built from it) carries ACTUAL recovery, never an estimate: a
+//! same-volume airlock rename frees nothing until purge, and the outcome says
+//! so. Per-item receipts carry the scan size and the pass's `incident_id`.
 
 use std::path::{Path, PathBuf};
 
@@ -201,7 +202,17 @@ pub fn reclaim(candidates: &[Candidate], req: &Request) -> Outcome {
             continue;
         }
 
-        match execute(c, req) {
+        // Re-measure before each survivor: once earlier deletes have lifted free
+        // space back above the threshold, the rest is airlocked. An unreadable
+        // df keeps the caller's decision.
+        let disposition = match req.disposition {
+            Disposition::Delete => history::free_bytes(req.home)
+                .map(|free| disposition_for(free, req.prof))
+                .unwrap_or(Disposition::Delete),
+            Disposition::Airlock => Disposition::Airlock,
+        };
+
+        match execute(c, req, disposition) {
             Ok(action) => {
                 out.bytes_estimated += c.size_bytes;
                 out.actions.push(action);
@@ -219,13 +230,13 @@ pub fn reclaim(candidates: &[Candidate], req: &Request) -> Outcome {
 }
 
 /// Airlock or delete one gated survivor and append its receipt.
-fn execute(c: &Candidate, req: &Request) -> anyhow::Result<Action> {
+fn execute(c: &Candidate, req: &Request, disposition: Disposition) -> anyhow::Result<Action> {
     let mut context = serde_json::Map::new();
     context.insert("auto".into(), serde_json::Value::Bool(true));
     context.insert("trigger".into(), req.trigger.into());
     context.insert("incident_id".into(), req.incident_id.into());
 
-    let (command, reversible, undo_cmd, airlock_id) = match req.disposition {
+    let (command, reversible, undo_cmd, airlock_id) = match disposition {
         Disposition::Airlock => {
             let (entry, kind) = airlock_store::airlock_path(
                 &c.id,
@@ -282,7 +293,7 @@ fn execute(c: &Candidate, req: &Request) -> anyhow::Result<Action> {
         candidate_id: c.id.clone(),
         path: c.path.clone(),
         size_bytes: c.size_bytes,
-        disposition: req.disposition,
+        disposition,
         airlock_id,
     })
 }
@@ -461,6 +472,9 @@ mod tests {
         let prof = Profile::default();
         let p = home.cache("worktree-build");
         std::fs::write(p.join("blob.bin"), vec![0u8; 4096]).unwrap();
+        // A database the pressure test WOULD refuse: if provenance did not run
+        // first, the refusal stage would read "pressure-test".
+        std::fs::write(p.join("state.sqlite"), b"SQLite format 3\0").unwrap();
         age(&p);
         let mut c = cand(&p, 0.95, Some("rebuild"));
         c.provenance = Some(Provenance {
@@ -479,6 +493,25 @@ mod tests {
             out.refusals[0].reason
         );
         assert!(p.exists(), "an active producer's artifact is never touched");
+    }
+
+    /// The disposition is re-measured per survivor: once free space is back
+    /// above the pressure threshold mid-pass, the rest is airlocked, not
+    /// deleted. (Threshold 0 means free space is always above it.)
+    #[test]
+    fn delete_request_reverts_to_airlock_once_free_space_is_above_threshold() {
+        let home = TempHome::new("recheck");
+        let mut prof = Profile::default();
+        prof.preferences.disk_pressure_threshold_gb = 0.0;
+        let p = home.cache("cache-a");
+        std::fs::write(p.join("blob.bin"), vec![0u8; 4096]).unwrap();
+        age(&p);
+        let req = request(&home, &prof, Disposition::Delete);
+        let out = reclaim(&[cand(&p, 0.95, Some("auto"))], &req);
+        assert_eq!(out.actions.len(), 1, "{:?}", out.refusals);
+        assert_eq!(out.actions[0].disposition, Disposition::Airlock);
+        assert!(out.actions[0].airlock_id.is_some());
+        assert!(!p.exists(), "moved into the airlock");
     }
 
     #[test]

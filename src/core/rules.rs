@@ -145,6 +145,76 @@ mod tests {
         ));
     }
 
+    /// Installer and screenshot rules were written when `*` crossed `/` and
+    /// matched nested files too; they keep that reach explicitly with `**`.
+    #[test]
+    fn installer_rules_still_reach_nested_files() {
+        let rules = load_builtin().unwrap();
+        let home = std::path::Path::new("/home/u");
+        for (id, nested, direct) in [
+            (
+                "old-dmg-files",
+                "/home/u/Downloads/Installers/x.dmg",
+                "/home/u/Downloads/x.dmg",
+            ),
+            (
+                "old-zip-installers",
+                "/home/u/Downloads/a/b.zip",
+                "/home/u/Downloads/b.zip",
+            ),
+            (
+                "old-pkg-installers",
+                "/home/u/Downloads/a/b.pkg",
+                "/home/u/Downloads/b.pkg",
+            ),
+            (
+                "desktop-screenshots",
+                "/home/u/Desktop/shots/Screenshot 1.png",
+                "/home/u/Desktop/Screenshot 1.png",
+            ),
+            (
+                "downloads-screenshots",
+                "/home/u/Downloads/s/Screenshot 1.png",
+                "/home/u/Downloads/Screenshot 1.png",
+            ),
+            (
+                "parallels-vm",
+                "/home/u/Parallels/old/w.pvm",
+                "/home/u/Parallels/w.pvm",
+            ),
+            (
+                "vmware-vm",
+                "/home/u/Virtual Machines/old/w.vmwarevm",
+                "/home/u/Virtual Machines/w.vmwarevm",
+            ),
+            (
+                "shipit-update-cache",
+                "/home/u/Library/Caches/com.x/ShipIt",
+                "/home/u/Library/Caches/com.x.ShipIt",
+            ),
+        ] {
+            let rule = rules
+                .iter()
+                .find(|r| r.id == id)
+                .unwrap_or_else(|| panic!("{}", id));
+            let pat =
+                glob::Pattern::new(&crate::core::scanner::expand_home(&rule.path_pattern, home))
+                    .unwrap();
+            assert!(
+                glob_matches(&pat, std::path::Path::new(nested)),
+                "{} nested {}",
+                id,
+                nested
+            );
+            assert!(
+                glob_matches(&pat, std::path::Path::new(direct)),
+                "{} direct {}",
+                id,
+                direct
+            );
+        }
+    }
+
     #[test]
     fn legacy_rule_without_reference_url_parses() {
         // A pre-P2 rule (no `reference_url` key) must still deserialize, with the

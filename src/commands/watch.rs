@@ -833,10 +833,12 @@ fn scan_phase(
     // error must never crash the tick. Advances `last_autoreclaim_ts` only after
     // a complete scan, so a budget timeout remains immediately retryable.
     let policy = prof_watch_policy();
-    let below_headroom = match (policy.headroom_bytes, state.last_free_bytes) {
-        (Some(floor), Some(free)) => free < floor,
-        _ => false,
-    };
+    let below_headroom = headroom_due(
+        policy.headroom_bytes,
+        state.last_free_bytes,
+        &state.incidents,
+        now,
+    );
     let autoreclaim = if should_autoreclaim(
         policy.enabled,
         level,
@@ -923,6 +925,24 @@ fn prof_watch_policy() -> WatchPolicy {
             headroom_bytes: None,
         },
     }
+}
+
+/// Headroom fires when MEASURED free space is below the floor, at most once per
+/// incident day. The headroom disposition is normally an airlock, which on the
+/// same volume frees nothing until purge, so re-firing every 30 minutes would
+/// airlock every newly eligible cache all day for an incident that still reads
+/// 0 freed. Pressure levels keep their cadence: there, deletion frees space.
+fn headroom_due(
+    floor: Option<u64>,
+    free: Option<u64>,
+    incidents: &[Incident],
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    let (Some(floor), Some(free)) = (floor, free) else {
+        return false;
+    };
+    let today = incident_id_for("headroom", now);
+    free < floor && !incidents.iter().any(|i| i.id == today)
 }
 
 /// Whether launchd currently lists the watch agent. Only asked when the plist
@@ -1018,7 +1038,7 @@ pub fn recovery_view(now: chrono::DateTime<chrono::Utc>) -> known_state::Recover
 
 /// Outcome of one autonomous reclaim pass, surfaced in output. Per-item receipts
 /// are written by `core::autonomy`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct AutoReclaimOutcome {
     /// `<level>-<yyyymmdd>`: every pass inside one pressure episode shares it.
     incident_id: String,
@@ -1033,6 +1053,24 @@ struct AutoReclaimOutcome {
     actually_freed: Option<u64>,
     #[serde(skip)]
     scan_complete: bool,
+}
+
+impl Serialize for AutoReclaimOutcome {
+    /// `bytes_freed` predates the measured fields and stays for existing
+    /// consumers, now carrying the measured delta (0 when df was unavailable)
+    /// instead of the scan estimate it used to report.
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut st = s.serialize_struct("AutoReclaimOutcome", 7)?;
+        st.serialize_field("incident_id", &self.incident_id)?;
+        st.serialize_field("disposition", &self.disposition)?;
+        st.serialize_field("items", &self.items)?;
+        st.serialize_field("refused", &self.refused)?;
+        st.serialize_field("bytes_estimated", &self.bytes_estimated)?;
+        st.serialize_field("actually_freed", &self.actually_freed)?;
+        st.serialize_field("bytes_freed", &self.actually_freed.unwrap_or(0))?;
+        st.end()
+    }
 }
 
 /// One incident per trigger kind (`urgent`, `critical`, `headroom`) per UTC day,
@@ -1125,10 +1163,17 @@ fn auto_reclaim(
 
     AutoReclaimOutcome {
         incident_id: incident_id.to_string(),
+        // The pass re-measures per survivor, so report what actually happened:
+        // any delete makes the pass a delete pass.
         disposition: (!outcome.actions.is_empty()).then(|| {
-            match disposition {
-                autonomy::Disposition::Airlock => "airlock",
-                autonomy::Disposition::Delete => "delete",
+            if outcome
+                .actions
+                .iter()
+                .any(|a| a.disposition == autonomy::Disposition::Delete)
+            {
+                "delete"
+            } else {
+                "airlock"
             }
             .to_string()
         }),
@@ -1868,6 +1913,66 @@ mod tests {
         assert!(should_autoreclaim(true, Level::Soft, true, None, now));
     }
 
+    /// A same-volume airlock cannot raise free space, so a headroom pass that
+    /// airlocked would otherwise re-fire every 30 minutes all day. Headroom runs
+    /// once per incident day; pressure levels keep their cadence because there
+    /// deletion actually frees space.
+    #[test]
+    fn headroom_triggers_once_per_incident_day() {
+        let now = chrono::Utc::now();
+        let floor = 20 << 30;
+        assert!(headroom_due(Some(floor), Some(10 << 30), &[], now));
+        assert!(!headroom_due(Some(floor), Some(30 << 30), &[], now));
+        assert!(!headroom_due(None, Some(1), &[], now));
+        let today = Incident {
+            id: incident_id_for("headroom", now),
+            level: Level::Ok,
+            opened_ts: now,
+            last_ts: now,
+            passes: 1,
+            items: 0,
+            refused: 0,
+            bytes_estimated: 0,
+            actually_freed: 0,
+            disposition: None,
+        };
+        assert!(!headroom_due(
+            Some(floor),
+            Some(10 << 30),
+            &[today.clone()],
+            now
+        ));
+        let yesterday = Incident {
+            id: incident_id_for("headroom", now - chrono::Duration::days(1)),
+            ..today
+        };
+        assert!(headroom_due(Some(floor), Some(10 << 30), &[yesterday], now));
+    }
+
+    /// `bytes_freed` stays in `watch run --json` for existing consumers, now
+    /// carrying the MEASURED delta (0 when df was unavailable) instead of the
+    /// scan estimate it used to report.
+    #[test]
+    fn autoreclaim_json_keeps_bytes_freed_as_the_measured_delta() {
+        let out = AutoReclaimOutcome {
+            incident_id: "urgent-20261006".into(),
+            disposition: Some("delete".into()),
+            items: 1,
+            refused: 0,
+            bytes_estimated: 5000,
+            actually_freed: Some(4096),
+            scan_complete: true,
+        };
+        let v = serde_json::to_value(&out).unwrap();
+        assert_eq!(v["bytes_freed"], 4096);
+        assert_eq!(v["bytes_estimated"], 5000);
+        let none = AutoReclaimOutcome {
+            actually_freed: None,
+            ..out
+        };
+        assert_eq!(serde_json::to_value(&none).unwrap()["bytes_freed"], 0);
+    }
+
     #[test]
     fn autoreclaim_rate_limited() {
         let now = chrono::Utc::now();
@@ -2068,7 +2173,11 @@ mod tests {
         while !writer.is_finished() {
             let raw = std::fs::read_to_string(&path).unwrap();
             let parsed: Result<WatchState, _> = serde_json::from_str(&raw);
-            assert!(parsed.is_ok(), "torn read: {}", &raw[..raw.len().min(80)]);
+            assert!(
+                parsed.is_ok(),
+                "torn read: {}",
+                raw.chars().take(80).collect::<String>()
+            );
             reads += 1;
         }
         writer.join().unwrap();

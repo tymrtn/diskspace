@@ -335,7 +335,8 @@ pub(crate) fn read_all_shared_in(base: &Path) -> Result<std::sync::Arc<Vec<Obser
     let path = series_path_in(base);
     let (len, modified) = match std::fs::metadata(&path) {
         Ok(m) => (m.len(), m.modified().ok()),
-        Err(_) => return Ok(Arc::new(Vec::new())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Arc::new(Vec::new())),
+        Err(e) => return Err(e.into()),
     };
     let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(c) = cache.as_ref() {
@@ -691,6 +692,25 @@ mod tests {
         let third = read_all_shared_in(base.path()).unwrap();
         assert_eq!(third.len(), 2, "an append is visible on the next read");
         assert!(!std::sync::Arc::ptr_eq(&first, &third));
+    }
+
+    /// A series we cannot stat is an error, never silently "empty".
+    #[cfg(unix)]
+    #[test]
+    fn shared_read_reports_an_unreadable_base_instead_of_empty() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = TempBase::new("unreadable");
+        append_batch_in(base.path(), &[obs("/x/1", 1, ts(2026, 6, 1, 0, 0, 0))]).unwrap();
+        let locked = base.path().join("locked");
+        std::fs::create_dir_all(&locked).unwrap();
+        std::fs::rename(series_path_in(base.path()), locked.join("series.jsonl")).unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let result = read_all_shared_in(&locked);
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(result.is_err(), "EACCES must surface");
+        assert!(read_all_shared_in(&base.path().join("nowhere"))
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

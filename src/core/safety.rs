@@ -704,6 +704,17 @@ pub fn autonomous_gate(path: &Path, home: &Path) -> Vec<CheckStep> {
     };
     let mut steps = Vec::new();
 
+    // (0) A relative path has no $HOME prefix to check and would resolve against
+    // the process cwd. Nothing below can reason about it.
+    if !path.is_absolute() {
+        steps.push(step(
+            "absolute",
+            false,
+            format!("relative path: {}", path.display()),
+        ));
+        return steps;
+    }
+
     // $HOME may itself sit behind a symlink (macOS /var -> /private/var, relocated
     // home folders). That link is the OS's, so compare everything against the
     // canonical home and rebase the candidate onto it; links BELOW home remain
@@ -818,6 +829,17 @@ pub fn autonomous_gate_passed(steps: &[CheckStep]) -> bool {
 #[cfg(test)]
 mod autonomous_tests {
     use super::*;
+
+    /// A relative candidate path has no `$HOME` prefix to check and would be
+    /// resolved against the process cwd. Refused before any other step.
+    #[test]
+    fn relative_path_is_refused() {
+        let home = std::env::temp_dir();
+        let steps = autonomous_gate(Path::new("Library/Caches/x"), &home);
+        assert!(!autonomous_gate_passed(&steps));
+        assert_eq!(steps[0].name, "absolute");
+        assert!(!steps[0].passed);
+    }
 
     struct Tmp(PathBuf);
     impl Tmp {

@@ -22,9 +22,12 @@ All notable changes to `diskspace` are recorded here. Dates are `YYYY-MM-DD`.
 - **Recovery is measured, not estimated.** `watch run --json` `autoreclaim` now
   carries `incident_id`, `disposition` (`"airlock"` / `"delete"` / `null`),
   `items`, `refused`, `bytes_estimated` (scan sizes) and `actually_freed` (df
-  delta on `$HOME`'s volume; 0 for a same-volume airlock). The former
-  `bytes_freed` field, which reported the scan estimate, is gone. Receipts in
-  `history.jsonl` carry `trigger`, `incident_id` and `disposition` in `context`.
+  delta on `$HOME`'s volume; 0 for a same-volume airlock). `bytes_freed` stays
+  for existing consumers but now carries that measured delta (0 when df was
+  unavailable) instead of the scan estimate it used to report. The disposition
+  is re-measured before each survivor: once deletes lift free space back above
+  the threshold, the rest of the pass airlocks. Receipts in `history.jsonl`
+  carry `trigger`, `incident_id` and `disposition` in `context`.
 - **New `critical` level below 1% free.** `watch run` and `watch status` report
   `level: "critical"` (additive JSON value; consumers matching on
   `ok`/`soft`/`urgent` should add it). Critical re-notifies on every 5-minute
@@ -32,7 +35,9 @@ All notable changes to `diskspace` are recorded here. Dates are `YYYY-MM-DD`.
 - **Headroom policy.** New optional `preferences.headroom_gb`. With
   `watch_autoreclaim` on, the monitor also runs its gated reclaim whenever
   MEASURED free space is below that floor, even while the percentage level is
-  still `ok`. The burn-rate forecast is still advisory and never triggers it.
+  still `ok`, at most once per UTC day (a same-volume airlock cannot raise free
+  space, so a faster cadence would only airlock more). The burn-rate forecast
+  is still advisory and never triggers it.
 - **Incidents.** `watch_state.json` gains an `incidents` list (serde-default,
   capped at 30): one record per trigger kind per UTC day
   (`urgent-20261006`, `critical-…`, `headroom-…`) with passes, items, refused,
@@ -64,7 +69,9 @@ All notable changes to `diskspace` are recorded here. Dates are `YYYY-MM-DD`.
   `unknown`, never a guess. A cargo `build-dir` (`<base>/<2 hex>/<14 hex>/target`)
   is matched to its workspace by reproducing cargo's `{workspace-path-hash}`
   (new dependency `rustc-stable-hash`); no surveyed workspace hashing to it
-  means `orphaned`.
+  means `orphaned` only when the survey covered `$HOME` and stayed under the
+  manifest cap, otherwise `unknown`. A clean, pushed worktree that still holds
+  ignored files (`.env`, local data) is `present`, not `orphaned`.
 - **Orphaned artifacts rank higher** (confidence +0.10, capped at 0.99) and
   `detect` prints the evidence under the path. **An `active` producer is a new
   refusal stage, `provenance`, in the unattended reclaim gate**, ahead of the
@@ -84,7 +91,11 @@ All notable changes to `diskspace` are recorded here. Dates are `YYYY-MM-DD`.
   builtin pattern already meant this; the change matters for patterns ending in
   `/*` (`**/stale/*`, the new worktree rules), which previously also matched
   every file beneath the directory and would have filled the survey cache with
-  the whole tree. Profile `never_touch` / `never_suggest` globs are unchanged.
+  the whole tree. The installer, screenshot, VM and ShipIt rules, which relied
+  on `*` crossing `/` to reach nested files, now say so with `**/` and keep
+  their reach. Profile `never_touch` / `never_suggest` globs are unchanged.
+- The unattended gate refuses a relative candidate path outright (step
+  `absolute`) instead of resolving it against the process cwd.
 
 ### Added (instant known-state panel)
 
