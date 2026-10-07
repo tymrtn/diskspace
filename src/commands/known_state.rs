@@ -631,12 +631,12 @@ fn measured_sentence(state: &KnownState) -> String {
     let w = &state.watch;
     let watch = match (w.last_tick, &w.last_level) {
         (Some(ts), Some(level)) => {
-            let age = humanize(Utc::now().signed_duration_since(ts).num_seconds().max(0));
+            let age = ago(Utc::now().signed_duration_since(ts).num_seconds().max(0));
             let pct = w
                 .last_pct_free
                 .map(|p| format!(", {:.1}% free", p))
                 .unwrap_or_default();
-            let mut s = format!("watch last sampled {} ago ({}{}", age, level, pct);
+            let mut s = format!("watch last sampled {} ({}{}", age, level, pct);
             if w.certainty == Certainty::Stale {
                 s.push_str(", STALE");
             }
@@ -666,8 +666,8 @@ fn measured_sentence(state: &KnownState) -> String {
 fn survey_sentence(state: &KnownState) -> String {
     match &state.survey {
         Some(s) => format!(
-            "measured {} ago  ·  scope {}  ·  {}{}",
-            humanize(s.age_seconds),
+            "measured {}  ·  scope {}  ·  {}{}",
+            ago(s.age_seconds),
             s.scope.display(),
             s.certainty.label(),
             if s.certainty == Certainty::Stale {
@@ -743,6 +743,16 @@ fn alerts_sentence(w: &WatchView) -> String {
 }
 
 /// Compact relative age.
+/// `humanize` with the "ago" suffix, except for "just now".
+fn ago(secs: i64) -> String {
+    let h = humanize(secs);
+    if h == "just now" {
+        h
+    } else {
+        format!("{h} ago")
+    }
+}
+
 pub fn humanize(secs: i64) -> String {
     if secs < 60 {
         "just now".to_string()
@@ -825,6 +835,26 @@ mod tests {
         assert_eq!(recovery_sentence(&s.recovery), "no incidents on record");
     }
 
+    /// A survey finished seconds ago reads "measured just now", never "just now ago".
+    #[test]
+    fn fresh_survey_reads_just_now_without_ago() {
+        let mut s = empty_state();
+        s.survey = Some(SurveyView {
+            scanned_at: Utc::now(),
+            age_seconds: 5,
+            scope: PathBuf::from("/home/u"),
+            total_bytes: 10,
+            certainty: Certainty::Recorded,
+            largest_owners: Vec::new(),
+            known_reclaimable_bytes: 0,
+            known_reclaimable_entries: 0,
+            not_summarized: None,
+        });
+        let m = survey_sentence(&s);
+        assert!(m.starts_with("measured just now  ·"), "{m}");
+        assert!(!m.contains("just now ago"), "{m}");
+    }
+
     #[test]
     fn stale_survey_is_flagged_and_recommends_remeasure() {
         let mut s = empty_state();
@@ -864,6 +894,24 @@ mod tests {
         assert!(m.contains("3.2% free"), "{m}");
         assert!(m.contains("STALE"), "{m}");
         assert!(m.contains("not installed"), "{m}");
+    }
+
+    /// A sample under a minute old reads "just now", never "just now ago".
+    #[test]
+    fn fresh_watch_sample_reads_just_now_without_ago() {
+        let mut s = empty_state();
+        s.watch = WatchView {
+            installed: true,
+            loaded: true,
+            last_tick: Some(Utc::now()),
+            last_level: Some("urgent".into()),
+            last_pct_free: Some(0.5),
+            last_free_bytes: Some(1),
+            certainty: Certainty::Recorded,
+        };
+        let m = measured_sentence(&s);
+        assert!(m.contains("sampled just now ("), "{m}");
+        assert!(!m.contains("just now ago"), "{m}");
     }
 
     #[test]
