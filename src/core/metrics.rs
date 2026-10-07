@@ -214,7 +214,7 @@ pub(crate) fn compute_metrics_in(
     now: DateTime<Utc>,
 ) -> Result<Metrics> {
     let df = read_df_series_in(base)?;
-    let series = series::read_all_in_pub(base)?;
+    let series = series::read_all_shared_in(base)?;
     let hist = history::read_all_in_pub(base)?;
 
     let (burn_rate, days_to_full) = burn_rate_and_days_to_full(&df);
@@ -484,7 +484,7 @@ fn top_growers_in(
     now: DateTime<Utc>,
 ) -> Result<Vec<Grower>> {
     let cutoff = now - chrono::Duration::milliseconds((window_days * 86_400_000.0) as i64);
-    let series = series::read_all_in_pub(base)?;
+    let series = series::read_all_shared_in(base)?;
 
     // Per identity: (first_ts, first_bytes, last_ts, last_bytes, last_path).
     // File order is append order, but sort by ts to be safe against merged logs.

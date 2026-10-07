@@ -9,6 +9,8 @@ pub mod explain;
 pub mod grant_cmd;
 pub mod guard;
 pub mod hunt;
+pub mod investigate;
+pub mod known_state;
 pub mod plan;
 pub mod profile_cmd;
 pub mod purge;

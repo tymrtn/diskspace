@@ -65,6 +65,13 @@ pub struct Preferences {
     /// the recovery-class filter both exclude them.
     #[serde(default)]
     pub watch_autoreclaim: bool,
+    /// Headroom floor in GB. With `watch_autoreclaim` on, the monitor also runs
+    /// its (reversible, gated) reclaim whenever MEASURED free space drops below
+    /// this, even while the percentage level is still healthy. `None` (default)
+    /// keeps the percentage thresholds as the only trigger. Additive +
+    /// serde-default so legacy profiles still parse.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub headroom_gb: Option<f32>,
 }
 
 fn default_pressure_threshold_gb() -> f32 {
@@ -80,6 +87,7 @@ impl Default for Preferences {
             disk_pressure_threshold_gb: 5.0,
             grant_path: None,
             watch_autoreclaim: false,
+            headroom_gb: None,
         }
     }
 }

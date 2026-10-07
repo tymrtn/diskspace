@@ -27,6 +27,7 @@
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
+use crate::core::candidate::CheckStep;
 use crate::core::rules::Rule;
 
 /// Filename suffixes marking a file as a database / durable state store. Matched
@@ -485,5 +486,593 @@ mod tests {
             &rules,
             home
         ));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Autonomous-path hardening
+// ---------------------------------------------------------------------------
+//
+// `check::pressure_test` is the shared floor for every delete path, interactive
+// or not. The checks below are the EXTRA ones that only an UNATTENDED delete
+// needs, and they are deliberately not folded into `pressure_test`: an
+// interactive user surveying `/Volumes/scratch` must still be able to act there,
+// while a background tick must not. Keeping them separate also means this
+// hardening can only ever make the autonomous path stricter.
+//
+// What it adds over `pressure_test`:
+//   * symlink rejection on the target AND every ancestor under $HOME (a swapped
+//     ancestor is the classic TOCTOU escape — `remove_dir_all` would follow the
+//     new parent, and `fs::metadata` in `restat_check` follows links);
+//   * containment: the resolved path must live strictly beneath the resolved
+//     $HOME, so a relative/`..` candidate or a cross-volume path is refused;
+//   * cloud-synced exclusion for ANY recognized provider (iCloud, both Dropbox
+//     shapes), because a local delete there propagates to every other device;
+//   * a bounded content scan that refuses model weights, unique patches, version
+//     -controlled source, and credential material.
+
+/// File suffixes that identify trained-model weights. Deleting these "frees"
+/// space that can cost hours and gigabytes of download to restore, so the
+/// unattended path refuses them even when a rule calls the cache regenerable.
+pub const MODEL_WEIGHT_SUFFIXES: &[&str] = &[
+    ".gguf",
+    ".ggml",
+    ".safetensors",
+    ".ckpt",
+    ".pt",
+    ".pth",
+    ".onnx",
+    ".npz",
+    ".h5",
+    ".tflite",
+    ".mlmodel",
+    ".mlpackage",
+    ".mlmodelc",
+];
+
+/// `.bin` is far too common to blanket-refuse, so it only counts as a weight
+/// above this size. Typical shard sizes start in the hundreds of MB.
+pub const MODEL_WEIGHT_BIN_MIN_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Patch / diff files: often the only copy of work that exists nowhere else.
+pub const PATCH_SUFFIXES: &[&str] = &[".patch", ".diff"];
+
+/// Credential material by file name or suffix. Complements the prefix-based
+/// [`builtin_never_touch`], which only covers whole well-known directories.
+pub const CREDENTIAL_SUFFIXES: &[&str] = &[
+    ".pem",
+    ".key",
+    ".p12",
+    ".pfx",
+    ".keychain",
+    ".keychain-db",
+    ".kdbx",
+    ".asc",
+    ".gpg",
+];
+pub const CREDENTIAL_NAMES: &[&str] = &[
+    ".env",
+    "id_rsa",
+    "id_ed25519",
+    "id_ecdsa",
+    "id_dsa",
+    "credentials",
+    "credentials.json",
+    ".netrc",
+    ".npmrc",
+    ".pypirc",
+];
+
+/// Directory names marking version-controlled source — active work whose
+/// presence means the tree is not a disposable cache.
+pub const VCS_DIR_NAMES: &[&str] = &[".git", ".hg", ".svn", ".jj"];
+
+/// Entry budget for [`sensitive_scan`]. Smaller than [`DB_SCAN_CAP`] because this
+/// runs on candidates that already cleared the database floor, and a background
+/// tick has a hard time budget. Exhausting it is INCONCLUSIVE → refused.
+pub const AUTONOMOUS_SCAN_CAP: usize = 50_000;
+
+/// What a bounded sensitive-content scan found.
+#[derive(Debug, PartialEq, Eq)]
+pub enum SensitiveScan {
+    Clean,
+    /// `(offending path, reason token)`.
+    Found(PathBuf, &'static str),
+    /// Budget exhausted before the tree could be cleared — fail closed.
+    Inconclusive,
+}
+
+fn name_of(path: &Path) -> String {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+}
+
+/// Classify one FILE (never a directory) against the content exclusions.
+/// `size` is the file's length; only `.bin` consults it.
+pub fn sensitive_file_reason(path: &Path, size: u64) -> Option<&'static str> {
+    let lower = name_of(path);
+    if MODEL_WEIGHT_SUFFIXES.iter().any(|s| lower.ends_with(s)) {
+        return Some("model-weights");
+    }
+    if lower.ends_with(".bin") && size >= MODEL_WEIGHT_BIN_MIN_BYTES {
+        return Some("model-weights");
+    }
+    if PATCH_SUFFIXES.iter().any(|s| lower.ends_with(s)) {
+        return Some("unique-patch");
+    }
+    if CREDENTIAL_SUFFIXES.iter().any(|s| lower.ends_with(s))
+        || CREDENTIAL_NAMES.iter().any(|n| lower == *n)
+    {
+        return Some("credentials");
+    }
+    None
+}
+
+/// Walk `path` within `cap` entries looking for content the unattended path must
+/// never delete. Symlinks are never followed (and a symlink encountered inside is
+/// itself a refusal — the autonomous path does not reason about link targets).
+pub fn sensitive_scan(path: &Path, cap: usize) -> SensitiveScan {
+    let mut budget = cap;
+    sensitive_scan_inner(path, &mut budget)
+}
+
+fn sensitive_scan_inner(path: &Path, budget: &mut usize) -> SensitiveScan {
+    if *budget == 0 {
+        return SensitiveScan::Inconclusive;
+    }
+    *budget -= 1;
+
+    let md = match std::fs::symlink_metadata(path) {
+        Ok(m) => m,
+        // Unreadable is not provably safe.
+        Err(_) => return SensitiveScan::Found(path.to_path_buf(), "unreadable"),
+    };
+    if md.file_type().is_symlink() {
+        return SensitiveScan::Found(path.to_path_buf(), "symlink");
+    }
+    let name = name_of(path);
+    // `.git` is a FILE in worktrees and submodules (`gitdir: ...`); either shape
+    // marks the tree as active source.
+    if VCS_DIR_NAMES.contains(&name.as_str()) {
+        return SensitiveScan::Found(path.to_path_buf(), "version-controlled-source");
+    }
+    if md.is_file() {
+        return match sensitive_file_reason(path, md.len()) {
+            Some(reason) => SensitiveScan::Found(path.to_path_buf(), reason),
+            None => SensitiveScan::Clean,
+        };
+    }
+    if !md.is_dir() {
+        // Sockets, fifos, devices: not something a cleanup path should remove.
+        return SensitiveScan::Found(path.to_path_buf(), "not-a-regular-file");
+    }
+    // Core ML models (`.mlpackage`, `.mlmodelc`) are bundle directories.
+    if MODEL_WEIGHT_SUFFIXES.iter().any(|s| name.ends_with(s)) {
+        return SensitiveScan::Found(path.to_path_buf(), "model-weights");
+    }
+
+    let entries = match std::fs::read_dir(path) {
+        Ok(e) => e,
+        Err(_) => return SensitiveScan::Found(path.to_path_buf(), "unreadable"),
+    };
+    for entry in entries {
+        // An entry that cannot even be listed is not provably safe.
+        let Ok(entry) = entry else {
+            return SensitiveScan::Found(path.to_path_buf(), "unreadable");
+        };
+        match sensitive_scan_inner(&entry.path(), budget) {
+            SensitiveScan::Clean => {}
+            other => return other,
+        }
+    }
+    SensitiveScan::Clean
+}
+
+/// Is `path`, or any ancestor of it strictly below `home`, a symlink? Returns
+/// the first offending component. Checked per-component with `symlink_metadata`
+/// so nothing is ever resolved through a link. `home` itself and everything
+/// above it (/, /Users) are the OS's and are not attacker-controlled, so they
+/// are not policed; callers pass a canonical `home` and a path rebased onto it.
+pub fn symlinked_component(path: &Path, home: &Path) -> Option<PathBuf> {
+    let mut prefix = PathBuf::new();
+    let mut offender = None;
+    for component in path.components() {
+        prefix.push(component);
+        if !prefix.starts_with(home) || prefix == home {
+            continue;
+        }
+        if let Ok(md) = std::fs::symlink_metadata(&prefix) {
+            if md.file_type().is_symlink() {
+                offender = Some(prefix.clone());
+                break;
+            }
+        }
+    }
+    offender
+}
+
+/// The unattended-delete gate. Returns the ordered checks; the caller requires
+/// every one to pass. Mirrors `check::CheckStep` so both gates render and
+/// serialize identically.
+pub fn autonomous_gate(path: &Path, home: &Path) -> Vec<CheckStep> {
+    let step = |name: &str, passed: bool, note: String| CheckStep {
+        name: name.into(),
+        passed,
+        note,
+    };
+    let mut steps = Vec::new();
+
+    // (0) A relative path has no $HOME prefix to check and would resolve against
+    // the process cwd. Nothing below can reason about it.
+    if !path.is_absolute() {
+        steps.push(step(
+            "absolute",
+            false,
+            format!("relative path: {}", path.display()),
+        ));
+        return steps;
+    }
+
+    // $HOME may itself sit behind a symlink (macOS /var -> /private/var, relocated
+    // home folders). That link is the OS's, so compare everything against the
+    // canonical home and rebase the candidate onto it; links BELOW home remain
+    // the candidate's problem.
+    let resolved_home = std::fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf());
+    let rebased = match path.strip_prefix(home) {
+        Ok(rest) => resolved_home.join(rest),
+        Err(_) => path.to_path_buf(),
+    };
+
+    // (1) Symlink — the target itself and every ancestor under $HOME.
+    match symlinked_component(&rebased, &resolved_home) {
+        Some(bad) => steps.push(step(
+            "symlink",
+            false,
+            format!("symlinked path component: {}", bad.display()),
+        )),
+        None => steps.push(step(
+            "symlink",
+            true,
+            "no symlinked component below $HOME".into(),
+        )),
+    }
+
+    // (2) Containment — resolve WITHOUT following the final component (it may not
+    // survive to deletion) and require it strictly beneath the resolved $HOME.
+    // A `.` or `..` component is refused outright: `$HOME/a/..` names `$HOME`,
+    // and resolving only the parent would misread it as `$HOME/a`.
+    let has_dot_component = rebased.components().any(|c| {
+        matches!(
+            c,
+            std::path::Component::CurDir | std::path::Component::ParentDir
+        )
+    });
+    let resolved = if has_dot_component {
+        None
+    } else {
+        rebased
+            .parent()
+            .and_then(|p| std::fs::canonicalize(p).ok())
+            .zip(rebased.file_name())
+            .map(|(p, name)| p.join(name))
+    };
+    match resolved {
+        Some(r) if r.starts_with(&resolved_home) && r != resolved_home => steps.push(step(
+            "containment",
+            true,
+            format!("resolves beneath {}", resolved_home.display()),
+        )),
+        Some(r) => steps.push(step(
+            "containment",
+            false,
+            format!(
+                "{} is not strictly beneath {}",
+                r.display(),
+                resolved_home.display()
+            ),
+        )),
+        None => steps.push(step(
+            "containment",
+            false,
+            "path has a `.`/`..` component or its parent could not be resolved".into(),
+        )),
+    }
+
+    // (3) Cloud-synced — a local delete propagates to every other device.
+    let provider = crate::core::cloud::detect_provider(path);
+    if provider == crate::core::cloud::CloudProvider::None {
+        steps.push(step(
+            "cloud-sync",
+            true,
+            "not under a cloud sync root".into(),
+        ));
+    } else {
+        steps.push(step(
+            "cloud-sync",
+            false,
+            format!("under a {} sync root — deleting propagates", provider),
+        ));
+    }
+
+    // (4) Content — weights, patches, source, credentials.
+    match sensitive_scan(path, AUTONOMOUS_SCAN_CAP) {
+        SensitiveScan::Clean => steps.push(step(
+            "protected-content",
+            true,
+            "no weights, patches, source or credentials found".into(),
+        )),
+        SensitiveScan::Found(p, reason) => steps.push(step(
+            "protected-content",
+            false,
+            format!("{} at {}", reason, p.display()),
+        )),
+        SensitiveScan::Inconclusive => steps.push(step(
+            "protected-content",
+            false,
+            format!(
+                "too large to verify within {} entries — refused (fail-closed)",
+                AUTONOMOUS_SCAN_CAP
+            ),
+        )),
+    }
+
+    steps
+}
+
+/// Did every check in [`autonomous_gate`] pass?
+pub fn autonomous_gate_passed(steps: &[CheckStep]) -> bool {
+    steps.iter().all(|s| s.passed)
+}
+
+#[cfg(test)]
+mod autonomous_tests {
+    use super::*;
+
+    /// A relative candidate path has no `$HOME` prefix to check and would be
+    /// resolved against the process cwd. Refused before any other step.
+    #[test]
+    fn relative_path_is_refused() {
+        let home = std::env::temp_dir();
+        let steps = autonomous_gate(Path::new("Library/Caches/x"), &home);
+        assert!(!autonomous_gate_passed(&steps));
+        assert_eq!(steps[0].name, "absolute");
+        assert!(!steps[0].passed);
+    }
+
+    struct Tmp(PathBuf);
+    impl Tmp {
+        fn new(tag: &str) -> Self {
+            let mut p = std::env::temp_dir();
+            p.push(format!(
+                "diskspace-autogate-{}-{}-{}",
+                tag,
+                std::process::id(),
+                chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+            ));
+            std::fs::create_dir_all(&p).unwrap();
+            // Resolve so comparisons are not defeated by /var -> /private/var.
+            Self(std::fs::canonicalize(&p).unwrap())
+        }
+    }
+    impl Drop for Tmp {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn plain_cache(home: &Path) -> PathBuf {
+        let p = home.join("Library/Caches/example");
+        std::fs::create_dir_all(&p).unwrap();
+        std::fs::write(p.join("blob.tmp"), b"x").unwrap();
+        p
+    }
+
+    #[test]
+    fn plain_cache_passes_every_check() {
+        let home = Tmp::new("ok");
+        let p = plain_cache(&home.0);
+        let steps = autonomous_gate(&p, &home.0);
+        assert!(
+            autonomous_gate_passed(&steps),
+            "expected pass, got {:?}",
+            steps
+        );
+    }
+
+    #[test]
+    fn symlinked_candidate_is_refused() {
+        let home = Tmp::new("symlink");
+        let real = home.0.join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        let link = home.0.join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let steps = autonomous_gate(&link, &home.0);
+        assert!(!autonomous_gate_passed(&steps));
+        assert!(steps.iter().any(|s| s.name == "symlink" && !s.passed));
+    }
+
+    /// The TOCTOU shape: the candidate's own name is fine, but a PARENT was
+    /// swapped for a symlink after the scan.
+    #[test]
+    fn symlinked_ancestor_is_refused() {
+        let home = Tmp::new("ancestor");
+        let real = home.0.join("elsewhere/cache");
+        std::fs::create_dir_all(&real).unwrap();
+        std::os::unix::fs::symlink(home.0.join("elsewhere"), home.0.join("Library")).unwrap();
+        let steps = autonomous_gate(&home.0.join("Library/cache"), &home.0);
+        assert!(!autonomous_gate_passed(&steps));
+        assert!(steps.iter().any(|s| s.name == "symlink" && !s.passed));
+    }
+
+    #[test]
+    fn path_outside_home_is_refused() {
+        let home = Tmp::new("outside");
+        let other = Tmp::new("other");
+        let p = plain_cache(&other.0);
+        let steps = autonomous_gate(&p, &home.0);
+        assert!(!autonomous_gate_passed(&steps));
+        assert!(steps.iter().any(|s| s.name == "containment" && !s.passed));
+    }
+
+    #[test]
+    fn home_itself_is_refused() {
+        let home = Tmp::new("selfhome");
+        let steps = autonomous_gate(&home.0, &home.0);
+        assert!(steps.iter().any(|s| s.name == "containment" && !s.passed));
+    }
+
+    /// Generic cloud detection, not a hardcoded personal path: a `.dropbox`
+    /// marker at an ancestor is the structural signal.
+    #[test]
+    fn cloud_synced_candidate_is_refused() {
+        let home = Tmp::new("cloud");
+        let root = home.0.join("SomeSyncRoot");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join(".dropbox"), b"").unwrap();
+        let p = root.join("project/cache");
+        std::fs::create_dir_all(&p).unwrap();
+        let steps = autonomous_gate(&p, &home.0);
+        assert!(!autonomous_gate_passed(&steps));
+        assert!(steps.iter().any(|s| s.name == "cloud-sync" && !s.passed));
+    }
+
+    #[test]
+    fn model_weights_patches_source_and_credentials_are_refused() {
+        for (tag, build, reason) in [
+            (
+                "weights",
+                &(|p: &Path| std::fs::write(p.join("model.safetensors"), b"w").unwrap())
+                    as &dyn Fn(&Path),
+                "model-weights",
+            ),
+            (
+                "patch",
+                &(|p: &Path| std::fs::write(p.join("fix.patch"), b"d").unwrap()) as &dyn Fn(&Path),
+                "unique-patch",
+            ),
+            (
+                "source",
+                &(|p: &Path| std::fs::create_dir_all(p.join("repo/.git")).unwrap())
+                    as &dyn Fn(&Path),
+                "version-controlled-source",
+            ),
+            (
+                "creds",
+                &(|p: &Path| std::fs::write(p.join(".env"), b"K=V").unwrap()) as &dyn Fn(&Path),
+                "credentials",
+            ),
+        ] {
+            let home = Tmp::new(tag);
+            let p = plain_cache(&home.0);
+            build(&p);
+            let steps = autonomous_gate(&p, &home.0);
+            assert!(
+                !autonomous_gate_passed(&steps),
+                "{} must be refused",
+                reason
+            );
+            let note = steps
+                .iter()
+                .find(|s| s.name == "protected-content")
+                .map(|s| s.note.clone())
+                .unwrap_or_default();
+            assert!(note.contains(reason), "{} not in note: {}", reason, note);
+        }
+    }
+
+    /// A small `.bin` is ordinary cache content; a large one is treated as a
+    /// weight shard.
+    #[test]
+    fn bin_files_are_size_discriminated() {
+        let small = Path::new("/tmp/thing.bin");
+        assert_eq!(sensitive_file_reason(small, 1024), None);
+        assert_eq!(
+            sensitive_file_reason(small, MODEL_WEIGHT_BIN_MIN_BYTES),
+            Some("model-weights")
+        );
+    }
+
+    #[test]
+    fn exhausted_budget_fails_closed() {
+        let home = Tmp::new("budget");
+        let p = plain_cache(&home.0);
+        assert_eq!(sensitive_scan(&p, 0), SensitiveScan::Inconclusive);
+    }
+
+    /// `$HOME/a/..` names `$HOME` itself. Resolving only the parent and then
+    /// re-appending a (missing) file name must not turn that into `$HOME/a`.
+    #[test]
+    fn trailing_dotdot_is_refused() {
+        let home = Tmp::new("dotdot");
+        let p = plain_cache(&home.0);
+        let steps = autonomous_gate(&p.join(".."), &home.0);
+        assert!(
+            steps.iter().any(|s| s.name == "containment" && !s.passed),
+            "expected containment refusal, got {:?}",
+            steps
+        );
+    }
+
+    /// Git worktrees and submodules carry `.git` as a FILE (`gitdir: ...`), and
+    /// are just as much active source as a `.git` directory.
+    #[test]
+    fn git_file_marks_worktree_as_source() {
+        let home = Tmp::new("gitfile");
+        let p = plain_cache(&home.0);
+        std::fs::create_dir_all(p.join("wt")).unwrap();
+        std::fs::write(p.join("wt/.git"), b"gitdir: /somewhere/.git/worktrees/wt\n").unwrap();
+        let steps = autonomous_gate(&p, &home.0);
+        let note = steps
+            .iter()
+            .find(|s| s.name == "protected-content")
+            .map(|s| s.note.clone())
+            .unwrap_or_default();
+        assert!(
+            note.contains("version-controlled-source"),
+            "expected source refusal, got {:?}",
+            steps
+        );
+    }
+
+    /// Core ML models are bundle DIRECTORIES, so the weight suffix has to be
+    /// honored on directory names too.
+    #[test]
+    fn mlpackage_bundle_is_model_weights() {
+        let home = Tmp::new("mlpackage");
+        let p = plain_cache(&home.0);
+        std::fs::create_dir_all(p.join("Model.mlpackage/Data")).unwrap();
+        std::fs::write(p.join("Model.mlpackage/Data/weights"), b"w").unwrap();
+        let steps = autonomous_gate(&p, &home.0);
+        let note = steps
+            .iter()
+            .find(|s| s.name == "protected-content")
+            .map(|s| s.note.clone())
+            .unwrap_or_default();
+        assert!(
+            note.contains("model-weights"),
+            "expected weights refusal, got {:?}",
+            steps
+        );
+    }
+
+    /// A `$HOME` that is itself reached through a symlink (macOS `/var` ->
+    /// `/private/var`, relocated home folders) is the OS's business, not an
+    /// attacker's. The gate must police components BELOW home, not home itself.
+    #[test]
+    fn symlinked_home_root_is_not_an_offender() {
+        let real = Tmp::new("realhome");
+        let parent = Tmp::new("linkparent");
+        let link_home = parent.0.join("home");
+        std::os::unix::fs::symlink(&real.0, &link_home).unwrap();
+        let p = plain_cache(&real.0);
+        let via_link = link_home.join(p.strip_prefix(&real.0).unwrap());
+        let steps = autonomous_gate(&via_link, &link_home);
+        assert!(
+            autonomous_gate_passed(&steps),
+            "expected pass through symlinked home, got {:?}",
+            steps
+        );
     }
 }

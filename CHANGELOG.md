@@ -4,6 +4,136 @@ All notable changes to `diskspace` are recorded here. Dates are `YYYY-MM-DD`.
 
 ## [Unreleased]
 
+### Changed (watch auto-reclaim: one gated, reversible path)
+
+- **Every unattended delete now goes through `core::autonomy::reclaim`.** The
+  watch tick used to filter candidates and call `remove_dir_all` inline. It now
+  hands them to a single gate: standing opt-in (`preferences.watch_autoreclaim`)
+  → regenerable tier (confidence ≥ 0.85, recovery `auto`/`redownload`/`rebuild`)
+  → `pressure_test` → the new unattended checks (no symlinked component below
+  `$HOME`, strict containment, not cloud-synced, no model weights / patches /
+  version-controlled source / credentials inside) → act. Each refused candidate
+  is recorded with the stage that refused it. Grants are never consulted on this
+  path in any build; in `actuation` builds they only relax bounds elsewhere.
+- **Survivors are airlocked, not deleted, unless free space is already below
+  `preferences.disk_pressure_threshold_gb`** (same rule `doctor` uses, because a
+  same-volume airlock frees nothing until purge). Airlocked items get a
+  reversible receipt with `diskspace restore <id>`.
+- **Recovery is measured, not estimated.** `watch run --json` `autoreclaim` now
+  carries `incident_id`, `disposition` (`"airlock"` / `"delete"` / `null`),
+  `items`, `refused`, `bytes_estimated` (scan sizes) and `actually_freed` (df
+  delta on `$HOME`'s volume; 0 for a same-volume airlock). `bytes_freed` stays
+  for existing consumers but now carries that measured delta (0 when df was
+  unavailable) instead of the scan estimate it used to report. The disposition
+  is re-measured before each survivor: once deletes lift free space back above
+  the threshold, the rest of the pass airlocks. Receipts in `history.jsonl`
+  carry `trigger`, `incident_id` and `disposition` in `context`.
+- **New `critical` level below 1% free.** `watch run` and `watch status` report
+  `level: "critical"` (additive JSON value; consumers matching on
+  `ok`/`soft`/`urgent` should add it). Critical re-notifies on every 5-minute
+  tick and retries autonomous reclaim after 10 minutes instead of 30.
+- **Headroom policy.** New optional `preferences.headroom_gb`. With
+  `watch_autoreclaim` on, the monitor also runs its gated reclaim whenever
+  MEASURED free space is below that floor, even while the percentage level is
+  still `ok`, at most once per UTC day (a same-volume airlock cannot raise free
+  space, so a faster cadence would only airlock more). The burn-rate forecast
+  is still advisory and never triggers it.
+- **Incidents.** `watch_state.json` gains an `incidents` list (serde-default,
+  capped at 30): one record per trigger kind per UTC day
+  (`urgent-20261006`, `critical-…`, `headroom-…`) with passes, items, refused,
+  `bytes_estimated` and summed `actually_freed`. Receipts carry the same id.
+- Unattended-gate fixes: a trailing `..` no longer slips containment; a `.git`
+  FILE (worktree / submodule) counts as source; `.mlpackage` / `.mlmodelc` bundle
+  directories count as model weights; an unreadable directory entry refuses
+  instead of being skipped; a `$HOME` reached through a symlink is no longer
+  refused wholesale.
+
+### Fixed (detect and watch reclaim re-parsed the series log per candidate)
+
+- `detect` and the watch's reclaim pass asked for the whole `series.jsonl` once
+  per candidate inside the advisory metrics enrichment. On a machine with a
+  400 MB series that was a full JSON parse per candidate: a debug `detect`
+  ran past 11 minutes and the release build took 2 minutes. The parsed series
+  is now shared within a process while the file's path, length and mtime are
+  unchanged, and re-read after any append. Same machine, debug build: 50 s.
+
+### Added (provenance: who produced an artifact, and do they still need it)
+
+- **`core::provenance`** attaches an additive `provenance` object to a
+  candidate (`detect --json`, `explain --json`) when the path carries evidence:
+  `producer` (`cargo_workspace` / `git_repository`), `producer_path`,
+  `liveness` (`active` / `present` / `orphaned` / `unknown`) and the
+  `evidence` lines behind the verdict. A linked git worktree is read through
+  its `.git` file: uncommitted changes or commits on no remote mean `active`;
+  clean and fully pushed means `orphaned`; a missing parent repository means
+  `unknown`, never a guess. A cargo `build-dir` (`<base>/<2 hex>/<14 hex>/target`)
+  is matched to its workspace by reproducing cargo's `{workspace-path-hash}`
+  (new dependency `rustc-stable-hash`); no surveyed workspace hashing to it
+  means `orphaned` only when the survey covered `$HOME` and stayed under the
+  manifest cap, otherwise `unknown`. A clean, pushed worktree that still holds
+  ignored files (`.env`, local data) is `present`, not `orphaned`.
+- **Orphaned artifacts rank higher** (confidence +0.10, capped at 0.99) and
+  `detect` prints the evidence under the path. **An `active` producer is a new
+  refusal stage, `provenance`, in the unattended reclaim gate**, ahead of the
+  pressure test.
+- The survey now records every `Cargo.toml` it sees outside `target` and
+  `.cargo` trees (`scan.json` `manifests`, serde-default, capped at 5000) so
+  build dirs can be matched without a rescan.
+- **Agent worktree rules**: `repo-dot-worktrees` (`**/.worktrees/*`),
+  `claude-code-worktrees` (`**/.claude/worktrees/*`) and `hermes-worktrees`
+  (`~/.hermes/profiles/*/worktrees/*`), each one worktree per candidate,
+  `irreversible`, excluded when modified within 14 days.
+
+### Changed (rule globs match path components)
+
+- Rule `path_pattern` globs now match with `require_literal_separator`: `*`
+  and `?` stay inside one path component, `**` still spans directories. Every
+  builtin pattern already meant this; the change matters for patterns ending in
+  `/*` (`**/stale/*`, the new worktree rules), which previously also matched
+  every file beneath the directory and would have filled the survey cache with
+  the whole tree. The installer, screenshot, VM and ShipIt rules, which relied
+  on `*` crossing `/` to reach nested files, now say so with `**/` and keep
+  their reach. Profile `never_touch` / `never_suggest` globs are unchanged.
+- The unattended gate refuses a relative candidate path outright (step
+  `absolute`) instead of resolving it against the process cwd.
+
+### Added (instant known-state panel)
+
+- **`diskspace investigate`** and the bare `diskspace` launch now open with
+  everything the watcher already knows, drawn from persisted state without a
+  scan: live `df`, the watch's last sample (level, % free, age, monitoring
+  on/off), the survey's age and scope (STALE past 24h, `unknown` when absent),
+  the largest known owners strictly below the survey root, rule-matched bytes as
+  an *estimate*, the 7-day free-space sparkline and advisory trend, the latest
+  incident with its *measured* recovery, and next actions. `investigate --json`
+  emits the same document. Both views are read-only and never create or touch
+  `scan.json`.
+- `watch status` now shares its launchd check with the panel; the bare launch's
+  previous one-line disk/profile/survey status is replaced by the panel.
+
+### Fixed (watch notifications)
+
+- **`watch run` sends a due notification before auto-reclaim and the advisory
+  recorder.** Those scans can run well past their 5-second budget on a large
+  HOME (`tick_state.json` is parsed outside it), and the alert used to wait
+  behind them. Notification bookkeeping is now saved before the scans start, and
+  a failed state save is logged instead of ignored. The scans' budget starts
+  after notification delivery, so a slow `osascript` cannot use it up.
+- **The re-notify clock advances only when the OS accepts the notification.**
+  A failed `osascript` launch, nonzero exit, or hang (killed after 10s) is logged
+  to stderr, leaves `last_notified_ts` / `last_notified_pct` /
+  `last_trend_notified_ts` untouched, and retries on the next tick. A failed
+  recovery ping is not retried: recovery is still announced once. `osascript`
+  stderr is drained while it runs and collected only within the 10s limit. New
+  serde-default state field `notify_retry_pending`.
+- **`watch run --json`:** `notified` and `trend_notified` keep their names and
+  boolean type, but now mean "submitted to the OS notifier this tick" instead of
+  "a notification was due". New `notification` / `trend_notification` fields are
+  `null` when nothing was due, otherwise `{"status": "submitted"}`,
+  `{"status": "failed", "error": "..."}`, or `{"status": "unsupported"}`
+  (non-macOS builds, which now report `notified: false`). `submitted` means
+  `osascript` exited 0; macOS offers no receipt that a banner was displayed.
+
 ### Changed (agent-facing — `detect --json` schema)
 
 - **`diskspace detect --json` now emits an OBJECT envelope, not a bare array.**

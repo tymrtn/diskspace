@@ -157,6 +157,26 @@ pub fn run(show_all: bool, top: usize, ctx: &Context) -> Result<()> {
             println!("       {}", ctx.style(&format!("↳  {}", c.reason), &dim));
         }
 
+        // Provenance, when it changes the decision: orphaned (nothing needs
+        // this any more) or active (someone still does).
+        if let Some(prov) = &c.provenance {
+            use crate::core::provenance::Liveness;
+            let label = match prov.liveness {
+                Liveness::Orphaned => Some("orphaned"),
+                Liveness::Active => Some("producer active"),
+                _ => None,
+            };
+            if let Some(label) = label {
+                println!(
+                    "       {}",
+                    ctx.style(
+                        &format!("↳  {}: {}", label, prov.evidence.join(" · ")),
+                        &dim
+                    )
+                );
+            }
+        }
+
         if i < shown.len() - 1 {
             println!("  {}", ctx.style("  ·", &dim));
         }
@@ -190,6 +210,8 @@ fn build_candidates(
 ) -> Vec<Candidate> {
     let mut candidates: Vec<Candidate> = Vec::new();
     let home_path = Path::new(home);
+    let workspaces =
+        crate::core::provenance::Index::from_survey(&scan.root, home_path, &scan.manifests);
 
     for rule in rules {
         let pattern_str = crate::core::scanner::expand_home(&rule.path_pattern, home_path);
@@ -200,7 +222,7 @@ fn build_candidates(
 
         // Find entries matching this rule
         for entry in &scan.entries {
-            if !glob_pat.matches_path(&entry.path) {
+            if !crate::core::rules::glob_matches(&glob_pat, &entry.path) {
                 continue;
             }
             if entry.size_bytes == 0 {
@@ -314,12 +336,22 @@ fn build_candidates(
                 consequence_contract: None,
                 metrics: None,
                 reference_url: None,
+                provenance: None,
             };
 
             // Agent-surface enrichment: attach reference_url, consequence
             // contract, and advisory metrics. Purely additive / advisory — it
             // never touches the score() inputs, so ranking stays unaffected.
             crate::commands::agent_surface::enrich_candidate(&mut candidate, rule, prof);
+
+            // Provenance: who produced this and whether they still need it. An
+            // orphaned artifact ranks higher; an active producer is reported
+            // here and refused by the unattended gate.
+            if let Some(prov) = crate::core::provenance::probe(&candidate.path, &workspaces) {
+                candidate.confidence =
+                    crate::core::provenance::adjust_confidence(candidate.confidence, &prov);
+                candidate.provenance = Some(prov);
+            }
 
             candidates.push(candidate);
         }
@@ -590,6 +622,7 @@ mod tests {
             scan_id: String::new(),
             metrics: None,
             largest_dirs: Vec::new(),
+            manifests: Vec::new(),
             dir_mtimes: Default::default(),
         }
     }
@@ -607,6 +640,38 @@ mod tests {
                 })
         });
         candidates
+    }
+
+    /// A cargo build dir whose workspace is not among the survey's manifests is
+    /// orphaned: provenance is attached and confidence rises by the orphan boost.
+    #[test]
+    fn orphaned_build_dir_gains_provenance_and_confidence() {
+        let _h = TempHome::new();
+        let tmp = std::env::temp_dir().join(format!(
+            "diskspace-detect-prov-{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        let other = tmp.join("other").join("Cargo.toml");
+        std::fs::create_dir_all(other.parent().unwrap()).unwrap();
+        std::fs::write(&other, "[package]\nname='y'\n").unwrap();
+        let build = tmp.join("cargo-build/0c/a4d1336e85fe5d/target");
+
+        let rules = vec![rule("target", "**/target", 0.78, "rebuild", None)];
+        let mut scan = scan_with(vec![entry(build.to_str().unwrap(), 5 << 30, 30)]);
+        scan.manifests = vec![other];
+        scan.root = PathBuf::from("/home/test");
+        let got = build_candidates(&scan, &rules, &test_profile(), "/home/test");
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        assert_eq!(got.len(), 1);
+        let prov = got[0].provenance.as_ref().expect("provenance attached");
+        assert_eq!(prov.liveness, crate::core::provenance::Liveness::Orphaned);
+        assert!(
+            (got[0].confidence - 0.88).abs() < 1e-5,
+            "{}",
+            got[0].confidence
+        );
     }
 
     /// #1: one rule, three matching entries at different sizes -> three

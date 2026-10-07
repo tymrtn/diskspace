@@ -150,6 +150,7 @@ mod tests {
             consequence_contract: None,
             metrics: None,
             reference_url: None,
+            provenance: None,
         }
     }
 
