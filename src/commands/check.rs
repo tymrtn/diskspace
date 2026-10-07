@@ -478,6 +478,9 @@ mod tests {
     /// builtin rule via $HOME.
     #[test]
     fn data_safety_allows_exact_file_database_rule() {
+        let _home = crate::core::HOME_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let home = std::env::var("HOME").unwrap_or_else(|_| "/".into());
         let path = std::path::Path::new(&home)
             .join(".screenpipe")
@@ -498,6 +501,11 @@ mod tests {
     /// profile. Pure path check (no fs touch of the real `~/.ssh`).
     #[test]
     fn policy_blocks_builtin_secret_store() {
+        // Reads $HOME twice (here and in policy_check); other tests swap it
+        // under this lock, so hold it for the whole check.
+        let _home = crate::core::HOME_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let home = std::env::var("HOME").unwrap_or_else(|_| "/".into());
         let path = std::path::Path::new(&home).join(".ssh").join("id_ed25519");
         let step = policy_check(&path, &profile::Profile::default());

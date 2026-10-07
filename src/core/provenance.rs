@@ -431,7 +431,11 @@ mod tests {
         std::fs::create_dir_all(&build).unwrap();
 
         // Survey scoped below $HOME.
-        let scoped = Index::from_survey(&tmp.path().join("other"), tmp.path(), &[other.clone()]);
+        let scoped = Index::from_survey(
+            &tmp.path().join("other"),
+            tmp.path(),
+            std::slice::from_ref(&other),
+        );
         let p = probe(&build, &scoped).expect("evidence");
         assert_eq!(p.liveness, Liveness::Unknown, "{:?}", p.evidence);
         assert!(
@@ -441,8 +445,6 @@ mod tests {
         );
 
         // Survey hit the manifest cap.
-        let mut many = vec![other; crate::core::scanner::MANIFESTS_KEPT];
-        many.dedup();
         let capped = Index::from_survey(
             tmp.path(),
             tmp.path(),
@@ -450,7 +452,6 @@ mod tests {
         );
         let p = probe(&build, &capped).expect("evidence");
         assert_eq!(p.liveness, Liveness::Unknown, "{:?}", p.evidence);
-        drop(many);
     }
 
     /// Ignored files (`.env`, local data) live in no commit, so a worktree that

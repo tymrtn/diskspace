@@ -564,10 +564,13 @@ mod tests {
         assert_eq!(h.context["disposition"], "airlock");
     }
 
+    /// The per-survivor re-measure reads the real volume, so pin the threshold
+    /// above any plausible free space; otherwise this passes only on a full disk.
     #[test]
     fn delete_disposition_removes_and_records_irreversible_receipt() {
         let home = TempHome::new("delete");
-        let prof = Profile::default();
+        let mut prof = Profile::default();
+        prof.preferences.disk_pressure_threshold_gb = 1.0e9;
         let p = home.cache("doomed");
         let req = request(&home, &prof, Disposition::Delete);
         let out = reclaim(&[cand(&p, 0.95, Some("auto"))], &req);

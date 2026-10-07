@@ -1939,7 +1939,7 @@ mod tests {
         assert!(!headroom_due(
             Some(floor),
             Some(10 << 30),
-            &[today.clone()],
+            std::slice::from_ref(&today),
             now
         ));
         let yesterday = Incident {
